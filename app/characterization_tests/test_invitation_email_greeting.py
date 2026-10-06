@@ -1,46 +1,58 @@
-"""Saludo del correo de invitación (spec 091, A-100).
+"""Saludo del correo de invitación (spec 091, A-100; spec 096, D11, FR-059).
+
+El saludo se integra en el párrafo de entrada (D11): "Hola, {nombre}." con
+nombre y "Hola." sin él, en vez del "Hola, {nombre}:" en línea propia que
+usaba `invitation_email_body`. Se reapunta al constructor nuevo
+(`construir_correo_invitacion`) citando FR-059 + D11.
 
     python -m unittest app.characterization_tests.test_invitation_email_greeting -v
 """
 import unittest
 
-from app.core.mail import invitation_email_body
+from app.characterization_tests import auth_fixtures as af  # noqa: F401 - fija settings de test
+from app.core.mail_templates import construir_correo_invitacion
 
 _KW = dict(
-    tenant_name="Acme",
-    login_url="https://acme.skeilopos.com/login",
-    email="ana@acme.com",
-    password="Temporal123!",
+    nombre_negocio="Acme",
+    url_ingreso="https://acme.skeilopos.com/login",
+    correo="ana@acme.com",
+    contrasena_temporal="Temporal123!",
 )
 
 
 class InvitationEmailGreetingTests(unittest.TestCase):
     def test_con_nombre_saluda_por_el_nombre(self):
-        body = invitation_email_body(**_KW, name="María Pérez")
-        self.assertIn("Hola, María Pérez:", body)
+        correo = construir_correo_invitacion(**_KW, nombre_persona="María Pérez")
+        self.assertIn("Hola, María Pérez.", correo.html_body)
 
-    def test_el_apostrofe_se_escapa(self):
-        body = invitation_email_body(**_KW, name="O'Brien")
-        self.assertIn("Hola, O&#x27;Brien:", body)
-        self.assertNotIn("O'Brien", body)
+    def test_el_apostrofe_se_escapa_en_html_y_va_crudo_en_texto(self):
+        correo = construir_correo_invitacion(**_KW, nombre_persona="O'Brien")
+        self.assertIn("Hola, O&#x27;Brien.", correo.html_body)
+        self.assertNotIn("O'Brien", correo.html_body)
+        # research.md Decisión 3: en texto plano el apóstrofo va crudo.
+        self.assertIn("Hola, O'Brien.", correo.text_body)
+        self.assertNotIn("&#x27;", correo.text_body)
 
     def test_sin_nombre_saluda_hola_y_nunca_con_el_correo(self):
-        for name in (None, ""):
-            with self.subTest(name=name):
-                body = invitation_email_body(**_KW, name=name)
-                self.assertIn("Hola:", body)
-                self.assertNotIn("Hola, ", body)
+        for nombre in (None, ""):
+            with self.subTest(nombre=nombre):
+                correo = construir_correo_invitacion(**_KW, nombre_persona=nombre)
+                self.assertIn("Hola.", correo.html_body)
+                self.assertNotIn("Hola, ", correo.html_body)
 
     def test_el_resto_del_cuerpo_no_cambia(self):
-        for body in (invitation_email_body(**_KW), invitation_email_body(**_KW, name="Ana Pérez")):
-            self.assertIn("Te invitaron a unirte a Acme", body)
-            self.assertIn("https://acme.skeilopos.com/login", body)
-            self.assertIn("ana@acme.com", body)
-            self.assertIn("Temporal123!", body)
-            self.assertIn("Al iniciar sesión por primera vez deberás fijar tu propia contraseña", body)
+        for correo in (
+            construir_correo_invitacion(**_KW),
+            construir_correo_invitacion(**_KW, nombre_persona="Ana Pérez"),
+        ):
+            self.assertIn("Te invitaron a unirte a Acme", correo.html_body)
+            self.assertIn("https://acme.skeilopos.com/login", correo.html_body)
+            self.assertIn("ana@acme.com", correo.html_body)
+            self.assertIn("Temporal123!", correo.html_body)
+            self.assertIn("fijar tu propia contraseña", correo.html_body)
 
-    def test_los_llamadores_sin_name_siguen_funcionando(self):
-        self.assertIn("Hola:", invitation_email_body("Acme", "https://x/login", "a@b.co", "pw"))
+    def test_los_llamadores_sin_nombre_persona_siguen_funcionando(self):
+        self.assertIn("Hola.", construir_correo_invitacion(**_KW).html_body)
 
 
 if __name__ == "__main__":
