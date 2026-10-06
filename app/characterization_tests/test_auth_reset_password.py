@@ -172,7 +172,12 @@ class ResetPasswordTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(mock_send.delay.call_count, 2)
         subjects = [call.kwargs["subject"] for call in mock_send.delay.call_args_list]
-        self.assertEqual(subjects, ["Restablecer tu contraseña", "Tu contraseña fue cambiada"])
+        # spec 096 (FR-059, A-113): los dos asuntos pasan a los literales
+        # nuevos de FR-010.
+        self.assertEqual(
+            subjects,
+            ["Restablece tu contraseña de SkeiloPOS", "Tu contraseña de SkeiloPOS fue cambiada"],
+        )
 
     def test_email_dispatch_failure_does_not_break_response(self):
         """FR-028: un fallo del envío no debe romper la respuesta 200."""

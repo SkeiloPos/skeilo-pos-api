@@ -18,7 +18,7 @@ from app.core.utils import verify_password, create_access_token, generate_passwd
 from app.core.dependencies import RefreshTokenBearer,AccessTokenBearer, get_authenticated_user
 from app.core.dependencies import get_shared_db, _reject_if_session_revoked
 from app.core.rate_limit import enforce_sliding_window
-from app.core.mail import password_reset_email_body, password_changed_email_body
+from app.core.mail_templates import construir_correo_contrasena_cambiada, construir_correo_restablecimiento
 from app.core.timezone import utc_now
 from app.celery_task import send_email_task
 from app.api.v1.auth.schemas import (
@@ -42,19 +42,41 @@ _FORGOT_PASSWORD_GENERIC_MESSAGE = {
 }
 
 
-def _dispatch_password_changed_email(email: str, when) -> None:
+def _build_login_url_for_user(user: User) -> str:
+    """FR-037: subdominio del negocio para un usuario de tenant, o
+    `PLATFORM_HOST` (`admin`) para un Super Admin. Mismo patrón
+    `prod → https`/`resto → localhost:4200` que los módulos vecinos — no se
+    unifica con `_build_login_url` de `invitations/router.py` ni de
+    `super_admin/router.py` (research Decisión 9, Principio V)."""
+    host = PLATFORM_HOST if user.tenant_id is None else user.tenant.host
+    if settings.ENVIRONMENT == "prod":
+        return f"https://{host}.skeilopos.com/login"
+    return f"http://{host}.localhost:4200/login"
+
+
+def _dispatch_password_changed_email(user: User, when) -> None:
     """Correo de aviso tras cualquier cambio exitoso (FR-022). Nunca bloquea ni
-    rompe la respuesta si el envío falla (FR-028)."""
+    rompe la respuesta si el envío falla (FR-028). El constructor se evalúa
+    dentro de este mismo `try`, que ya captura `Exception`: un fallo de
+    FR-041 queda en `warning` sin romper la respuesta (research Decisión 10)."""
     try:
+        correo = construir_correo_contrasena_cambiada(
+            correo=user.email,
+            momento=when,
+            url_ingreso=_build_login_url_for_user(user),
+            es_super_admin=user.tenant_id is None,
+            nombre_negocio=user.tenant_name,
+        )
         send_email_task.delay(
-            recipients=[email],
-            subject="Tu contraseña fue cambiada",
-            body=password_changed_email_body(when.strftime("%d/%m/%Y %H:%M UTC"), email),
+            recipients=[user.email],
+            subject=correo.subject,
+            body=correo.html_body,
+            text_body=correo.text_body,
         )
     except Exception:
         logger.warning(
             "No se pudo encolar el correo de aviso de cambio de contraseña para '%s'",
-            email,
+            user.email,
             exc_info=True,
         )
 
@@ -286,10 +308,19 @@ async def forgot_password(
     db.commit()
 
     try:
+        # FR-030: la vigencia que el correo anuncia sale de la configuración
+        # vigente, nunca de un literal. El constructor se evalúa dentro de
+        # este `try`, que ya captura `Exception`: un fallo de FR-041 queda
+        # en `warning` sin romper la respuesta genérica (research Decisión 10).
+        correo = construir_correo_restablecimiento(
+            url_restablecimiento=_build_reset_url(tenant, raw_token),
+            minutos_de_vigencia=expiry_minutes,
+        )
         send_email_task.delay(
             recipients=[user.email],
-            subject="Restablecer tu contraseña",
-            body=password_reset_email_body(_build_reset_url(tenant, raw_token), expiry_minutes),
+            subject=correo.subject,
+            body=correo.html_body,
+            text_body=correo.text_body,
         )
     except Exception:
         logger.warning(
@@ -337,7 +368,7 @@ def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_shared_
     row.used_at = now  # consumido — un segundo POST con el mismo enlace ve reason="used"
     db.commit()
 
-    _dispatch_password_changed_email(user.email, now)
+    _dispatch_password_changed_email(user, now)
 
     return JSONResponse(content={"message": "Contraseña actualizada correctamente."})
 
@@ -370,7 +401,7 @@ def change_password(
     user.tokens_valid_after = now
     db.commit()
 
-    _dispatch_password_changed_email(user.email, now)
+    _dispatch_password_changed_email(user, now)
 
     return JSONResponse(content={"message": "Password changed successfully"})
 
