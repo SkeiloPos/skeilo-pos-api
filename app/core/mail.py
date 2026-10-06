@@ -9,13 +9,19 @@ logger = logging.getLogger(__name__)
 
 EMAIL_SEND_PATH = "/api/email/send"
 
-def create_message(recipients: list[str], subject: str, body: str):
-    return {
+def create_message(recipients: list[str], subject: str, body: str, text_body: str | None = None):
+    message = {
         "from": f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>",
         "to": recipients,
         "subject": subject,
         "htmlBody": body,
     }
+    # FR-047: la clave "textBody" se añade solo cuando hay texto plano, de
+    # modo que sin él el payload queda byte por byte igual al actual
+    # (research.md Decisión 5).
+    if text_body is not None:
+        message["textBody"] = text_body
+    return message
 
 def send_email(message: dict):
     url = f"{settings.EMAIL_API_URL.rstrip('/')}{EMAIL_SEND_PATH}"
