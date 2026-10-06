@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.sql import Select
 
 from app.core.audit import record_audit
@@ -61,7 +61,15 @@ class ProductService:
         search: str | None = None,
         available: bool | None = None,
     ) -> Select:
-        stmt = select(Product).order_by(Product.created_at.desc())
+        # spec 097 (research.md D1): JOIN contra Category en la propia consulta, para que
+        # `category_name` (ver Product.category_name) no dependa de la paginación de
+        # `GET /categories` (tope 100). `joinedload` sobre una relación many-to-one no
+        # multiplica filas ni exige `.unique()`.
+        stmt = (
+            select(Product)
+            .options(joinedload(Product.category))
+            .order_by(Product.created_at.desc())
+        )
         if active is not None:
             stmt = stmt.where(Product.active == active)
         if available is not None:

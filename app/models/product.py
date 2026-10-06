@@ -21,6 +21,13 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     category: Mapped[Optional["Category"]] = relationship(back_populates="products")
 
+    @property
+    def category_name(self) -> Optional[str]:
+        """Resuelve el nombre de la categoría desde la relación ya cargada -- spec 097
+        (research.md D2): evita que el cliente dependa de una lista de categorías
+        paginada aparte (`GET /categories`, tope 100) para mostrar este dato."""
+        return self.category.name if self.category else None
+
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)

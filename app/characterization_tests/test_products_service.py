@@ -29,9 +29,10 @@ from decimal import Decimal
 from unittest import mock
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from app.characterization_tests import fixtures as fx
+from app.core.pagination import paginate
 from app.api.v1.products.service import ProductService
 from app.api.v1.products.schemas import ProductCreate, ProductUpdate
 from app.api.v1.catalog.schemas import VariantSaveIn, RecipeItemIn, VariantOptionGroupIn
@@ -421,6 +422,81 @@ class TestConsolidatedSaveAtomicity(unittest.TestCase):
             select(VariantOptionGroup).where(VariantOptionGroup.product_variant_id == v1.id)
         ).scalars().all()
         self.assertEqual(len(groups), 0)
+
+
+class TestListQueryCategoryName(unittest.TestCase):
+    """Spec 097 (FR-001/FR-002, research.md D1): `category_name` se resuelve con un JOIN
+    dentro del propio `list_query`, sin depender de la paginación de `GET /categories`
+    (tope 100, `categories/router.py:53`)."""
+
+    def test_category_name_no_depende_de_cuantas_categorias_tenga_el_tenant(self):
+        """Más de 100 categorías activas; la categoría del producto es, a propósito, la
+        última por orden alfabético -- la que un `GET /categories?size=100` paginado por
+        nombre nunca alcanzaría a traer en su primera página."""
+        db = fx.new_session()
+        categorias = [fx.make_category(db, name=f"Categoria {i:03d}") for i in range(105)]
+        categoria_tardia = categorias[-1]
+        producto = fx.make_product(db, category=categoria_tardia, name="Producto tardio")
+        db.commit()
+
+        service = ProductService()
+        pagina = paginate(db, service.list_query(search="tardio"), page=1, size=20)
+
+        self.assertEqual(len(pagina["items"]), 1)
+        item = pagina["items"][0]
+        self.assertEqual(item.id, producto.id)
+        self.assertEqual(item.category_name, categoria_tardia.name)
+
+    def test_category_name_no_agrega_consultas_por_producto_sin_n_mas_1(self):
+        """El número de sentencias SQL para traer una página no puede crecer con la
+        cantidad de productos de esa página -- un `category_name` resuelto con N+1
+        lazy-loads sí lo haría (mismo patrón de guardia que
+        `test_orders_pagination.py::test_guardia_de_trabajo_acotado_numero_de_sentencias_constante`)."""
+        conteos = []
+        for n in (1, 10):
+            db = fx.new_session()
+            categoria = fx.make_category(db)
+            for i in range(n):
+                fx.make_product(db, category=categoria, name=f"Producto {i:03d}")
+            db.commit()
+
+            service = ProductService()
+            sentencias: list[str] = []
+            bind = db.get_bind()
+
+            def _rec(conn, cursor, statement, parameters, context, executemany):
+                sentencias.append(statement)
+
+            event.listen(bind, "before_cursor_execute", _rec)
+            try:
+                pagina = paginate(db, service.list_query(), page=1, size=20)
+                # Fuerza el acceso a `category_name` de cada ítem, como hace la
+                # serialización de `ProductResponse` -- si hubiera N+1, ocurriría aquí.
+                [item.category_name for item in pagina["items"]]
+            finally:
+                event.remove(bind, "before_cursor_execute", _rec)
+            conteos.append(len(sentencias))
+
+        self.assertEqual(conteos[0], conteos[1])
+
+    def test_category_renombrada_se_refleja_sin_cache(self):
+        """Criterio de aceptación 3 del spec: `category_name` no vive en ninguna caché --
+        se recalcula en cada lectura a partir de `Category.name`."""
+        db = fx.new_session()
+        categoria = fx.make_category(db, name="Nombre original")
+        producto = fx.make_product(db, category=categoria)
+        db.commit()
+        service = ProductService()
+
+        antes = paginate(db, service.list_query(), page=1, size=20)
+        self.assertEqual(antes["items"][0].category_name, "Nombre original")
+
+        categoria.name = "Nombre renombrado"
+        db.commit()
+
+        despues = paginate(db, service.list_query(), page=1, size=20)
+        self.assertEqual(despues["items"][0].id, producto.id)
+        self.assertEqual(despues["items"][0].category_name, "Nombre renombrado")
 
 
 if __name__ == "__main__":
