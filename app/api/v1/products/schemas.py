@@ -84,6 +84,9 @@ class ProductAvailabilityUpdate(BaseModel):
 class ProductResponse(BaseModel):
     id: UUID
     category_id: UUID
+    # spec 097: resuelto en el propio servidor (Product.category_name), sin depender de
+    # que el cliente haya cargado `GET /categories` (tope 100 por página) por separado.
+    category_name: str | None = None
     name: str
     description: str | None = None
     preparation_type: PreparationType
