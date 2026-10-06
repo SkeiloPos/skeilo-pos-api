@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -8,13 +9,16 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.config import settings
 from app.core.db import get_db, get_tenant
 from app.core.dependencies import require_tenant_admin
-from app.core.mail import create_message, invitation_email_body, send_email
+from app.core.mail import create_message, send_email
+from app.core.mail_templates import ErrorDePlantillaDeCorreo, construir_correo_invitacion
 from app.core.models import Role, Tenant, User, UserInvitation
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import enforce_plan_limit
 from app.core.timezone import utc_now
 from app.core.utils import generate_passwd_hash, generate_random_password
 from app.api.v1.invitations.schemas import InvitationCreate, InvitationResponse
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/invitations", tags=["invitations"])
 
@@ -130,21 +134,29 @@ def create_invitation(
 
     # 4) Envío síncrono (research.md Decisión 4): un fallo deja la invitación
     # sin persistir (FR-012) — nunca se confirma un envío que no salió.
+    # FR-041/A-121: un valor obligatorio vacío o nulo hace que el
+    # constructor levante ErrorDePlantillaDeCorreo, que entra por el mismo
+    # camino que un fallo del servicio de correo (FR-057) — mismo 502,
+    # mismo rollback, sin vía de error nueva.
     try:
+        correo = construir_correo_invitacion(
+            nombre_negocio=tenant.name,
+            url_ingreso=_build_login_url(tenant),
+            correo=email,
+            contrasena_temporal=password,
+            nombre_persona=body.name,
+        )
         send_email(
             create_message(
-                [email],
-                f"Bienvenido a {tenant.name}",
-                invitation_email_body(
-                    tenant_name=tenant.name,
-                    login_url=_build_login_url(tenant),
-                    email=email,
-                    password=password,
-                    name=body.name,
-                ),
+                [email], correo.subject, correo.html_body, text_body=correo.text_body
             )
         )
-    except RuntimeError:
+    except (RuntimeError, ErrorDePlantillaDeCorreo) as exc:
+        logger.warning(
+            "No se pudo generar o enviar el correo de invitación para '%s': %s",
+            email,
+            exc,
+        )
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -205,22 +217,27 @@ def resend_invitation(
     # research.md Decisión 10: el correo se despacha *antes* de sobrescribir
     # la fila — si falla, la contraseña anterior sigue intacta y sirviendo
     # (FR-012 aplicado al reenvío: nunca deja la invitación sin ninguna
-    # contraseña funcional conocida por nadie).
+    # contraseña funcional conocida por nadie). Mismo correo que la
+    # invitación original, misma presentación y asunto (FR-025).
     try:
+        correo = construir_correo_invitacion(
+            nombre_negocio=tenant.name,
+            url_ingreso=_build_login_url(tenant),
+            correo=invitation.email,
+            contrasena_temporal=password,
+            nombre_persona=invitation.name,
+        )
         send_email(
             create_message(
-                [invitation.email],
-                f"Bienvenido a {tenant.name}",
-                invitation_email_body(
-                    tenant_name=tenant.name,
-                    login_url=_build_login_url(tenant),
-                    email=invitation.email,
-                    password=password,
-                    name=invitation.name,
-                ),
+                [invitation.email], correo.subject, correo.html_body, text_body=correo.text_body
             )
         )
-    except RuntimeError:
+    except (RuntimeError, ErrorDePlantillaDeCorreo) as exc:
+        logger.warning(
+            "No se pudo generar o enviar el correo de reenvío de invitación para '%s': %s",
+            invitation.email,
+            exc,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="No se pudo enviar el correo de invitación. Intenta de nuevo.",

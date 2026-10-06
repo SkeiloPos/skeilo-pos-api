@@ -21,7 +21,7 @@ from app.celery_task import send_email_task
 from app.core.config import settings
 from app.core.db import tenant_create
 from app.core.dependencies import get_current_super_admin
-from app.core.mail import welcome_email_body
+from app.core.mail_templates import construir_correo_invitacion
 from app.core.utils import generate_random_password
 logger = logging.getLogger(__name__)
 
@@ -142,15 +142,20 @@ def create_tenant(body: TenantCreateWithUser):
     else:
         login_url = f"http://{body.host}.localhost:4200/login"
     try:
+        # FR-026/A-115/D9: el correo del alta de un negocio reusa tal cual
+        # la plantilla de invitación, con los mismos campos y el mismo
+        # asunto que una invitación de tenant.
+        correo = construir_correo_invitacion(
+            nombre_negocio=body.tenant_name,
+            url_ingreso=login_url,
+            correo=body.email,
+            contrasena_temporal=password,
+        )
         send_email_task.delay(
             recipients=[body.email],
-            subject=f"Bienvenido a {body.tenant_name}",
-            body=welcome_email_body(
-                tenant_name=body.tenant_name,
-                login_url=login_url,
-                email=body.email,
-                password=password,
-            ),
+            subject=correo.subject,
+            body=correo.html_body,
+            text_body=correo.text_body,
         )
     except Exception as exc:
         # El tenant ya fue creado y commiteado; no romper la respuesta si la

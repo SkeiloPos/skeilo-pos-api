@@ -1,4 +1,3 @@
-import html
 import logging
 
 import httpx
@@ -43,62 +42,6 @@ def send_email(message: dict):
         # No hubo respuesta (timeout, conexión, DNS…).
         logger.error("No se pudo contactar el servicio de email: %s", exc)
         raise RuntimeError(f"No se pudo contactar el servicio de email: {exc}") from exc
-
-
-def welcome_email_body(tenant_name: str, login_url: str, email: str, password: str) -> str:
-    return f"""\
-<div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
-  <h2 style="color: #111827;">¡Bienvenido a {tenant_name}!</h2>
-  <p>Tu cuenta ha sido creada correctamente. Estos son tus datos de acceso:</p>
-  <table style="border-collapse: collapse; margin: 16px 0;">
-    <tr>
-      <td style="padding: 8px 12px; font-weight: bold;">URL de inicio de sesión</td>
-      <td style="padding: 8px 12px;"><a href="{login_url}">{login_url}</a></td>
-    </tr>
-    <tr>
-      <td style="padding: 8px 12px; font-weight: bold;">Usuario</td>
-      <td style="padding: 8px 12px;">{email}</td>
-    </tr>
-    <tr>
-      <td style="padding: 8px 12px; font-weight: bold;">Contraseña</td>
-      <td style="padding: 8px 12px;">{password}</td>
-    </tr>
-  </table>
-  <p style="color: #b91c1c; font-size: 14px;">
-    Por seguridad, te recomendamos cambiar tu contraseña después de iniciar sesión por primera vez.
-  </p>
-</div>"""
-
-
-def invitation_email_body(
-    tenant_name: str, login_url: str, email: str, password: str, name: str | None = None
-) -> str:
-    # spec 091: saludo por el nombre (escapado); sin nombre —invitación anterior—
-    # un "Hola:" neutro, nunca con el correo.
-    greeting = f"Hola, {html.escape(name, quote=True)}:" if name else "Hola:"
-    return f"""\
-<div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
-  <p>{greeting}</p>
-  <h2 style="color: #111827;">Te invitaron a unirte a {tenant_name}</h2>
-  <p>Un administrador de {tenant_name} te dio acceso al sistema. Estos son tus datos de acceso:</p>
-  <table style="border-collapse: collapse; margin: 16px 0;">
-    <tr>
-      <td style="padding: 8px 12px; font-weight: bold;">URL de inicio de sesión</td>
-      <td style="padding: 8px 12px;"><a href="{login_url}">{login_url}</a></td>
-    </tr>
-    <tr>
-      <td style="padding: 8px 12px; font-weight: bold;">Usuario</td>
-      <td style="padding: 8px 12px;">{email}</td>
-    </tr>
-    <tr>
-      <td style="padding: 8px 12px; font-weight: bold;">Contraseña temporal</td>
-      <td style="padding: 8px 12px;">{password}</td>
-    </tr>
-  </table>
-  <p style="color: #b91c1c; font-size: 14px;">
-    Al iniciar sesión por primera vez deberás fijar tu propia contraseña antes de continuar.
-  </p>
-</div>"""
 
 
 def password_reset_email_body(reset_url: str, expiry_minutes: int) -> str:
