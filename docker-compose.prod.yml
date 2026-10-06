@@ -59,7 +59,7 @@ services:
       - backend
 
   api:
-    image: ghcr.io/deimerhdz/pos-backend:${IMAGE_TAG:-latest}
+    image: ghcr.io/skeilopos/skeilo-pos-api:${IMAGE_TAG:-latest}
 
     restart: unless-stopped
 
@@ -107,7 +107,7 @@ services:
       - backend
 
   worker:
-    image: ghcr.io/deimerhdz/pos-backend:${IMAGE_TAG:-latest}
+    image: ghcr.io/skeilopos/skeilo-pos-api:${IMAGE_TAG:-latest}
 
     restart: unless-stopped
 
