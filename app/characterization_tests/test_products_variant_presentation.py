@@ -43,14 +43,24 @@ def _variants_of(db, product_id):
 
 
 class SchemaSinNombreTests(unittest.TestCase):
-    """A-79: `name` desaparece del payload de guardado y de la tabla."""
+    """A-79: la estructura de la variante la da su presentación, no un nombre libre.
 
-    def test_la_variante_no_tiene_columna_name(self):
-        self.assertFalse(hasattr(ProductVariant, "name"))
-        self.assertNotIn("name", ProductVariant.__table__.columns)
+    spec 099-nombre-tamano-variante (2026-10-06) reabre esto de forma controlada y
+    documentada (ver su `research.md`, "Contexto histórico"): agrega `ProductVariant.name`
+    como un alias comercial **opcional y puramente cosmético** que convive con
+    `presentation_id` sin reemplazarlo. Las dos primeras pruebas de esta clase, que antes
+    afirmaban la ausencia total de `name`, ahora afirman que sigue siendo opcional y que
+    `presentation_id` sigue siendo la única fuente estructural del nombre.
+    """
 
-    def test_variant_save_in_no_declara_name(self):
-        self.assertNotIn("name", VariantSaveIn.model_fields)
+    def test_la_variante_tiene_columna_name_opcional_y_cosmetica(self):
+        self.assertTrue(hasattr(ProductVariant, "name"))
+        self.assertIn("name", ProductVariant.__table__.columns)
+        self.assertFalse(ProductVariant.__table__.c.name.nullable)
+
+    def test_variant_save_in_declara_name_opcional(self):
+        self.assertIn("name", VariantSaveIn.model_fields)
+        self.assertFalse(VariantSaveIn.model_fields["name"].is_required())
         self.assertIn("presentation_id", VariantSaveIn.model_fields)
 
     def test_presentation_id_es_obligatorio_en_la_tabla(self):

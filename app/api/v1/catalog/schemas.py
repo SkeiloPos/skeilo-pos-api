@@ -2,18 +2,30 @@ from typing import Literal
 from uuid import UUID
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.variant_name import normalize_variant_name
 
 
 # ---------- Variantes ----------
 class VariantCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    # spec 084 (A-79): la variante no tiene nombre propio; lo da su presentación del
-    # catálogo. `None` = "Presentación única".
+    # spec 084 (A-79): la presentación del catálogo sigue siendo la única fuente
+    # estructural del tamaño. `None` = "Presentación única".
     presentation_id: UUID | None = None
     price: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     sku: str | None = Field(None, max_length=100)
+    # spec 099: alias comercial opcional, puramente cosmético. Ausente/`None` -> `""`.
+    # `validate_default=True`: el validador debe normalizar también cuando el campo se
+    # omite del payload, no solo cuando llega explícito (si no, Pydantic deja el `None`
+    # del default sin pasar por el validador, y `""` nunca se materializa).
+    name: str | None = Field(None, validate_default=True)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: str | None) -> str:
+        return normalize_variant_name(value)
 
 
 class VariantUpdate(BaseModel):
@@ -24,6 +36,19 @@ class VariantUpdate(BaseModel):
     price: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
     sku: str | None = Field(None, max_length=100)
     active: bool | None = None
+    # spec 099: mismo criterio "ausente = sin cambio" que el resto de los campos de
+    # este PATCH parcial (price, active, presentation_id) -- distinto del contrato de
+    # `VariantSaveIn`/`VariantCreate` (reemplazo total, FR-012/Escenario 14), que este
+    # endpoint standalone no usa. Para quitar el nombre propio aquí, se envía `""`
+    # explícito (no ausente, no `null`).
+    name: str | None = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_variant_name(value)
 
 
 class VariantResponse(BaseModel):
@@ -32,9 +57,12 @@ class VariantResponse(BaseModel):
     sku: str | None = None
     price: Decimal
     active: bool
-    # spec 084 (A-79): el nombre de la variante es el de su presentación.
+    # spec 084 (A-79): `presentation_id` sigue siendo la fuente estructural del tamaño.
     presentation_id: UUID
     presentation_name: str
+    # spec 099: alias comercial (crudo) y etiqueta calculada que ve el comensal.
+    name: str
+    display_name: str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -117,9 +145,18 @@ class VariantSaveIn(BaseModel):
     active: bool = True
     recipe: list[RecipeItemIn] = Field(default_factory=list)
     option_groups: list[VariantOptionGroupIn] = Field(default_factory=list)
-    # spec 084 (A-79): presentación del catálogo (spec 083) que nombra a esta variante.
-    # `None` = "Presentación única" (productos sin tamaños). No hay campo `name`.
+    # spec 084 (A-79): presentación del catálogo (spec 083) que nombra estructuralmente
+    # a esta variante. `None` = "Presentación única" (productos sin tamaños).
     presentation_id: UUID | None = None
+    # spec 099: alias comercial opcional (reemplazo total como el resto de esta clase,
+    # FR-012/Escenario 14): ausente/`None` = "sin nombre propio" (`""`), no "sin cambio".
+    # `validate_default=True`: ver el mismo comentario en `VariantCreate.name`.
+    name: str | None = Field(None, validate_default=True)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: str | None) -> str:
+        return normalize_variant_name(value)
 
 
 # ---------- Grupos de opciones ----------

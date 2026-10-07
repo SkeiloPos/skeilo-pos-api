@@ -1,3 +1,5 @@
+import logging
+
 from app.core.models import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import String, Boolean, Integer, Numeric, ForeignKey, CheckConstraint, UniqueConstraint
@@ -11,12 +13,19 @@ if TYPE_CHECKING:
     from .variant_option_group import VariantOptionGroup
     from .presentation import Presentation
 
+logger = logging.getLogger(__name__)
+
 
 class ProductVariant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Línea vendible: aquí viven el precio y la receta. Su nombre es el de su
-    `Presentation` (spec 084, A-79): no hay columna `name`. Productos sin tamaños
-    obtienen una variante asociada a la presentación 'Presentación única'
-    (spec 083, A-74)."""
+    """Línea vendible: aquí viven el precio y la receta. Su nombre **estructural** es el
+    de su `Presentation` (spec 084, A-79): `presentation_id` sigue siendo obligatorio y
+    es la única fuente de `presentation_name`. Productos sin tamaños obtienen una
+    variante asociada a la presentación 'Presentación única' (spec 083, A-74).
+
+    `name` (spec 099) es distinto: un alias comercial **opcional y puramente
+    cosmético** ("Para compartir") que convive con `presentation_id` sin reemplazarlo.
+    No reabre la columna `name` que la spec 084 eliminó como clave estructural --
+    ver `research.md` de la spec 099, "Contexto histórico"."""
 
     __tablename__ = "product_variants"
 
@@ -26,6 +35,13 @@ class ProductVariant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     product: Mapped["Product"] = relationship(back_populates="variants")
 
     sku: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True)
+
+    # spec 099: alias comercial opcional y puramente cosmético. Nunca `null` (FR-003):
+    # mismo patrón que `price` abajo -- `default`/`server_default` juntos, uno para
+    # instancias en memoria sin flush todavía, otro para la columna en la base.
+    name: Mapped[str] = mapped_column(
+        String(60), nullable=False, default="", server_default=""
+    )
 
     price: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), nullable=False, default=0, server_default="0"
@@ -51,6 +67,23 @@ class ProductVariant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     @property
     def presentation_name(self) -> str:
         return self.presentation.name
+
+    @property
+    def display_name(self) -> str:
+        """Etiqueta que ve el comensal (spec 099, FR-004/FR-005): `name` si no está
+        vacío; si no, el de la presentación; si ninguno está disponible, `"Tamaño"` con
+        una advertencia registrada (Escenario 16) -- nunca una etiqueta vacía."""
+        if self.name:
+            return self.name
+        presentation = self.presentation
+        if presentation is not None and presentation.name:
+            return presentation.name
+        logger.warning(
+            "ProductVariant %s sin display_name resoluble (name vacío, presentación "
+            "no disponible); se usa el valor por defecto 'Tamaño'.",
+            self.id,
+        )
+        return "Tamaño"
 
     recipe_items: Mapped[List["RecipeItem"]] = relationship(
         back_populates="product_variant", cascade="all, delete-orphan"

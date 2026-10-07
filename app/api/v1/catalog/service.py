@@ -173,6 +173,38 @@ def _ensure_sku_unique(
         )
 
 
+def display_name_duplicado(
+    db: Session,
+    product_id: UUID,
+    display_name: str,
+    *,
+    exclude_id: UUID | None = None,
+) -> ProductVariant | None:
+    """Otra variante **activa** del mismo producto que ya resuelve a `display_name`
+    (spec 099, FR-008). Solo activas (Clarificación, sesión 2026-10-06, pregunta 1): una
+    variante desactivada no bloquea su etiqueta. Comparación insensible a mayúsculas
+    (pregunta 2) -- se hace en Python, no en SQL, porque pocas variantes por producto no
+    justifica un índice funcional para esto (research.md D5)."""
+    stmt = select(ProductVariant).where(
+        ProductVariant.product_id == product_id,
+        ProductVariant.active.is_(True),
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(ProductVariant.id != exclude_id)
+    objetivo = display_name.lower()
+    for otra in db.execute(stmt).scalars().all():
+        if otra.display_name.lower() == objetivo:
+            return otra
+    return None
+
+
+def _raise_display_name_conflict(index: int | None) -> None:
+    detail = {"error": "Ya existe un tamaño con ese nombre en este producto"}
+    if index is not None:
+        detail["variant_index"] = index
+    raise HTTPException(status.HTTP_409_CONFLICT, detail=detail)
+
+
 def _replace_recipe(
     db: Session, variant_id: UUID, items: list[RecipeItemIn], index: int
 ) -> None:
@@ -309,6 +341,18 @@ def _save_variant_entry(
         db, product.id, entry.presentation_id, index, current=current
     )
 
+    # spec 099 (FR-008): la etiqueta que resultaría para esta entrada no puede coincidir
+    # con la de otra variante activa del mismo producto -- solo si esta misma entrada
+    # queda activa (una entrada que se guarda desactivada no le quita el nombre a nadie).
+    if entry.active:
+        entry_display_name = entry.name or presentation.name
+        dup_nombre = display_name_duplicado(
+            db, product.id, entry_display_name,
+            exclude_id=current.id if current is not None else None,
+        )
+        if dup_nombre is not None:
+            _raise_display_name_conflict(index)
+
     if current is None:
         if entry.sku is not None:
             _ensure_sku_unique(db, entry.sku, index)
@@ -319,6 +363,7 @@ def _save_variant_entry(
             price=entry.price,
             sku=sku,
             active=entry.active,
+            name=entry.name,
             display_order=_next_display_order(db, product.id),
         )
         db.add(variant)
@@ -331,6 +376,7 @@ def _save_variant_entry(
         variant.presentation_id = presentation.id
         variant.price = entry.price
         variant.active = entry.active
+        variant.name = entry.name
         db.flush()
 
     _replace_recipe(db, variant.id, entry.recipe, index)

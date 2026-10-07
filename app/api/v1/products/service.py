@@ -334,6 +334,8 @@ class ProductService:
                     product_id=v.product_id,
                     presentation_id=v.presentation_id,
                     presentation_name=v.presentation_name,
+                    name=v.name,
+                    display_name=v.display_name,
                     sku=v.sku,
                     price=v.price,
                     active=v.active,
