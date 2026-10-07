@@ -84,6 +84,9 @@ class ProductAvailabilityUpdate(BaseModel):
 class ProductResponse(BaseModel):
     id: UUID
     category_id: UUID
+    # spec 097: resuelto en el propio servidor (Product.category_name), sin depender de
+    # que el cliente haya cargado `GET /categories` (tope 100 por página) por separado.
+    category_name: str | None = None
     name: str
     description: str | None = None
     preparation_type: PreparationType
@@ -120,7 +123,7 @@ class ProductDetailResponse(ProductResponse):
 class VariantSaveOut(VariantResponse):
     """Estado final de una presentación tras un guardado consolidado (spec 043).
 
-    Extiende `VariantResponse` (`id`, `product_id`, `presentation_id`, `presentation_name`, `sku`, `price`, `active`); `recipe` y
+    Extiende `VariantResponse` (`id`, `product_id`, `presentation_id`, `presentation_name`, `name`, `display_name`, `sku`, `price`, `active`); `recipe` y
     `option_groups` no se pueden poblar por `from_attributes` porque el modelo ORM los expone como
     `recipe_items`/`option_groups` con otro shape -- el servicio los arma explícitamente al
     construir la respuesta.

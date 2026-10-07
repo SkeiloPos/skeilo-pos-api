@@ -104,7 +104,10 @@ class ChangePasswordTests(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         mock_send.delay.assert_called_once()
-        self.assertEqual(mock_send.delay.call_args.kwargs["subject"], "Tu contraseña fue cambiada")
+        # spec 096 (FR-059, A-113): el asunto pasa al literal nuevo de FR-010.
+        self.assertEqual(
+            mock_send.delay.call_args.kwargs["subject"], "Tu contraseña de SkeiloPOS fue cambiada"
+        )
 
     def test_email_dispatch_failure_does_not_break_response(self):
         with patch("app.api.v1.auth.routes.send_email_task") as mock_send:

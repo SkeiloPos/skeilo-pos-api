@@ -205,18 +205,51 @@ class CreateInvitationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 502)
         self.assertEqual(_count(self.db, UserInvitation, UserInvitation.email == "fallo@acme.com"), 0)
 
+    # ---------------------------------------------------------- spec 096 (FR-041, FR-057, A-121, D16)
+
+    def test_valor_obligatorio_de_plantilla_faltante_produce_502_y_no_crea_la_invitacion(self):
+        """D16/A-121: FR-041 impide generar un correo con huecos, y FR-057
+        trata ese fallo como un caso más de "el correo no sale" — mismo 502,
+        mismo rollback, sin vía de error nueva. Antes de esta spec el valor
+        vacío se interpolaba y la invitación quedaba creada; con el cambio
+        de comportamiento ya registrado en A-121, ahora falla la operación
+        completa."""
+        from app.core.mail_templates import ErrorDePlantillaDeCorreo
+
+        with patch(
+            "app.api.v1.invitations.router.construir_correo_invitacion",
+            side_effect=ErrorDePlantillaDeCorreo("Faltan campos obligatorios: nombre_negocio"),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                create_invitation(
+                    InvitationCreate(email="hueco@acme.com", role="CASHIER", name="Ana Pérez"),
+                    tenant=self.tenant,
+                    admin=self.admin,
+                    db=self.db,
+                )
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(_count(self.db, UserInvitation, UserInvitation.email == "hueco@acme.com"), 0)
+
     # ---------------------------------------------------------- spec 091 (A-100): nombre completo
 
     def test_el_nombre_se_persiste_recortado_en_nfc_y_va_al_correo_y_a_la_respuesta(self):
+        # spec 096 (FR-059, A-113): el router pasa de armar el cuerpo con
+        # `invitation_email_body` a pedirle un `EmailContent` a
+        # `construir_correo_invitacion`. Se reapunta el parcheo al
+        # constructor nuevo, conservando intacto lo que este test afirma:
+        # que el nombre normalizado llega a la plantilla.
+        from app.core.mail_templates import EmailContent
+
         with patch("app.api.v1.invitations.router.send_email") as mock_send, patch(
-            "app.api.v1.invitations.router.invitation_email_body", return_value="<p>cuerpo</p>"
+            "app.api.v1.invitations.router.construir_correo_invitacion",
+            return_value=EmailContent(subject="asunto", html_body="<p>cuerpo</p>", text_body="cuerpo"),
         ) as mock_body:
             resp = create_invitation(
                 InvitationCreate(email="maria@acme.com", role="CASHIER", name="  Mari\u0301a Pérez  "),
                 tenant=self.tenant, admin=self.admin, db=self.db,
             )
         mock_send.assert_called_once()
-        self.assertEqual(mock_body.call_args.kwargs["name"], "María Pérez")
+        self.assertEqual(mock_body.call_args.kwargs["nombre_persona"], "María Pérez")
         self.assertEqual(resp.name, "María Pérez")
         self.assertEqual(InvitationResponse.model_validate(resp).name, "María Pérez")
         invitation = self.db.execute(select(UserInvitation)).scalar_one()

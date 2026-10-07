@@ -459,9 +459,13 @@ def _set_descriptor(names: Iterable[str]) -> tuple[str, bool] | None:
 def variant_display_names(db: Session, variant_ids: Iterable[UUID]) -> dict[UUID, str]:
     """`{product_variant_id: nombre utilizable}` en **una sola** consulta.
 
-    El nombre utilizable es el de la variante y, si queda vacío al recortar, el
-    del producto; una variante sin ninguno de los dos **no aparece en el mapa**,
-    porque no aporta nombre al descriptor (spec 066 FR-006, research.md D-3).
+    El nombre utilizable es el `display_name` de la variante (spec 099, FR-004: su
+    nombre propio si lo tiene, si no el de su presentación) y, si ese queda vacío, el
+    del producto; una variante sin ninguno de los tres **no aparece en el mapa**,
+    porque no aporta nombre al descriptor (spec 066 FR-006, research.md D-3; spec 099
+    research.md D10 -- misma precedencia que `display_name`, antes de cualquier texto de
+    promoción en el menú público, sin que un nombre propio recién puesto se vea pisado
+    por el de la presentación).
 
     Nunca llamarla dentro de un bucle de variantes ni de reglas: el coste es
     constante por llamada y debe seguir siéndolo (research.md D-12)."""
@@ -469,14 +473,18 @@ def variant_display_names(db: Session, variant_ids: Iterable[UUID]) -> dict[UUID
     if not ids:
         return {}
     rows = db.execute(
-        select(ProductVariant.id, Presentation.name, Product.name)
+        select(ProductVariant.id, ProductVariant.name, Presentation.name, Product.name)
         .join(Product, Product.id == ProductVariant.product_id)
         .join(Presentation, Presentation.id == ProductVariant.presentation_id)
         .where(ProductVariant.id.in_(ids))
     ).all()
     names: dict[UUID, str] = {}
-    for variant_id, variant_name, product_name in rows:
-        usable = (variant_name or "").strip() or (product_name or "").strip()
+    for variant_id, own_name, presentation_name, product_name in rows:
+        usable = (
+            (own_name or "").strip()
+            or (presentation_name or "").strip()
+            or (product_name or "").strip()
+        )
         if usable:
             names[variant_id] = usable
     return names

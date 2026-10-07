@@ -6,7 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
-from app.core.db import get_db, get_tenant, with_db
+from app.core.db import find_tenant_by_host, get_db, get_tenant, with_db
 from app.core.models import User, Tenant
 from app.core.utils import decode_token
 from app.core.redis import token_in_blocklist
@@ -14,7 +14,7 @@ bearer_scheme = HTTPBearer()
 
 logger = logging.getLogger(__name__)
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPBearer
@@ -267,6 +267,34 @@ def get_shared_db():
     """Sesión sobre el schema compartido (shared). Para endpoints sin tenant
     (super admin), donde viven users/tenants/roles."""
     with with_db(None) as db:
+        yield db
+
+
+def get_optional_tenant(req: Request) -> Optional[Tenant]:
+    """Gemelo de `get_tenant` (spec 100, research.md Decisión 2): misma
+    validación de cabecera (`400` si falta `x-tenant-host`) y misma consulta
+    (`find_tenant_by_host`), pero devuelve `None` en vez de levantar `404`
+    cuando el host no resuelve a ningún `Tenant` — lo necesita el arranque
+    agregado del panel para tolerar al Super Admin (FR-007)."""
+    tenant_host = req.headers.get("x-tenant-host")
+    if not tenant_host:
+        raise HTTPException(
+            status_code=400, detail="Falta la cabecera 'x-tenant-host'"
+        )
+    host_without_port = tenant_host.split(":", 1)[0]
+
+    tenant = find_tenant_by_host(host_without_port)
+    if tenant is not None:
+        req.state.tenant_id = tenant.id
+
+    return tenant
+
+
+def get_optional_db(tenant: Optional[Tenant] = Depends(get_optional_tenant)) -> Session:
+    """Espejo de `get_db` (`db.py`), tolerante a `tenant=None` (Super Admin):
+    sin tenant resuelto, abre la sesión sobre el schema por defecto en vez de
+    fallar."""
+    with with_db(tenant.schema if tenant else None) as db:
         yield db
 
 

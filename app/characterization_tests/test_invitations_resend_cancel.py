@@ -118,12 +118,14 @@ class ResendCancelInvitationTests(unittest.TestCase):
         return resp, mock_message.call_args.args[2]
 
     def test_reenviar_conserva_el_nombre_y_el_correo_saluda_por_el(self):
+        # spec 096 (FR-059, D11): el saludo se integra en el párrafo,
+        # "Hola, {nombre}." en vez de "Hola, {nombre}:" en línea propia.
         self.invitation.name = "María Pérez"
         self.db.commit()
 
         resp, body = self._resend_capturing_body()
 
-        self.assertIn("Hola, María Pérez:", body)
+        self.assertIn("Hola, María Pérez.", body)
         self.assertEqual(resp.name, "María Pérez")
         self.db.refresh(self.invitation)
         self.assertEqual(self.invitation.name, "María Pérez")
@@ -133,7 +135,7 @@ class ResendCancelInvitationTests(unittest.TestCase):
 
         resp, body = self._resend_capturing_body()
 
-        self.assertIn("Hola:", body)
+        self.assertIn("Hola.", body)
         self.assertNotIn("Hola, ", body)
         self.assertIsNone(resp.name)
 
