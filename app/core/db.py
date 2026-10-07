@@ -187,6 +187,15 @@ def get_tenant_specific_metadata():
 
 
 
+def find_tenant_by_host(host_without_port: str) -> Optional[Tenant]:
+    """Gemelo de `resolve_tenant_by_id`, pero por host en vez de por id.
+    Extraído de `get_tenant()` (spec 100, research.md Decisión 2) para que
+    `get_optional_tenant` pueda reutilizar la misma consulta sin pasar por el
+    `404` que `get_tenant` sigue levantando sin cambios."""
+    with with_db(None) as db:
+        return db.query(Tenant).filter(Tenant.host == host_without_port).one_or_none()
+
+
 def get_tenant(req: Request) -> Tenant:
     tenant_host = req.headers.get("x-tenant-host")
     logger.info(f"Obteniendo tenant para x-tenant-host: {tenant_host}")
@@ -196,8 +205,7 @@ def get_tenant(req: Request) -> Tenant:
         )
     host_without_port = tenant_host.split(":", 1)[0]
 
-    with with_db(None) as db:
-        tenant = db.query(Tenant).filter(Tenant.host == host_without_port).one_or_none()
+    tenant = find_tenant_by_host(host_without_port)
     logger.info(f"Host recibido: {host_without_port}, Tenant encontrado: {tenant.name if tenant else 'None'}")
     if tenant is None:
         raise HTTPException(status_code=404, detail=f"Tenant not found for host '{host_without_port}'")
