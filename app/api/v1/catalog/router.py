@@ -24,6 +24,8 @@ from app.api.v1.catalog.service import (
     _unique_sku,
     _slug,
     _next_display_order,
+    display_name_duplicado,
+    _raise_display_name_conflict,
 )
 from app.api.v1.catalog.schemas import (
     VariantCreate,
@@ -99,8 +101,13 @@ def create_variant(
     _: User = Depends(require_tenant_admin),
 ):
     product = get_or_404(db, Product, product_id, "Product not found")
-    # spec 084 (A-79): sin nombre propio; `presentation_id` nulo = "Presentación única".
+    # spec 084 (A-79): `presentation_id` nulo = "Presentación única".
     presentation = _resolve_presentation(db, product_id, body.presentation_id)
+    # spec 099 (FR-008): la etiqueta resultante no puede chocar con otra variante activa.
+    display_name = body.name or presentation.name
+    dup_nombre = display_name_duplicado(db, product_id, display_name)
+    if dup_nombre is not None:
+        _raise_display_name_conflict(None)
     if body.sku is not None:
         ensure_unique(db, ProductVariant, ProductVariant.sku, body.sku, "SKU already exists")
     sku = body.sku or _unique_sku(db, f"{_slug(product.name)}-{_slug(presentation.name)}")
@@ -110,6 +117,7 @@ def create_variant(
         price=body.price,
         sku=sku,
         active=True,
+        name=body.name,
         display_order=_next_display_order(db, product_id),
     )
     db.add(variant)
@@ -145,6 +153,17 @@ def update_variant(
         variant.price = body.price
     if body.active is not None:
         variant.active = body.active
+    # spec 099: `None` = sin cambio de nombre propio (ver VariantUpdate.name); un valor
+    # (incluida `""` explícita) sí se aplica. Se valida contra el estado ya actualizado
+    # arriba (presentación/activa), antes de persistir.
+    if body.name is not None:
+        variant.name = body.name
+    if variant.active:
+        dup_nombre = display_name_duplicado(
+            db, variant.product_id, variant.display_name, exclude_id=variant.id
+        )
+        if dup_nombre is not None:
+            _raise_display_name_conflict(None)
     return _commit_variante(db, variant)
 
 

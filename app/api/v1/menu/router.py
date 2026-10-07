@@ -190,7 +190,8 @@ def _build_menu(db: Session) -> list[MenuCategoryResponse]:
 
                 variants.append(MenuVariantResponse(
                     id=v.id, presentation_id=v.presentation_id,
-                    presentation_name=v.presentation_name, price=v.price, discounted_price=discounted_price,
+                    presentation_name=v.presentation_name, display_name=v.display_name,
+                    price=v.price, discounted_price=discounted_price,
                     discount_kind=discount_kind, option_groups=groups, available=v_pedible,
                     promotion=promotion,
                 ))
