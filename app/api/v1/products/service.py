@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy.sql import Select
 
 from app.core.audit import record_audit
@@ -41,6 +41,7 @@ from app.api.v1.products.schemas import (
     ProductUpdate,
     ProductResponse,
     ProductDetailResponse,
+    VariantDetailResponse,
     ProductSaveResponse,
     VariantSaveOut,
     RecipeItemResponse,
@@ -82,17 +83,62 @@ class ProductService:
     def get_or_404(self, db: Session, id: UUID) -> Product:
         return get_or_404(db, Product, id, "Product not found")
 
-    def to_detail_response(self, product: Product) -> ProductDetailResponse:
+    def get_detail_or_404(self, db: Session, id: UUID) -> Product:
+        """Spec 103-detalle-producto-consolidado (research.md D2): variante de
+        `get_or_404` solo para el detalle de producto -- precarga `recipe_items`/
+        `option_groups` de cada variante con `selectinload` (mismo patrón que ya usa
+        `menu/router.py` para evitar N+1 en su propio endpoint), para que
+        `to_detail_response` no dispare una consulta perezosa por variante. No se
+        generaliza `get_or_404` en sí (Principio V): ningún otro llamador necesita hoy
+        esta precarga."""
+        stmt = (
+            select(Product)
+            .where(Product.id == id)
+            .options(
+                selectinload(Product.variants).selectinload(ProductVariant.recipe_items),
+                selectinload(Product.variants).selectinload(ProductVariant.option_groups),
+            )
+        )
+        product = db.execute(stmt).scalar_one_or_none()
+        if product is None:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return product
+
+    def to_detail_response(self, product: Product, user: User) -> ProductDetailResponse:
         """Spec 093 (escenario 9, research.md D9): agrega las presentaciones activas
-        con su precio al detalle de producto, en el shape `VariantResponse` ya
-        existente -- sin receta ni grupos de opciones (FR-018). No se puede confiar en
-        el mapeo automático de `from_attributes` porque incluiría también las
-        presentaciones inactivas de `product.variants`."""
+        con su precio al detalle de producto. Spec 103-detalle-producto-consolidado
+        (research.md D1/D3): cada variante ahora también trae `recipe`/`option_groups`
+        embebidos -- `recipe` solo si `user` no es Cajero (preserva FR-018 de la spec
+        093, que `option_groups` nunca restringió). No se puede confiar en el mapeo
+        automático de `from_attributes` porque incluiría también las presentaciones
+        inactivas de `product.variants`, y porque el modelo ORM expone
+        `recipe_items`/`option_groups`, no `recipe`/`option_groups`.
+
+        `deactivated` (ajuste posterior): las presentaciones inactivas, en el shape
+        `VariantResponse` -- reutiliza el mismo `product.variants` ya precargado, sin
+        receta/grupos (restaurar una ya los pide aparte). Deja innecesario un segundo
+        `GET /products/{id}/variants` solo para listarlas."""
         base = ProductResponse.model_validate(product)
+        is_cashier = user.role is not None and user.role.name == "CASHIER"
         return ProductDetailResponse(
             **base.model_dump(),
             variants=[
-                VariantResponse.model_validate(v) for v in product.variants if v.active
+                VariantDetailResponse(
+                    **VariantResponse.model_validate(v).model_dump(),
+                    recipe=(
+                        []
+                        if is_cashier
+                        else [RecipeItemResponse.model_validate(r) for r in v.recipe_items]
+                    ),
+                    option_groups=[
+                        VariantOptionGroupResponse.model_validate(g) for g in v.option_groups
+                    ],
+                )
+                for v in product.variants
+                if v.active
+            ],
+            deactivated=[
+                VariantResponse.model_validate(v) for v in product.variants if not v.active
             ],
         )
 
