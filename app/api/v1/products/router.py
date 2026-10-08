@@ -61,9 +61,12 @@ def list_products(
 def get_product(
     id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    return service.to_detail_response(service.get_or_404(db, id))
+    # Spec 103-detalle-producto-consolidado: `get_detail_or_404` precarga receta/grupos
+    # de opciones por variante (research.md D2); `to_detail_response` necesita el `user`
+    # para ocultarle la receta al rol Cajero (D3, FR-003).
+    return service.to_detail_response(service.get_detail_or_404(db, id), user)
 
 
 @router.patch(

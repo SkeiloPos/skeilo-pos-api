@@ -111,13 +111,34 @@ class ProductListResponse(ProductResponse):
     pass
 
 
+class VariantDetailResponse(VariantResponse):
+    """Spec 103-detalle-producto-consolidado (research.md D1): extiende `VariantResponse`
+    sin tocarlo -- `VariantResponse` sigue sin receta/grupos de opciones para cualquier
+    otro consumidor (p. ej. `GET /products/{id}/variants`). `recipe`/`option_groups` no se
+    pueden poblar por `from_attributes` porque el modelo ORM los expone como
+    `recipe_items`/`option_groups` -- el servicio los arma explícitamente
+    (`to_detail_response`), ocultando `recipe` para el rol Cajero (FR-003, preserva FR-018
+    de la spec 093) sin ocultar `option_groups`."""
+
+    recipe: list[RecipeItemResponse] = Field(default_factory=list)
+    option_groups: list[VariantOptionGroupResponse] = Field(default_factory=list)
+
+
 class ProductDetailResponse(ProductResponse):
     """Spec 093 (escenario 9, research.md D9): a diferencia de `ProductListResponse`,
-    incluye las presentaciones activas con su precio -- en el shape ya existente
-    `VariantResponse` (sin receta ni grupos de opciones, a propósito: FR-018 exige que
-    ninguna pantalla de la carta exponga costos/receta/inventario)."""
+    incluye las presentaciones activas con su precio. Spec 103: cada variante ahora
+    también trae su receta y sus grupos de opciones embebidos (`VariantDetailResponse`),
+    sin peticiones adicionales por tamaño -- ver esa clase para el resguardo de rol.
 
-    variants: list[VariantResponse] = Field(default_factory=list)
+    `deactivated` (spec 103, ajuste posterior a la implementación inicial): las
+    presentaciones desactivadas, en el shape `VariantResponse` (sin receta/grupos --
+    restaurarlas ya pide esos datos aparte si hace falta). Vienen del mismo
+    `product.variants` ya precargado por `get_detail_or_404` -- no agregan ninguna
+    consulta nueva. Esto hace innecesario un segundo `GET /products/{id}/variants`
+    solo para listar las desactivadas al abrir el formulario de edición."""
+
+    variants: list[VariantDetailResponse] = Field(default_factory=list)
+    deactivated: list[VariantResponse] = Field(default_factory=list)
 
 
 class VariantSaveOut(VariantResponse):
