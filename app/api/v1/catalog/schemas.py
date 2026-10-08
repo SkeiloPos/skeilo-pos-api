@@ -85,6 +85,12 @@ class RecipeItemIn(BaseModel):
 class RecipeItemResponse(BaseModel):
     id: UUID
     inventory_item_id: UUID
+    # spec 105 (research.md): denormalizados desde `RecipeItem.inventory_item` (ya
+    # cargado vía `lazy="joined"`) -- mismo patrón que `category_name`/`presentation_name`
+    # (spec 097/103) -- para que el cliente muestre el nombre/unidad del insumo sin un
+    # `GET /inventory/items/{id}` por cada línea de receta.
+    inventory_item_name: str
+    unit_measure_id: UUID
     quantity: Decimal
 
     model_config = ConfigDict(from_attributes=True)
@@ -186,6 +192,11 @@ class OptionResponse(BaseModel):
     name: str
     extra_price: Decimal
     inventory_item_id: UUID | None = None
+    # spec 105 (research.md): denormalizados desde `Option.inventory_item` (ya cargado
+    # vía `lazy="joined"`), igual que `RecipeItemResponse` -- `None` si la opción no
+    # tiene insumo ligado.
+    inventory_item_name: str | None = None
+    unit_measure_id: UUID | None = None
     item_quantity: Decimal
     active: bool
 
