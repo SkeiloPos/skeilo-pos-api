@@ -60,6 +60,14 @@ class PurchaseItem(UUIDPrimaryKeyMixin, Base):
         ForeignKey("inventory_items.id"), nullable=False, index=True
     )
 
+    # Relación proveedor-insumo usada en esta línea (spec 106). Nace NULL y hoy ningún flujo
+    # de compras la puebla todavía -- la llena HU-05 al implementar el upsert automático
+    # (RN-15). Existe para que el bloqueo de edición del factor (FR-014) tenga algo que
+    # inspeccionar (research.md D6).
+    supplier_item_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("supplier_items.id"), nullable=True, index=True
+    )
+
     quantity: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
 
     # Cantidad ya recibida (RF-022); el resto queda pendiente.

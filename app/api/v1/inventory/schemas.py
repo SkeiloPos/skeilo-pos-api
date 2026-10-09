@@ -40,6 +40,12 @@ class InventoryItemResponse(BaseModel):
     min_stock: Decimal
     unit_cost: Decimal
     active: bool
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
+    # Nombre del proveedor preferido activo (spec 106, RN-16); None si el insumo no tiene
+    # ninguna relación proveedor-insumo preferida. Se asigna fuera del ORM (ver
+    # supplier_items.attach_preferred_supplier_names) -- no es una columna mapeada.
+    preferred_supplier_name: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -90,8 +96,53 @@ class SupplierResponse(BaseModel):
     phone: str | None = None
     email: str | None = None
     active: bool
+    is_system: bool
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Relación proveedor-insumo (spec 106) ----------
+class SupplierItemCreate(BaseModel):
+    """Alta/reactivación de una relación proveedor-insumo (FR-001/FR-004/FR-005).
+
+    Las dos rutas de creación (desde el insumo o desde el proveedor) fijan uno de los dos
+    ids por la URL; el que falte aquí se completa con el de la ruta.
+    """
+    supplier_id: UUID | None = None
+    inventory_item_id: UUID | None = None
+    presentation: str = Field(..., min_length=1, max_length=100, examples=["Bolsa x 500 g"])
+    conversion_factor: Decimal = Field(..., max_digits=12, decimal_places=3)
+    last_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+
+
+class SupplierItemUpdate(BaseModel):
+    presentation: str | None = Field(None, min_length=1, max_length=100)
+    conversion_factor: Decimal | None = Field(None, max_digits=12, decimal_places=3)
+    last_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+    active: bool | None = None
+    preferred: bool | None = None
+
+
+class SupplierItemResponse(BaseModel):
+    id: UUID
+    supplier_id: UUID
+    supplier_name: str
+    inventory_item_id: UUID
+    inventory_item_name: str
+    presentation: str
+    conversion_factor: Decimal
+    last_cost: Decimal | None = None
+    last_cost_at: UtcDatetime | None = None
+    active: bool
+    preferred: bool
+    equivalence: str | None = None
+    was_preferred: bool = False
+
+
+class SupplierItemConflict(BaseModel):
+    """Cuerpo del 409 de FR-004: la relación activa con la que colisionó el alta."""
+    existing_id: UUID
+    detail: str
 
 
 # ---------- Compras ----------
