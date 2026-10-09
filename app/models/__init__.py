@@ -15,6 +15,7 @@ from .category_presentation import CategoryPresentation
 from .inventory_item import InventoryItem
 from .inventory_movement import InventoryMovement
 from .supplier import Supplier
+from .supplier_item import SupplierItem
 from .purchase import Purchase, PurchaseItem
 
 # Caja y conciliación
