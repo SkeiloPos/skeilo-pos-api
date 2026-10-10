@@ -1,8 +1,14 @@
 """Service de compras: registra la compra y da alta de stock por cada item
 (equivalente al trigger `fn_add_inventory_on_purchase` de schema.sql, en la capa
-de aplicación)."""
+de aplicación).
+
+spec 107: una línea de compra puede venir en unidad base (`quantity`/`unit_cost`, como siempre)
+o en una presentación guardada (`supplier_item_id` + `presentation_quantity` +
+`presentation_unit_cost`) -- `_resolve_purchase_line` es el único lugar que decide cuál de los
+dos casos aplica y calcula la conversión; `create_purchase`/`create_purchase_order` la
+reutilizan para no duplicar esa lógica (research.md D2 de spec 107)."""
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -13,9 +19,11 @@ from sqlalchemy.sql import Select
 from app.core.crud import get_or_404
 from app.models.inventory_item import InventoryItem
 from app.models.supplier import Supplier
+from app.models.supplier_item import SupplierItem
 from app.models.purchase import Purchase, PurchaseItem
+from app.api.v1.inventory import supplier_items
 from app.api.v1.inventory.stock import record_movement
-from app.api.v1.inventory.schemas import PurchaseCreate, PurchaseReceiveIn
+from app.api.v1.inventory.schemas import PurchaseCreate, PurchaseItemIn, PurchaseReceiveIn
 from app.core import inventory_reasons as reasons
 
 logger = logging.getLogger(__name__)
@@ -52,6 +60,60 @@ def list_all_items_for_export(db: Session) -> list[InventoryItem]:
     ).scalars().all()
 
 
+def _resolve_purchase_line(
+    db: Session, purchase: Purchase, it: PurchaseItemIn,
+) -> tuple[PurchaseItem, Decimal, InventoryItem]:
+    """Resuelve una línea de alta directa u orden (spec 107): si trae `supplier_item_id`,
+    calcula `quantity`/`unit_cost` en unidad base a partir de la presentación (FR-003/FR-004),
+    conserva lo capturado originalmente (`presentation_quantity`, snapshot de
+    `presentation_label`) y aplica RN-15; si no, se comporta exactamente igual que antes de
+    esta spec (FR-007). Devuelve el `PurchaseItem` sin persistir todavía, el total de la línea
+    con los valores originales (FR-005), y el `InventoryItem` ya cargado."""
+    item = get_or_404(db, InventoryItem, it.inventory_item_id, "Inventory item not found")
+
+    if it.supplier_item_id is not None:
+        relation = get_or_404(
+            db, SupplierItem, it.supplier_item_id, "Relación proveedor-insumo no encontrada",
+        )
+        if not relation.active:
+            raise HTTPException(422, "La relación proveedor-insumo no está activa")
+        if relation.inventory_item_id != it.inventory_item_id:
+            raise HTTPException(
+                422, "La presentación elegida no corresponde al insumo de esta línea",
+            )
+        if relation.supplier_id != purchase.supplier_id:
+            raise HTTPException(
+                422, "La presentación elegida no corresponde al proveedor de esta compra",
+            )
+
+        quantity = it.presentation_quantity * relation.conversion_factor
+        unit_cost = (it.presentation_unit_cost / relation.conversion_factor).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP,
+        )
+        line_total = it.presentation_quantity * it.presentation_unit_cost
+
+        purchase_item = PurchaseItem(
+            purchase_id=purchase.id,
+            inventory_item_id=it.inventory_item_id,
+            quantity=quantity,
+            unit_cost=unit_cost,
+            supplier_item_id=relation.id,
+            presentation_quantity=it.presentation_quantity,
+            presentation_label=relation.presentation,
+        )
+        supplier_items.apply_purchase_cost(db, relation, it.presentation_unit_cost)
+    else:
+        purchase_item = PurchaseItem(
+            purchase_id=purchase.id,
+            inventory_item_id=it.inventory_item_id,
+            quantity=it.quantity,
+            unit_cost=it.unit_cost,
+        )
+        line_total = it.quantity * it.unit_cost
+
+    return purchase_item, line_total, item
+
+
 def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> Purchase:
     if data.supplier_id is not None:
         get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
@@ -68,22 +130,17 @@ def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> 
 
         total = Decimal("0")
         for it in data.items:
-            item = get_or_404(db, InventoryItem, it.inventory_item_id, "Inventory item not found")
-            db.add(PurchaseItem(
-                purchase_id=purchase.id,
-                inventory_item_id=it.inventory_item_id,
-                quantity=it.quantity,
-                received_quantity=it.quantity,  # alta directa: recibida por completo
-                unit_cost=it.unit_cost,
-            ))
+            purchase_item, line_total, item = _resolve_purchase_line(db, purchase, it)
+            purchase_item.received_quantity = purchase_item.quantity  # alta directa: recibida por completo
+            db.add(purchase_item)
             # Alta de stock + kardex + actualización del costo unitario.
             record_movement(
-                db, it.inventory_item_id, type="in", quantity=it.quantity,
+                db, item.id, type="in", quantity=purchase_item.quantity,
                 reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE, reference_id=purchase.id,
                 user_id=user_id,
             )
-            item.unit_cost = it.unit_cost
-            total += it.quantity * it.unit_cost
+            item.unit_cost = purchase_item.unit_cost
+            total += line_total
 
         purchase.status = "received"
         purchase.total = total
@@ -113,12 +170,10 @@ def create_purchase_order(db: Session, data: PurchaseCreate, user_id: UUID | Non
         db.flush()
         total = Decimal("0")
         for it in data.items:
-            get_or_404(db, InventoryItem, it.inventory_item_id, "Inventory item not found")
-            db.add(PurchaseItem(
-                purchase_id=purchase.id, inventory_item_id=it.inventory_item_id,
-                quantity=it.quantity, received_quantity=Decimal("0"), unit_cost=it.unit_cost,
-            ))
-            total += it.quantity * it.unit_cost
+            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, it)
+            purchase_item.received_quantity = Decimal("0")
+            db.add(purchase_item)
+            total += line_total
         purchase.total = total
         db.commit()
     except HTTPException:
@@ -132,7 +187,12 @@ def create_purchase_order(db: Session, data: PurchaseCreate, user_id: UUID | Non
 def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
                      user_id: UUID | None) -> Purchase:
     """Recibe (parcial o totalmente) una orden de compra: suma stock por los
-    ítems indicados, incrementa `received_quantity` y ajusta el estado."""
+    ítems indicados, incrementa `received_quantity` y ajusta el estado.
+
+    spec 107: si el ítem se pactó en una presentación (`supplier_item_id` no NULL), la
+    recepción viene en `presentation_quantity` y se convierte con el factor que ya está fijado
+    en el propio `PurchaseItem` -- nunca con uno que llegue en el request (research.md D4),
+    así que el factor no puede cambiar entre crear la orden y recibirla."""
     purchase = get_or_404(db, Purchase, purchase_id, "Purchase not found")
     if purchase.status == "received":
         raise HTTPException(409, "La compra ya fue recibida por completo")
@@ -143,18 +203,38 @@ def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
             pi = items.get(r.purchase_item_id)
             if pi is None:
                 raise HTTPException(404, f"Ítem de compra {r.purchase_item_id} no encontrado")
+
+            if pi.supplier_item_id is not None:
+                if r.presentation_quantity is None:
+                    raise HTTPException(
+                        422,
+                        f"El ítem {pi.id} se pactó en una presentación; indica "
+                        f"presentation_quantity, no quantity",
+                    )
+                relation = get_or_404(
+                    db, SupplierItem, pi.supplier_item_id,
+                    "Relación proveedor-insumo no encontrada",
+                )
+                quantity_received = r.presentation_quantity * relation.conversion_factor
+            else:
+                if r.quantity is None:
+                    raise HTTPException(
+                        422, f"El ítem {pi.id} no usa presentación; indica quantity",
+                    )
+                quantity_received = r.quantity
+
             remaining = Decimal(pi.quantity) - Decimal(pi.received_quantity)
-            if r.quantity > remaining:
+            if quantity_received > remaining:
                 raise HTTPException(
                     422,
-                    f"Recepción {r.quantity} excede lo pendiente ({remaining}) del ítem {pi.id}",
+                    f"Recepción {quantity_received} excede lo pendiente ({remaining}) del ítem {pi.id}",
                 )
             record_movement(
-                db, pi.inventory_item_id, type="in", quantity=r.quantity,
+                db, pi.inventory_item_id, type="in", quantity=quantity_received,
                 reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE,
                 reference_id=purchase.id, user_id=user_id,
             )
-            pi.received_quantity = Decimal(pi.received_quantity) + r.quantity
+            pi.received_quantity = Decimal(pi.received_quantity) + quantity_received
             inv = db.get(InventoryItem, pi.inventory_item_id)
             if inv is not None:
                 inv.unit_cost = pi.unit_cost

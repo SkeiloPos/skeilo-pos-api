@@ -293,3 +293,31 @@ def attach_preferred_supplier_names(db: Session, items) -> None:
     names_by_item = {item_id: name for item_id, name in rows}
     for item in items:
         item.preferred_supplier_name = names_by_item.get(item.id)
+
+
+def attach_conversion_factors(db: Session, purchase_items) -> None:
+    """spec 107: fija `item.conversion_factor` (atributo transitorio, no una columna de
+    PurchaseItem) en cada línea de compra cuyo `supplier_item_id` no sea NULL -- lo necesita la
+    UI de recepción para mostrar "pendiente en presentaciones". Una sola consulta por lote,
+    mismo patrón que attach_preferred_supplier_names."""
+    purchase_items = list(purchase_items)
+    relation_ids = {pi.supplier_item_id for pi in purchase_items if pi.supplier_item_id is not None}
+    if not relation_ids:
+        for pi in purchase_items:
+            pi.conversion_factor = None
+        return
+    rows = db.execute(
+        select(SupplierItem.id, SupplierItem.conversion_factor)
+        .where(SupplierItem.id.in_(relation_ids))
+    ).all()
+    factor_by_relation = {relation_id: factor for relation_id, factor in rows}
+    for pi in purchase_items:
+        pi.conversion_factor = factor_by_relation.get(pi.supplier_item_id)
+
+
+def apply_purchase_cost(db: Session, relation: SupplierItem, cost_per_presentation: Decimal) -> None:
+    """RN-15 (spec 107): fija el último costo de la relación al precio pactado en esta compra.
+    Sin commit propio -- el llamador (create_purchase/create_purchase_order) decide cuándo
+    cerrar la transacción, mismo patrón que _apply_preferred_swap."""
+    relation.last_cost = cost_per_presentation
+    relation.last_cost_at = utc_now()
