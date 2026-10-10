@@ -17,12 +17,14 @@ from app.models.unit_measure import UnitMeasure
 from app.models.supplier import Supplier
 from app.models.purchase import Purchase
 from app.api.v1.inventory import service
+from app.api.v1.inventory import supplier_items
 from app.api.v1.inventory.export import build_inventory_excel
 from app.api.v1.inventory.stock import apply_adjustment
 from app.api.v1.inventory.schemas import (
     InventoryItemCreate, InventoryItemUpdate, InventoryItemResponse, InventoryItemType,
     AdjustmentIn, MovementResponse,
     SupplierCreate, SupplierUpdate, SupplierResponse,
+    SupplierItemCreate, SupplierItemUpdate, SupplierItemResponse,
     PurchaseCreate, PurchaseResponse, PurchaseReceiveIn,
     LowStockResponse,
 )
@@ -51,7 +53,9 @@ def list_items(
         active=active,
         low_stock=low_stock,
     )
-    return paginate(db, stmt, page, size)
+    result = paginate(db, stmt, page, size)
+    supplier_items.attach_preferred_supplier_names(db, result["items"])
+    return result
 
 
 @router.get("/items/low-stock", response_model=list[LowStockResponse], summary="Insumos en o bajo el mínimo")
@@ -85,7 +89,9 @@ def export_items(
 
 @router.get("/items/{item_id}", response_model=InventoryItemResponse, summary="Obtener un insumo")
 def get_item(item_id: UUID, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return get_or_404(db, InventoryItem, item_id, "Inventory item not found")
+    item = get_or_404(db, InventoryItem, item_id, "Inventory item not found")
+    supplier_items.attach_preferred_supplier_names(db, [item])
+    return item
 
 
 @router.post("/items", response_model=InventoryItemResponse, status_code=status.HTTP_201_CREATED, summary="Crear un insumo")
@@ -170,8 +176,15 @@ def item_movements(
 
 # ============================ Proveedores ============================
 @router.get("/suppliers", response_model=list[SupplierResponse], summary="Listar proveedores")
-def list_suppliers(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return db.execute(select(Supplier).order_by(Supplier.name)).scalars().all()
+def list_suppliers(
+    exclude_system: bool = Query(False, description="Excluye proveedores de sistema (FR-012)"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    stmt = select(Supplier)
+    if exclude_system:
+        stmt = stmt.where(Supplier.is_system.is_(False))
+    return db.execute(stmt.order_by(Supplier.name)).scalars().all()
 
 
 @router.post("/suppliers", response_model=SupplierResponse, status_code=status.HTTP_201_CREATED, summary="Crear proveedor")
@@ -198,6 +211,85 @@ def update_supplier(
     return supplier
 
 
+# ===================== Relación proveedor-insumo (spec 106) =====================
+@router.get(
+    "/items/{item_id}/suppliers", response_model=list[SupplierItemResponse],
+    summary="Proveedores que venden este insumo",
+)
+def list_item_suppliers(
+    item_id: UUID,
+    include_inactive: bool = Query(False),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    relations = supplier_items.list_for_item(db, item_id, include_inactive)
+    return [supplier_items.to_response(db, r) for r in relations]
+
+
+@router.post(
+    "/items/{item_id}/suppliers", response_model=SupplierItemResponse,
+    summary="Vincular un proveedor a este insumo",
+)
+def create_item_supplier(
+    item_id: UUID,
+    body: SupplierItemCreate,
+    response: Response,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    relation, status_code = supplier_items.create_or_reactivate(
+        db, supplier_id=body.supplier_id, inventory_item_id=item_id, body=body,
+    )
+    response.status_code = status_code
+    return supplier_items.to_response(db, relation)
+
+
+@router.get(
+    "/suppliers/{supplier_id}/items", response_model=list[SupplierItemResponse],
+    summary="Insumos que vende este proveedor",
+)
+def list_supplier_items(
+    supplier_id: UUID,
+    include_inactive: bool = Query(False),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    relations = supplier_items.list_for_supplier(db, supplier_id, include_inactive)
+    return [supplier_items.to_response(db, r) for r in relations]
+
+
+@router.post(
+    "/suppliers/{supplier_id}/items", response_model=SupplierItemResponse,
+    summary="Vincular este proveedor a un insumo",
+)
+def create_supplier_item(
+    supplier_id: UUID,
+    body: SupplierItemCreate,
+    response: Response,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    relation, status_code = supplier_items.create_or_reactivate(
+        db, supplier_id=supplier_id, inventory_item_id=body.inventory_item_id, body=body,
+    )
+    response.status_code = status_code
+    return supplier_items.to_response(db, relation)
+
+
+@router.patch(
+    "/supplier-items/{relation_id}", response_model=SupplierItemResponse,
+    summary="Editar, preferir o (des)activar una relación proveedor-insumo",
+)
+def update_supplier_item(
+    relation_id: UUID,
+    body: SupplierItemUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    relation, was_preferred = supplier_items.update(db, relation_id, body)
+    return supplier_items.to_response(db, relation, was_preferred=was_preferred)
+
+
 # ============================ Compras ============================
 @router.get(
     "/purchases", response_model=Page[PurchaseResponse], summary="Listar compras",
@@ -210,7 +302,10 @@ def list_purchases(
     _: User = Depends(get_current_user),
 ):
     stmt = select(Purchase).order_by(Purchase.purchased_at.desc())
-    return paginate(db, stmt, page, size)
+    result = paginate(db, stmt, page, size)
+    for p in result["items"]:
+        supplier_items.attach_conversion_factors(db, p.items)
+    return result
 
 
 @router.post(
@@ -223,7 +318,9 @@ def create_purchase(
     db: Session = Depends(get_db),
     user: User = Depends(require_tenant_admin),
 ):
-    return service.create_purchase(db, body, user_id=user.id)
+    purchase = service.create_purchase(db, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
 
 
 @router.post(
@@ -236,7 +333,9 @@ def create_purchase_order(
     db: Session = Depends(get_db),
     user: User = Depends(require_tenant_admin),
 ):
-    return service.create_purchase_order(db, body, user_id=user.id)
+    purchase = service.create_purchase_order(db, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
 
 
 @router.post(
@@ -250,4 +349,6 @@ def receive_purchase(
     db: Session = Depends(get_db),
     user: User = Depends(require_tenant_admin),
 ):
-    return service.receive_purchase(db, purchase_id, body, user_id=user.id)
+    purchase = service.receive_purchase(db, purchase_id, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase

@@ -17,4 +17,8 @@ class Supplier(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # Proveedor de sistema (p. ej. "Compra ocasional", spec 106): nunca se vincula a un
+    # insumo ni puede ser preferido (RN-17).
+    is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
     __table_args__ = ({"schema": "tenant"},)

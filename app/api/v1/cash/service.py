@@ -160,15 +160,29 @@ def reconcile(db: Session, shift: CashShift) -> dict:
 
     # El cambio (RF-029) sale del cajón, así que el efectivo neto de ventas es
     # Σ pagos en efectivo − Σ cambio entregado.
-    change_total = db.execute(
+    change_total = Decimal(db.execute(
         select(func.coalesce(func.sum(Sale.change_given), 0)).where(
             Sale.cash_shift_id == shift.id, Sale.status == "paid"
         )
-    ).scalar_one()
+    ).scalar_one())
 
-    ventas_efectivo = by_type["cash"] - Decimal(change_total)
+    ventas_efectivo = by_type["cash"] - change_total
     ventas_tarjeta = by_type["card"]
     ventas_transferencia = by_type["transfer"]
+
+    # Spec 108: `sales_by_method` debe mostrar venta neta (lo facturado), no el
+    # efectivo bruto recibido en mano — se descuenta el cambio a prorrata del
+    # bruto de cada método "cash" (normalmente hay uno solo, y entonces queda
+    # igual a `ventas_efectivo`).
+    cash_rows = [m for m in sales_by_method if m["method_type"] == "cash"]
+    if cash_rows and change_total:
+        for row in cash_rows:
+            share = (
+                change_total / len(cash_rows)
+                if by_type["cash"] == 0
+                else change_total * row["total"] / by_type["cash"]
+            )
+            row["total"] -= share
 
     # --- Movimientos manuales agrupados por kind ---
     mov_rows = db.execute(
@@ -196,10 +210,10 @@ def reconcile(db: Session, shift: CashShift) -> dict:
         "ventas_efectivo": ventas_efectivo,
         "ventas_tarjeta": ventas_tarjeta,
         "ventas_transferencia": ventas_transferencia,
-        # Va aparte para que el desglose cuadre a la vista: las filas de
-        # `sales_by_method` son brutas y `ventas_efectivo` ya lleva el cambio
-        # descontado.
-        "cambio_entregado": Decimal(change_total),
+        # Dato informativo: cuánto cambio salió del cajón. Desde spec 108, ya no
+        # hace falta para que el desglose cuadre a la vista — las filas de
+        # `sales_by_method` también son netas (ver ajuste arriba).
+        "cambio_entregado": change_total,
         "sales_by_method": sales_by_method,
         "ingresos": ingresos,
         "egresos": egresos,
