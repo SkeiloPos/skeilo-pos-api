@@ -12,8 +12,31 @@ class InventoryItemType(str, Enum):
     PACKAGED = "packaged"
 
 
+# ---------- Plantilla única de export/import (spec 109, research.md D6) ----------
+# Una sola definición de cabeceras, en orden -- `export.py` e `import_.py` la importan
+# en vez de repetirla cada uno por su lado (FR-001). Ver data-model.md para el origen/
+# tipo esperado de cada columna.
+INVENTORY_TEMPLATE_HEADERS = [
+    "Código",
+    "Nombre",
+    "Tipo",
+    "Unidad",
+    "Stock",
+    "Mínimo",
+    "Costo",
+    "Proveedor preferido",
+    "Presentación",
+    "Factor de conversión",
+    "Último costo",
+]
+
+
 # ---------- Insumos ----------
 class InventoryItemCreate(BaseModel):
+    code: str | None = Field(
+        None, min_length=1, max_length=20,
+        description="Si no se indica, se asigna uno automáticamente (spec 109).",
+    )
     name: str = Field(..., min_length=1, max_length=255, examples=["Leche entera", "Fresa"])
     unit_measure_id: UUID
     type: InventoryItemType = InventoryItemType.RAW_MATERIAL
@@ -23,6 +46,7 @@ class InventoryItemCreate(BaseModel):
 
 
 class InventoryItemUpdate(BaseModel):
+    code: str | None = Field(None, min_length=1, max_length=20)
     name: str | None = Field(None, min_length=1, max_length=255)
     unit_measure_id: UUID | None = None
     type: InventoryItemType | None = None
@@ -33,6 +57,7 @@ class InventoryItemUpdate(BaseModel):
 
 class InventoryItemResponse(BaseModel):
     id: UUID
+    code: str
     name: str
     unit_measure_id: UUID
     type: InventoryItemType
@@ -235,3 +260,27 @@ class LowStockResponse(BaseModel):
     min_stock: Decimal
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Importación masiva (spec 109) ----------
+class InventoryImportJobResponse(BaseModel):
+    id: UUID
+    status: str
+    file_name: str
+    started_at: UtcDatetime
+    finished_at: UtcDatetime | None = None
+    total_rows: int
+    created_count: int
+    updated_count: int
+    failed_count: int
+    # No es una columna mapeada -- lo fija el router al construir la respuesta
+    # (igual criterio que `preferred_supplier_name`), para que el frontend
+    # decida si ofrece la descarga de errores sin tener que mirar el conteo.
+    has_errors: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ImportStructureError(BaseModel):
+    """Cuerpo del 422 de FR-005: problemas de estructura, uno por línea."""
+    problems: list[str]

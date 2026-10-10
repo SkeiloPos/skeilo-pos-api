@@ -94,11 +94,11 @@ def _fixture(db):
         db.add(unit); db.flush()
 
     fresa = InventoryItem(
-        name=f"helado-fresa-{uuid4().hex[:8]}", type="raw_material",
+        code=f"test-{uuid4().hex[:8]}", name=f"helado-fresa-{uuid4().hex[:8]}", type="raw_material",
         unit_measure_id=unit.id, current_stock=STOCK_INICIAL, unit_cost=Decimal("1.00"),
     )
     choco = InventoryItem(
-        name=f"helado-choco-{uuid4().hex[:8]}", type="raw_material",
+        code=f"test-{uuid4().hex[:8]}", name=f"helado-choco-{uuid4().hex[:8]}", type="raw_material",
         unit_measure_id=unit.id, current_stock=STOCK_INICIAL, unit_cost=Decimal("1.00"),
     )
     db.add_all([fresa, choco]); db.flush()

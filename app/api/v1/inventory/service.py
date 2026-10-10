@@ -8,6 +8,8 @@ o en una presentación guardada (`supplier_item_id` + `presentation_quantity` +
 dos casos aplica y calcula la conversión; `create_purchase`/`create_purchase_order` la
 reutilizan para no duplicar esa lógica (research.md D2 de spec 107)."""
 import logging
+import re
+from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
@@ -17,7 +19,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
+from app.core.timezone import utc_now
 from app.models.inventory_item import InventoryItem
+from app.models.inventory_import_job import InventoryImportJob
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
 from app.models.purchase import Purchase, PurchaseItem
@@ -27,6 +31,32 @@ from app.api.v1.inventory.schemas import PurchaseCreate, PurchaseItemIn, Purchas
 from app.core import inventory_reasons as reasons
 
 logger = logging.getLogger(__name__)
+
+# research.md D5: muy por encima de lo que toma procesar ≈500 filas -- un job
+# "procesando" más viejo que esto se considera abandonado (el worker murió sin
+# actualizar su estado), no una importación genuinamente en curso.
+IMPORT_JOB_TIMEOUT = timedelta(minutes=30)
+
+
+def find_blocking_import_job(db: Session) -> InventoryImportJob | None:
+    """FR-010/research.md D5: devuelve el job `procesando` vigente del tenant, o
+    `None` si no hay ninguno que realmente bloquee una importación nueva. Un job
+    `procesando` que ya superó `IMPORT_JOB_TIMEOUT` se marca `interrumpido` (sin
+    revertir nada ya aplicado, FR-015) y deja de bloquear."""
+    candidatos = db.execute(
+        select(InventoryImportJob).where(InventoryImportJob.status == "procesando")
+    ).scalars().all()
+    ahora = utc_now().replace(tzinfo=None)
+    for job in candidatos:
+        if ahora - job.started_at > IMPORT_JOB_TIMEOUT:
+            job.status = "interrumpido"
+            job.finished_at = ahora
+            db.add(job)
+        else:
+            db.commit()
+            return job
+    db.commit()
+    return None
 
 
 def list_items_query(
@@ -58,6 +88,50 @@ def list_all_items_for_export(db: Session) -> list[InventoryItem]:
     return db.execute(
         select(InventoryItem).order_by(InventoryItem.name)
     ).scalars().all()
+
+
+_NUMERIC_CODE = re.compile(r"^\d+$")
+
+
+def generate_next_code(db: Session) -> str:
+    """Código secuencial con cero a la izquierda (spec 109, research.md D3): el
+    siguiente entero después del código numérico más alto ya asignado en este
+    tenant, con al menos 4 dígitos. Códigos no numéricos que el administrador haya
+    fijado a mano no interfieren con la secuencia automática -- se ignoran al
+    buscar el máximo."""
+    codes = db.execute(select(InventoryItem.code)).scalars().all()
+    max_numeric = 0
+    for code in codes:
+        if _NUMERIC_CODE.match(code):
+            max_numeric = max(max_numeric, int(code))
+    return f"{max_numeric + 1:04d}"
+
+
+def resolve_or_create_by_code(
+    db: Session, code: str | None, **fields
+) -> tuple[InventoryItem, bool]:
+    """Upsert por código (spec 109, FR-007): si `code` coincide con un insumo ya
+    existente del tenant, lo actualiza con `fields`; si no coincide con ninguno, o
+    viene vacío, crea uno nuevo (asignándole un código automático con
+    `generate_next_code` cuando viene vacío). Devuelve `(insumo, fue_creado)`.
+    Usado tanto por el alta manual de un insumo (router.py) como por cada fila de
+    una importación masiva (import_.py)."""
+    item = None
+    if code:
+        item = db.execute(
+            select(InventoryItem).where(InventoryItem.code == code)
+        ).scalar_one_or_none()
+
+    if item is not None:
+        for key, value in fields.items():
+            setattr(item, key, value)
+        db.flush()
+        return item, False
+
+    item = InventoryItem(code=code or generate_next_code(db), **fields)
+    db.add(item)
+    db.flush()
+    return item, True
 
 
 def _resolve_purchase_line(

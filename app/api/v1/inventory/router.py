@@ -1,32 +1,36 @@
 from datetime import date
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from openpyxl import load_workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.db import get_db
+from app.core.db import get_db, get_tenant
 from app.core.crud import get_or_404, ensure_unique
 from app.core.dependencies import get_current_user, require_tenant_admin
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import require_module_access
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
+from app.models.inventory_import_job import InventoryImportJob
 from app.models.unit_measure import UnitMeasure
 from app.models.supplier import Supplier
 from app.models.purchase import Purchase
 from app.api.v1.inventory import service
 from app.api.v1.inventory import supplier_items
-from app.api.v1.inventory.export import build_inventory_excel
+from app.api.v1.inventory import import_ as import_service
+from app.api.v1.inventory.export import build_inventory_excel, build_import_errors_excel
 from app.api.v1.inventory.stock import apply_adjustment
+from app.celery_task import import_inventory_task
 from app.api.v1.inventory.schemas import (
     InventoryItemCreate, InventoryItemUpdate, InventoryItemResponse, InventoryItemType,
     AdjustmentIn, MovementResponse,
     SupplierCreate, SupplierUpdate, SupplierResponse,
     SupplierItemCreate, SupplierItemUpdate, SupplierItemResponse,
     PurchaseCreate, PurchaseResponse, PurchaseReceiveIn,
-    LowStockResponse,
+    LowStockResponse, InventoryImportJobResponse,
 )
 
 router = APIRouter(
@@ -78,8 +82,117 @@ def export_items(
 ):
     items = service.list_all_items_for_export(db)
     unit_measures_by_id = {u.id: u for u in db.execute(select(UnitMeasure)).scalars().all()}
-    buffer = build_inventory_excel(items, unit_measures_by_id)
+    preferred_by_item = supplier_items.preferred_relations_by_item(db, [i.id for i in items])
+    buffer = build_inventory_excel(items, unit_measures_by_id, preferred_by_item)
     filename = f"inventario_{date.today().isoformat()}.xlsx"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _job_response(job: InventoryImportJob) -> InventoryImportJobResponse:
+    # `has_errors` no es una columna mapeada (mismo patrón que
+    # `preferred_supplier_name`) -- se fija aquí para que
+    # `InventoryImportJobResponse` la lea vía `from_attributes`.
+    job.has_errors = job.failed_count > 0
+    return InventoryImportJobResponse.model_validate(job)
+
+
+@router.post(
+    "/items/import", response_model=InventoryImportJobResponse,
+    status_code=status.HTTP_202_ACCEPTED, summary="Importar inventario desde .xlsx",
+)
+def import_items(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    user: User = Depends(require_tenant_admin),
+):
+    try:
+        wb = load_workbook(file.file, data_only=True)
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "El archivo no es un .xlsx válido"
+        ) from exc
+
+    filas_wb = list(wb.active.iter_rows(values_only=True))
+    if not filas_wb:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "El archivo está vacío")
+    headers, filas = filas_wb[0], [list(f) for f in filas_wb[1:]]
+
+    problemas = import_service.validar_estructura(headers)
+    if problemas:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "; ".join(problemas))
+
+    en_curso = service.find_blocking_import_job(db)
+    if en_curso is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Ya hay una importación en curso (job {en_curso.id})",
+        )
+
+    job = InventoryImportJob(
+        status="procesando", file_name=file.filename or "inventario.xlsx",
+        started_by_user_id=user.id, total_rows=len(filas),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    import_inventory_task.delay(tenant.schema, str(job.id), filas)
+    return _job_response(job)
+
+
+@router.get(
+    "/items/import/current", response_model=InventoryImportJobResponse | None,
+    summary="Job de importación más reciente del negocio",
+)
+def current_import_job(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    """Historia 3, escenario 2: el administrador puede cerrar y volver a abrir
+    la pantalla de Inventario y encontrar el resultado del import, en curso o
+    ya finalizado, sin recordar ningún id."""
+    job = db.execute(
+        select(InventoryImportJob).order_by(InventoryImportJob.started_at.desc())
+    ).scalars().first()
+    return _job_response(job) if job is not None else None
+
+
+def _get_import_job_or_404(db: Session, job_id: UUID) -> InventoryImportJob:
+    job = db.get(InventoryImportJob, job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Import job not found")
+    return job
+
+
+@router.get(
+    "/items/import/{job_id}", response_model=InventoryImportJobResponse,
+    summary="Job de importación puntual",
+)
+def get_import_job(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    return _job_response(_get_import_job_or_404(db, job_id))
+
+
+@router.get("/items/import/{job_id}/errors", summary="Reporte de filas fallidas de un import")
+def download_import_errors(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    job = _get_import_job_or_404(db, job_id)
+    if job.failed_count == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Este import no tiene filas fallidas")
+
+    buffer = build_import_errors_excel(job.errors)
+    filename = f"errores_{job.file_name}"
     return Response(
         content=buffer.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -102,7 +215,10 @@ def create_item(
 ):
     get_or_404(db, UnitMeasure, body.unit_measure_id, "Unit measure not found")
     ensure_unique(db, InventoryItem, InventoryItem.name, body.name, "Inventory item name already exists")
+    code = body.code or service.generate_next_code(db)
+    ensure_unique(db, InventoryItem, InventoryItem.code, code, "Inventory item code already exists")
     item = InventoryItem(
+        code=code,
         name=body.name,
         unit_measure_id=body.unit_measure_id,
         type=body.type.value,
@@ -124,6 +240,9 @@ def update_item(
     _: User = Depends(require_tenant_admin),
 ):
     item = get_or_404(db, InventoryItem, item_id, "Inventory item not found")
+    if body.code is not None and body.code != item.code:
+        ensure_unique(db, InventoryItem, InventoryItem.code, body.code, "Inventory item code already exists")
+        item.code = body.code
     if body.name is not None and body.name != item.name:
         ensure_unique(db, InventoryItem, InventoryItem.name, body.name, "Inventory item name already exists")
         item.name = body.name

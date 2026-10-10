@@ -100,7 +100,7 @@ def seed():
             db.add(unit); db.flush()
 
         item = InventoryItem(
-            name=f"e2e-insumo-{uuid.uuid4().hex[:8]}", type="raw_material",
+            code=f"test-{uuid.uuid4().hex[:8]}", name=f"e2e-insumo-{uuid.uuid4().hex[:8]}", type="raw_material",
             unit_measure_id=unit.id, current_stock=STOCK_INICIAL,
             unit_cost=Decimal("1.00"),
         )
