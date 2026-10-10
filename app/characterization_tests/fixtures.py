@@ -209,6 +209,7 @@ def make_inventory_item(db: Session, unit: UnitMeasure | None = None, **kw) -> I
     kw.setdefault("id", _uid())
     kw.setdefault("unit_measure_id", unit.id)
     kw.setdefault("name", f"insumo-{kw['id']}")
+    kw.setdefault("code", f"codigo-{kw['id']}")
     kw.setdefault("type", "raw_material")
     kw.setdefault("current_stock", Decimal("0"))
     kw.setdefault("min_stock", Decimal("0"))

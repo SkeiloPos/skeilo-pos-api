@@ -14,6 +14,7 @@ from .category_presentation import CategoryPresentation
 # Inventario (stock único, sin lotes)
 from .inventory_item import InventoryItem
 from .inventory_movement import InventoryMovement
+from .inventory_import_job import InventoryImportJob
 from .supplier import Supplier
 from .supplier_item import SupplierItem
 from .purchase import Purchase, PurchaseItem

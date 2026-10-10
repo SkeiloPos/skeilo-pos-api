@@ -102,6 +102,9 @@ alembic upgrade head
 
 # 5. API
 uvicorn app.main:app --reload
+
+# 6. Worker de Celery (en otra terminal, con el mismo entorno activado)
+celery -A app.celery_task:c_app worker --loglevel=info
 ```
 
 API en http://localhost:8000.

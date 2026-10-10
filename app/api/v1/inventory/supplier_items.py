@@ -295,6 +295,42 @@ def attach_preferred_supplier_names(db: Session, items) -> None:
         item.preferred_supplier_name = names_by_item.get(item.id)
 
 
+def preferred_relations_by_item(db: Session, item_ids) -> dict[UUID, dict]:
+    """spec 109 (research.md D4): trae, para cada insumo recibido, el nombre del
+    proveedor preferido, la presentación, el factor de conversión y el último costo
+    pagado de esa relación -- una sola consulta para todo el lote. Usado por
+    `export.py` y por el import (para no crear duplicados al re-subir un archivo ya
+    exportado). No toca `attach_preferred_supplier_names` (solo el nombre) ni el
+    contrato de `InventoryItemResponse`, que no necesita estos 3 campos extra."""
+    item_ids = list(item_ids)
+    if not item_ids:
+        return {}
+    rows = db.execute(
+        select(
+            SupplierItem.inventory_item_id,
+            Supplier.name,
+            SupplierItem.presentation,
+            SupplierItem.conversion_factor,
+            SupplierItem.last_cost,
+        )
+        .join(Supplier, Supplier.id == SupplierItem.supplier_id)
+        .where(
+            SupplierItem.inventory_item_id.in_(item_ids),
+            SupplierItem.preferred.is_(True),
+            SupplierItem.active.is_(True),
+        )
+    ).all()
+    return {
+        item_id: {
+            "supplier_name": supplier_name,
+            "presentation": presentation,
+            "conversion_factor": conversion_factor,
+            "last_cost": last_cost,
+        }
+        for item_id, supplier_name, presentation, conversion_factor, last_cost in rows
+    }
+
+
 def attach_conversion_factors(db: Session, purchase_items) -> None:
     """spec 107: fija `item.conversion_factor` (atributo transitorio, no una columna de
     PurchaseItem) en cada línea de compra cuyo `supplier_item_id` no sea NULL -- lo necesita la

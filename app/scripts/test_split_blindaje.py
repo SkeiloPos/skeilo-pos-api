@@ -99,7 +99,7 @@ def _fixture(db, suf: str):
     unit = db.execute(select(UnitMeasure).limit(1)).scalar_one()
     cat = db.execute(select(Category).limit(1)).scalar_one()
     item = InventoryItem(
-        name=f"insumo-split-{suf}", type="raw_material", unit_measure_id=unit.id,
+        code=f"test-{suf}", name=f"insumo-split-{suf}", type="raw_material", unit_measure_id=unit.id,
         current_stock=Decimal("500"), unit_cost=Decimal("1"),
     )
     db.add(item); db.flush()

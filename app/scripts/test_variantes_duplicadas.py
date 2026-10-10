@@ -94,7 +94,7 @@ def _fixture(db):
         db.add(unit); db.flush()
 
     insumo = InventoryItem(
-        name=f"insumo-dup-{uuid4().hex[:8]}", type="raw_material",
+        code=f"test-{uuid4().hex[:8]}", name=f"insumo-dup-{uuid4().hex[:8]}", type="raw_material",
         unit_measure_id=unit.id, current_stock=Decimal("100.000"),
         unit_cost=Decimal("1.00"),
     )
