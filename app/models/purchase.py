@@ -60,13 +60,25 @@ class PurchaseItem(UUIDPrimaryKeyMixin, Base):
         ForeignKey("inventory_items.id"), nullable=False, index=True
     )
 
-    # Relación proveedor-insumo usada en esta línea (spec 106). Nace NULL y hoy ningún flujo
-    # de compras la puebla todavía -- la llena HU-05 al implementar el upsert automático
-    # (RN-15). Existe para que el bloqueo de edición del factor (FR-014) tenga algo que
-    # inspeccionar (research.md D6).
+    # Relación proveedor-insumo usada en esta línea (spec 106, poblada desde spec 107): cuando
+    # no es NULL, `quantity`/`unit_cost` de abajo son valores derivados de
+    # `presentation_quantity`/`presentation_unit_cost` (ver service.py), no capturados
+    # directamente. También es lo que hace que el factor de esa relación quede bloqueado
+    # (FR-014, spec 106).
     supplier_item_id: Mapped[Optional[UUID]] = mapped_column(
         ForeignKey("supplier_items.id"), nullable=True, index=True
     )
+
+    # Cuántas presentaciones capturó el administrador (spec 107, FR-002); NULL si la línea se
+    # compró directo en la unidad base del insumo, como siempre.
+    presentation_quantity: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(12, 3), nullable=True
+    )
+
+    # Copia del texto de `SupplierItem.presentation` en el momento de la compra -- no un join en
+    # vivo: esa presentación se puede editar después (spec 106) y una compra ya registrada no
+    # puede cambiar de aspecto retroactivamente (research.md D1, Principio VII).
+    presentation_label: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     quantity: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
 

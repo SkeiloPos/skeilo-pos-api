@@ -2,7 +2,7 @@ from enum import Enum
 from uuid import UUID
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.timezone import UtcDatetime
 
@@ -147,9 +147,28 @@ class SupplierItemConflict(BaseModel):
 
 # ---------- Compras ----------
 class PurchaseItemIn(BaseModel):
+    """spec 107: una línea viene en unidad base (`quantity`/`unit_cost`, como siempre) o en
+    una presentación guardada (`supplier_item_id` + `presentation_quantity` +
+    `presentation_unit_cost`) -- nunca una mezcla de las dos (FR-001/FR-002/FR-007)."""
     inventory_item_id: UUID
-    quantity: Decimal = Field(..., gt=0, max_digits=12, decimal_places=3)
+    quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
     unit_cost: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
+    supplier_item_id: UUID | None = None
+    presentation_quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
+    presentation_unit_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _exactly_one_mode(self):
+        if self.supplier_item_id is not None:
+            if self.presentation_quantity is None:
+                raise ValueError(
+                    "presentation_quantity es obligatorio cuando se indica supplier_item_id"
+                )
+            if self.quantity is not None:
+                raise ValueError("no se puede indicar quantity junto con supplier_item_id")
+        elif self.quantity is None:
+            raise ValueError("quantity es obligatorio cuando no se indica supplier_item_id")
+        return self
 
 
 class PurchaseCreate(BaseModel):
@@ -164,6 +183,14 @@ class PurchaseItemResponse(BaseModel):
     quantity: Decimal
     received_quantity: Decimal
     unit_cost: Decimal
+    supplier_item_id: UUID | None = None
+    presentation_quantity: Decimal | None = None
+    presentation_label: str | None = None
+    # Denormalizado desde SupplierItem.conversion_factor (no es columna de PurchaseItem) --
+    # seguro de exponer porque FR-014 (spec 106) ya bloquea editar ese factor una vez usado en
+    # una compra, y esta fila es ese mismo uso. Lo llena
+    # supplier_items.attach_conversion_factors (ver router.py).
+    conversion_factor: Decimal | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -182,8 +209,19 @@ class PurchaseResponse(BaseModel):
 
 # ---------- Recepción parcial (RF-022) ----------
 class PurchaseReceiveItemIn(BaseModel):
+    """spec 107: si el ítem que se recibe se pactó en una presentación, la recepción viene en
+    `presentation_quantity` (cuántas presentaciones se reciben ahora); si no, en `quantity`
+    directo en unidad base, como siempre. El factor para convertir se lee del `PurchaseItem` ya
+    creado, nunca de este request (research.md D4) -- por eso aquí no hay ningún factor."""
     purchase_item_id: UUID
-    quantity: Decimal = Field(..., gt=0, max_digits=12, decimal_places=3)
+    quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
+    presentation_quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
+
+    @model_validator(mode="after")
+    def _exactly_one_mode(self):
+        if (self.quantity is None) == (self.presentation_quantity is None):
+            raise ValueError("indica exactamente uno de quantity o presentation_quantity")
+        return self
 
 
 class PurchaseReceiveIn(BaseModel):

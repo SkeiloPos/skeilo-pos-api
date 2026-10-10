@@ -302,7 +302,10 @@ def list_purchases(
     _: User = Depends(get_current_user),
 ):
     stmt = select(Purchase).order_by(Purchase.purchased_at.desc())
-    return paginate(db, stmt, page, size)
+    result = paginate(db, stmt, page, size)
+    for p in result["items"]:
+        supplier_items.attach_conversion_factors(db, p.items)
+    return result
 
 
 @router.post(
@@ -315,7 +318,9 @@ def create_purchase(
     db: Session = Depends(get_db),
     user: User = Depends(require_tenant_admin),
 ):
-    return service.create_purchase(db, body, user_id=user.id)
+    purchase = service.create_purchase(db, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
 
 
 @router.post(
@@ -328,7 +333,9 @@ def create_purchase_order(
     db: Session = Depends(get_db),
     user: User = Depends(require_tenant_admin),
 ):
-    return service.create_purchase_order(db, body, user_id=user.id)
+    purchase = service.create_purchase_order(db, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
 
 
 @router.post(
@@ -342,4 +349,6 @@ def receive_purchase(
     db: Session = Depends(get_db),
     user: User = Depends(require_tenant_admin),
 ):
-    return service.receive_purchase(db, purchase_id, body, user_id=user.id)
+    purchase = service.receive_purchase(db, purchase_id, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
