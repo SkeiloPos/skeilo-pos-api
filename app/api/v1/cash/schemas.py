@@ -85,6 +85,9 @@ class SalesByMethod(BaseModel):
     method_id: UUID
     method_name: str
     method_type: str
+    # Venta neta del método (lo facturado). Para `method_type="cash"`, desde
+    # spec 108 ya viene con el cambio entregado descontado — coincide con
+    # `ReconciliationResponse.ventas_efectivo`.
     total: Decimal
     count: int
 
@@ -97,9 +100,9 @@ class ReconciliationResponse(BaseModel):
     ventas_efectivo: Decimal       # ÚNICA que suma a expected
     ventas_tarjeta: Decimal        # informativa
     ventas_transferencia: Decimal  # informativa
-    # Cambio entregado del cajón. `ventas_efectivo` ya lo lleva restado, pero las
-    # filas de `sales_by_method` son brutas: se expone aparte para que el desglose
-    # por método cuadre con `expected` a la vista.
+    # Cambio entregado del cajón. Dato informativo (spec 108): ni `ventas_efectivo`
+    # ni las filas de `sales_by_method` necesitan sumarlo de vuelta, ambos ya son
+    # netos.
     cambio_entregado: Decimal
     # Una fila por método de pago activo, aunque no haya vendido nada en el turno.
     sales_by_method: list[SalesByMethod]
