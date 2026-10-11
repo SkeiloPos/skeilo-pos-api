@@ -129,7 +129,8 @@ class SaleCreate(BaseModel):
     tax: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     tip: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     items: list[SaleItemIn] = Field(..., min_length=1)
-    payments: list[PaymentIn] = Field(..., min_length=1)
+    # spec 112 (RN3/FR-004): hasta 3 líneas de pago por cobro.
+    payments: list[PaymentIn] = Field(..., min_length=1, max_length=3)
 
 
 class SaleItemResponse(BaseModel):

@@ -682,6 +682,23 @@ class TestOrderHasSale(unittest.TestCase):
 
         self.assertFalse(service.order_has_sale(db, order.id))
 
+    def test_order_has_sale_false_en_delivery_sin_sale_sin_importar_el_avance_de_cocina(self):
+        """Spec 112, US5/FR-017: el eje de cobro (`order_has_sale`) es
+        independiente del eje operativo (`OrderItem.estado_cocina`) -- un
+        pedido de Domicilio con todos sus ítems ya 'listo' (lo más avanzado
+        que existe en ese eje; no hay un estado 'despachado' en el modelo,
+        ver research.md D6) sigue sin pago mientras no exista una `Sale`."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        order = fx.make_customer_order(db, ts, status="abierta", channel="POS", order_type="DELIVERY")
+        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        db.commit()
+
+        self.assertFalse(service.order_has_sale(db, order.id))
+
     def test_paid_order_ids_resuelve_en_bloque_para_una_lista_de_pedidos(self):
         """Versión en bloque: una sola consulta para todo un listado, en vez
         de N — el pedido sin `Sale` no aparece en el resultado."""

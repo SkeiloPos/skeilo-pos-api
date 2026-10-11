@@ -377,7 +377,9 @@ class PayIn(BaseModel):
     discount: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     tax: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     tip: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
-    payments: list[PaymentIn] = Field(..., min_length=1)
+    # spec 112 (RN3/FR-004): hasta 3 líneas de pago por cobro — el mismo tope que
+    # impone el panel "Cobrar pedido"; esto es la defensa en profundidad del servidor.
+    payments: list[PaymentIn] = Field(..., min_length=1, max_length=3)
 
 
 class CheckoutAndSendIn(BaseModel):
@@ -396,7 +398,9 @@ class CheckoutAndSendIn(BaseModel):
     discount: Decimal = Field(0, ge=0, le=0, max_digits=12, decimal_places=2)
     tax: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     tip: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
-    payments: list[PaymentIn] = Field(..., min_length=1)
+    # spec 112 (RN3/FR-004): hasta 3 líneas de pago por cobro — el mismo tope que
+    # impone el panel "Cobrar pedido"; esto es la defensa en profundidad del servidor.
+    payments: list[PaymentIn] = Field(..., min_length=1, max_length=3)
     billing_customer_name: str | None = Field(
         None, max_length=255,
         description="A nombre de quién va la factura. Si se omite, 'Consumidor Final'.",
