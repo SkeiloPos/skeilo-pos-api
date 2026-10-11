@@ -497,6 +497,84 @@ class TestService(unittest.TestCase):
         )
 
 
+class TestCreateOrderIdempotencia(unittest.TestCase):
+    """spec 111 (FR-011, RN4): un reintento de red sobre la misma solicitud de
+    creación (mismo `client_request_id`) no debe generar un segundo pedido.
+    No es un characterization test -- es comportamiento nuevo introducido por
+    esa spec, no algo que existiera antes y se esté congelando."""
+
+    def _seed_variant(self, db):
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        return variant
+
+    def test_mismo_client_request_id_devuelve_el_mismo_pedido_sin_duplicar(self):
+        db = fx.new_session()
+        variant = self._seed_variant(db)
+        db.commit()
+
+        data = OrderCreate(
+            channel=OrderChannel.POS,
+            customer_name="Cliente de prueba",
+            client_request_id="intento-abc-123",
+            items=[OrderItemIn(product_variant_id=variant.id, quantity=1)],
+        )
+        primero = service.create_order(db, data, uuid4())
+        db.commit()
+        segundo = service.create_order(db, data, uuid4())
+
+        self.assertEqual(primero.id, segundo.id)
+        filas = db.execute(
+            select(service.CustomerOrder).where(
+                service.CustomerOrder.client_request_id == "intento-abc-123"
+            )
+        ).scalars().all()
+        self.assertEqual(len(filas), 1)
+
+    def test_sin_client_request_id_sigue_creando_dos_pedidos_distintos(self):
+        """Retrocompatibilidad: nada cambia para quien aún no envía el campo."""
+        db = fx.new_session()
+        variant = self._seed_variant(db)
+        db.commit()
+
+        data = OrderCreate(
+            channel=OrderChannel.POS,
+            customer_name="Cliente de prueba",
+            items=[OrderItemIn(product_variant_id=variant.id, quantity=1)],
+        )
+        primero = service.create_order(db, data, uuid4())
+        db.commit()
+        segundo = service.create_order(db, data, uuid4())
+
+        self.assertNotEqual(primero.id, segundo.id)
+
+    def test_client_request_id_distinto_crea_dos_pedidos_distintos(self):
+        db = fx.new_session()
+        variant = self._seed_variant(db)
+        db.commit()
+
+        data1 = OrderCreate(
+            channel=OrderChannel.POS,
+            customer_name="Cliente de prueba",
+            client_request_id="intento-1",
+            items=[OrderItemIn(product_variant_id=variant.id, quantity=1)],
+        )
+        data2 = OrderCreate(
+            channel=OrderChannel.POS,
+            customer_name="Cliente de prueba",
+            client_request_id="intento-2",
+            items=[OrderItemIn(product_variant_id=variant.id, quantity=1)],
+        )
+        primero = service.create_order(db, data1, uuid4())
+        db.commit()
+        segundo = service.create_order(db, data2, uuid4())
+
+        self.assertNotEqual(primero.id, segundo.id)
+
+
 class TestCreateOrderDelivery(unittest.TestCase):
     """spec 056: habilitación del tipo de orden DELIVERY en la creación
     manual — campos de entrega, obligatoriedad, y persistencia."""
