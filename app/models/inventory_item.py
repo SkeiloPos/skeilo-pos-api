@@ -20,6 +20,11 @@ class InventoryItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
 
+    # Identificador de negocio para el upsert de la importación masiva (spec 109).
+    # Generado automáticamente (secuencial con cero a la izquierda) cuando no se
+    # especifica; editable por el administrador.
+    code: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
+
     unit_measure_id: Mapped[UUID] = mapped_column(
         ForeignKey("unit_measures.id"), nullable=False, index=True
     )

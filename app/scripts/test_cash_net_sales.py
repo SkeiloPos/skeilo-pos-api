@@ -156,12 +156,77 @@ def test_venta_exacta_sin_cambio_no_cambia() -> None:
     print("OK: venta_exacta_sin_cambio_no_cambia")
 
 
+def test_pago_mixto_neta_el_cambio_solo_en_la_fila_cash() -> None:
+    """Spec 112, Historia 3 (FR-008): una venta con 2 líneas de pago --
+    transferencia $6.000 (exacta) + efectivo recibiendo $10.000 para una
+    porción asignada de $8.000 ($2.000 de cambio, total $14.000) -- la fila
+    `transfer` de `sales_by_method` debe mostrar $6.000 (bruto = neto, no
+    hay cambio ahí) y la fila `cash` debe mostrar $8.000 (neto), no $10.000."""
+    db = _session()
+    shift = make_cash_shift(db, opening_amount=Decimal("0"))
+    efectivo = make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
+    transferencia = make_payment_method(db, name="Transferencia", type="transfer", is_cash=False)
+
+    sale = make_sale(db, cash_shift_id=shift.id, total=Decimal("14000"),
+                      change_given=Decimal("2000"))
+    db.add(Payment(sale_id=sale.id, payment_method_id=transferencia.id, amount=Decimal("6000")))
+    _pay_cash(db, sale, efectivo, Decimal("10000"))
+
+    db.commit()
+    recon = reconcile(db, shift)
+
+    cash_rows = [m for m in recon["sales_by_method"] if m["method_type"] == "cash"]
+    transfer_rows = [m for m in recon["sales_by_method"] if m["method_type"] == "transfer"]
+    assert cash_rows[0]["total"] == Decimal("8000"), (
+        f"la fila cash debía ser 8000 (neto), fue {cash_rows[0]['total']}"
+    )
+    assert transfer_rows[0]["total"] == Decimal("6000")
+    assert recon["ventas_transferencia"] == Decimal("6000")
+    assert recon["ventas_efectivo"] == Decimal("8000")
+    print("OK: pago_mixto_neta_el_cambio_solo_en_la_fila_cash")
+
+
+def test_varias_ventas_con_pago_mixto_suman_correctamente_por_metodo() -> None:
+    """Spec 112, Historia 4 (FR-019): dos ventas del mismo turno, cada una
+    con 2 líneas de pago -- `sales_by_method` acumula el total de cada
+    método a través de TODAS las ventas del turno, no solo de la última."""
+    db = _session()
+    shift = make_cash_shift(db, opening_amount=Decimal("0"))
+    efectivo = make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
+    transferencia = make_payment_method(db, name="Transferencia", type="transfer", is_cash=False)
+
+    venta1 = make_sale(db, cash_shift_id=shift.id, total=Decimal("14000"),
+                        change_given=Decimal("0"))
+    db.add(Payment(sale_id=venta1.id, payment_method_id=transferencia.id, amount=Decimal("6000")))
+    _pay_cash(db, venta1, efectivo, Decimal("8000"))
+
+    venta2 = make_sale(db, cash_shift_id=shift.id, total=Decimal("9000"),
+                        change_given=Decimal("0"))
+    db.add(Payment(sale_id=venta2.id, payment_method_id=transferencia.id, amount=Decimal("4000")))
+    _pay_cash(db, venta2, efectivo, Decimal("5000"))
+
+    db.commit()
+    recon = reconcile(db, shift)
+
+    cash_rows = [m for m in recon["sales_by_method"] if m["method_type"] == "cash"]
+    transfer_rows = [m for m in recon["sales_by_method"] if m["method_type"] == "transfer"]
+    assert cash_rows[0]["total"] == Decimal("13000"), (
+        f"efectivo acumulado de las 2 ventas debía ser 13000, fue {cash_rows[0]['total']}"
+    )
+    assert cash_rows[0]["count"] == 2
+    assert transfer_rows[0]["total"] == Decimal("10000")
+    assert transfer_rows[0]["count"] == 2
+    print("OK: varias_ventas_con_pago_mixto_suman_correctamente_por_metodo")
+
+
 def main() -> None:
     tests = [
         test_tarjeta_muestra_neto_no_bruto,
         test_sin_ventas_efectivo_muestra_cero,
         test_expected_no_cambia_respecto_al_hotfix,
         test_invariante_sales_by_method_igual_a_ventas_efectivo,
+        test_pago_mixto_neta_el_cambio_solo_en_la_fila_cash,
+        test_varias_ventas_con_pago_mixto_suman_correctamente_por_metodo,
         test_venta_exacta_sin_cambio_no_cambia,
     ]
     fallos = 0
