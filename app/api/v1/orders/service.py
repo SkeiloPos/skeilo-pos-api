@@ -460,6 +460,17 @@ def create_order(
     `request_id` (spec 074, extensión de logging operativo — FR-021) es igual
     de opcional y por el mismo motivo: correlaciona el evento de auditoría con
     la entrada de log operativo de la misma petición HTTP."""
+    # spec 111 (FR-011, RN4): un reintento de red sobre la misma solicitud de creación (el
+    # cliente no recibió la respuesta y reintenta) no debe generar un segundo pedido -- mismo
+    # patrón que ya usa `invoices.service` (devolver el recurso existente en vez de duplicarlo).
+    # Sin `client_request_id` (clientes que aún no lo envían), comportamiento idéntico al actual.
+    if data.client_request_id is not None:
+        existing = db.execute(
+            select(CustomerOrder).where(CustomerOrder.client_request_id == data.client_request_id)
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
     # T013 (spec 028): 'hold_for_payment' es el modo "cobra primero, envía
     # después" del mostrador/mesero. El canal QR ya tiene su propio flujo
     # 'recibida' (vía /cart/submit, con OrderPaymentAttempt) — mezclarlo con
@@ -594,6 +605,7 @@ def create_order(
             status="recibida" if data.hold_for_payment else "abierta",
             user_id=user_id,
             notes=data.notes,
+            client_request_id=data.client_request_id,
         )
         db.add(order)
         db.flush()
