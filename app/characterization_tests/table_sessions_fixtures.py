@@ -363,7 +363,7 @@ def make_cash_shift(
     kw.setdefault("cash_register_id", register.id)
     kw.setdefault("user_id", _uid())
     kw.setdefault("user_name", "Cajero de prueba")
-    kw.setdefault("opening_amount", Decimal("0"))
+    kw.setdefault("opening_amount", Decimal("100000"))
     kw.setdefault("opened_at", datetime.now())
     kw.setdefault("status", "open")
     obj = CashShift(**kw)

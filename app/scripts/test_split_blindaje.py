@@ -91,7 +91,7 @@ def _fixture(db, suf: str):
         reg = CashRegister(name=f"caja-split-{suf}"); db.add(reg); db.flush()
     shift = CashShift(
         cash_register_id=reg.id, user_id=user.id, user_name=user.name,
-        opening_amount=Decimal("0"), status="open",
+        opening_amount=Decimal("100000"), status="open",
     )
     db.add(shift); db.flush()
 
