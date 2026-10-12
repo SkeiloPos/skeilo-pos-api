@@ -68,6 +68,11 @@ def list_shifts(
 @router.post("/shifts/open", response_model=ShiftResponse, status_code=status.HTTP_201_CREATED, summary="Abrir turno de caja")
 def open_shift(body: ShiftOpen, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     get_or_404(db, CashRegister, body.cash_register_id, "Register not found")
+    if body.opening_amount <= 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "El saldo inicial es obligatorio y debe ser mayor a cero",
+        )
     shift = CashShift(
         cash_register_id=body.cash_register_id,
         user_id=user.id,

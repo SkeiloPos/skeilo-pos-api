@@ -29,7 +29,7 @@ class RegisterResponse(BaseModel):
 # ---------- Turnos ----------
 class ShiftOpen(BaseModel):
     cash_register_id: UUID
-    opening_amount: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
+    opening_amount: Decimal = Field(0, max_digits=12, decimal_places=2)
 
 
 class DenominationIn(BaseModel):
