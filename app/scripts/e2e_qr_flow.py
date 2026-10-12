@@ -295,7 +295,7 @@ def main():
         reg = api("POST", "/api/v1/cash/registers",
                   json={"name": f"e2e-caja-{uuid.uuid4().hex[:6]}"}).json()
         shift = api("POST", "/api/v1/cash/shifts/open",
-                    json={"cash_register_id": reg["id"], "opening_amount": "0.00"}).json()
+                    json={"cash_register_id": reg["id"], "opening_amount": "50000.00"}).json()
         metodos = api("GET", "/api/v1/sales/payment-methods").json()
         efectivo = next((m for m in metodos if m["type"] == "cash"), None)
         if efectivo is None:

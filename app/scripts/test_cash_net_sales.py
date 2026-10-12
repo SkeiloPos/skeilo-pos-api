@@ -141,7 +141,7 @@ def test_venta_exacta_sin_cambio_no_cambia() -> None:
     """Edge case del spec: pago exacto (sin cambio) -> el neto y el bruto
     coinciden, sin diferencia respecto al comportamiento anterior al hotfix."""
     db = _session()
-    shift = make_cash_shift(db, opening_amount=Decimal("0"))
+    shift = make_cash_shift(db, opening_amount=Decimal("100000"))
     efectivo = make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
 
     sale = make_sale(db, cash_shift_id=shift.id, total=Decimal("12000"),
