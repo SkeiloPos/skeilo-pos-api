@@ -41,7 +41,7 @@ class CashShift(UUIDPrimaryKeyMixin, Base):
     close_note: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     __table_args__ = (
-        CheckConstraint("opening_amount >= 0", name="ck_cash_shift_opening_positive"),
+        CheckConstraint("opening_amount > 0", name="ck_cash_shift_opening_positive"),
         CheckConstraint(
             "status = 'open' OR closed_at IS NOT NULL",
             name="ck_cash_shift_closed_has_timestamp",
