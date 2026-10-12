@@ -146,6 +146,11 @@ class OrderCreate(BaseModel):
     #: con `channel=QR_MENU` es 400 (ese canal ya tiene su propio flujo
     #: `recibida` vía `/cart/submit`).
     hold_for_payment: bool = False
+    #: spec 111 (FR-011, RN4): generado por el cliente una sola vez por intento de "Crear
+    #: pedido"; reenviado sin cambios si ese mismo intento se reintenta por una falla de red.
+    #: Opcional y retrocompatible — sin él, cada solicitud sigue creando un pedido nuevo como
+    #: hasta ahora (ver contracts/post-orders.md de esa spec).
+    client_request_id: str | None = Field(None, max_length=64)
 
 
 class OrderItemOptionResponse(BaseModel):

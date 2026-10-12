@@ -135,6 +135,11 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
         DateTime, server_default=func.now(), nullable=False
     )
 
+    # spec 111 (FR-011, RN4): generado por el cliente una sola vez por intento de "Crear
+    # pedido"; reenviado sin cambios si ese mismo intento se reintenta por una falla de red.
+    # Nullable y sin backfill (Principio VII): todo pedido ya existente queda en NULL.
+    client_request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     items: Mapped[List["OrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan"
     )
@@ -203,6 +208,15 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
             "table_order_number",
             unique=True,
             postgresql_where=text("table_order_number IS NOT NULL"),
+        ),
+        # spec 111 (FR-011): único parcial -- permite múltiples filas en NULL (todo pedido
+        # histórico, y cualquier cliente que aún no lo envíe) sin violar la unicidad de los
+        # valores reales.
+        Index(
+            "uq_customer_orders_client_request_id",
+            "client_request_id",
+            unique=True,
+            postgresql_where=text("client_request_id IS NOT NULL"),
         ),
         {"schema": "tenant"},
     )
