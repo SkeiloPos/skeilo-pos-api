@@ -954,6 +954,68 @@ class TestOrderLinesWithAddonsPerLine(unittest.TestCase):
         self.assertEqual(item.line_total, Decimal("36000"))
         self.assertFalse(item.options[0].per_line)
 
+    def test_create_order_con_grupo_cantidad_separa_addons_total_y_marca_per_line(self):
+        """Spec 117 (A-126): a diferencia del sibling de arriba (grupo "conteo"), un
+        grupo "Por cantidad" se cobra por línea incluso creado vía `create_order` (alta
+        directa de comanda, canal no-QR) -- camino real, no el fixture manual `_item()`
+        de esta clase."""
+        cantidad_group = fx.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1,
+        )
+        gomitas = fx.make_option(self.db, group=cantidad_group, extra_price=Decimal("1000"))
+        insumo = fx.make_inventory_item(self.db, current_stock=Decimal("100"))
+        fx.make_recipe_item(self.db, self.variant, insumo, quantity=Decimal("1"))
+        fx.link_variant_group(
+            self.db, self.variant, cantidad_group, min_select=0, max_select=1,
+        )
+        data = OrderCreate(
+            channel=OrderChannel.POS, customer_name="Cliente de prueba",
+            items=[OrderItemIn(
+                product_variant_id=self.variant.id, quantity=2,
+                options=[OptionSelectionIn(option_id=gomitas.id, quantity=1)],
+            )],
+        )
+        order = service.create_order(self.db, data, uuid4())
+        [item] = order.items
+        self.assertEqual(item.unit_price, Decimal("15000"))
+        self.assertEqual(item.addons_total, Decimal("1000"))
+        self.assertEqual(item.line_total, Decimal("31000"))
+        self.assertTrue(item.options[0].per_line)
+
+    def test_create_order_con_grupo_cantidad_la_comanda_expone_la_cantidad_total_vigente(self):
+        """Spec 117 (T043, FR-008 de spec 065): cierra el lazo de la comanda con un
+        camino REAL (`create_order`), no solo el fixture manual `_item()` del sibling
+        `test_order_item_response_expone_addons_total_line_total_y_la_cantidad_del_adicional`
+        -- `OrderItemResponse.options[0].quantity` expone la cantidad TOTAL elegida de
+        la adición (la que lee la comanda), nunca multiplicada por la cantidad de
+        producto de la línea. No cambia código de formato (spec 065 FR-010 ya
+        garantizaba esto); solo se verifica con un camino real."""
+        from app.api.v1.orders.schemas import OrderItemResponse
+        cantidad_group = fx.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1,
+        )
+        gomitas = fx.make_option(self.db, group=cantidad_group, extra_price=Decimal("1000"))
+        insumo = fx.make_inventory_item(self.db, current_stock=Decimal("100"))
+        fx.make_recipe_item(self.db, self.variant, insumo, quantity=Decimal("1"))
+        fx.link_variant_group(
+            self.db, self.variant, cantidad_group, min_select=0, max_select=1,
+        )
+        data = OrderCreate(
+            channel=OrderChannel.POS, customer_name="Cliente de prueba",
+            items=[OrderItemIn(
+                product_variant_id=self.variant.id, quantity=2,
+                options=[OptionSelectionIn(option_id=gomitas.id, quantity=1)],
+            )],
+        )
+        order = service.create_order(self.db, data, uuid4())
+        [item] = order.items
+
+        out = OrderItemResponse.model_validate(item)
+        self.assertEqual(out.options[0].quantity, 1)  # total elegido (x1), no x2
+        self.assertTrue(out.options[0].per_line)
+
 
 class TestSoldOutNamesTheProduct(unittest.TestCase):
     """spec 089 (A-96, FR-029, research D18): al agregar una línea cuyo insumo se agota, la

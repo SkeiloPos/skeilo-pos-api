@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.crud import get_or_404
 from app.core.models import User
-from app.catalog_engine import ChosenOption
+from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import EN_CURSO, OrderItem, OrderItemOption
 from app.models.order_item_void_log import OrderItemVoidLog
@@ -22,7 +22,7 @@ from app.api.v1.orders import service
 from app.api.v1.orders.consumption import (
     chosen_from_rows, deduct_order_items_naming_product, reverse_order_items,
 )
-from app.api.v1.catalog.line_pricing import compute_line_price, load_valid_options
+from app.api.v1.catalog.line_pricing import load_valid_options
 from app.api.v1.orders.schemas import KitchenTransitionIn, VoidItemIn
 
 logger = logging.getLogger(__name__)
@@ -127,8 +127,10 @@ def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> Custo
                 status.HTTP_422_UNPROCESSABLE_ENTITY, f"Variante inactiva: {repl_variant.id}"
             )
         repl_options = load_valid_options(
-            db, data.replacement.options, variant=repl_variant
+            db, data.replacement.options, variant=repl_variant, quantity=data.replacement.quantity
         )
+        # spec 117 (A-126): nunca es el carrito QR -- `qr_addons_per_line=False`.
+        repl_options = mark_per_line(db, repl_options, qr_addons_per_line=False)
 
     try:
         item.estado_cocina = "anulado"
@@ -150,7 +152,8 @@ def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> Custo
                 participant_id=item.participant_id,
                 product_variant_id=repl_variant.id,
                 quantity=data.replacement.quantity,
-                unit_price=compute_line_price(repl_variant, repl_options),
+                unit_price=compute_unit_price(repl_variant, repl_options),
+                addons_total=compute_addons_total(repl_options),
                 notes=data.replacement.notes,
                 estado_cocina="pendiente",
                 void_de=item.id,
@@ -160,6 +163,7 @@ def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> Custo
             for chosen in repl_options:
                 db.add(OrderItemOption(
                     order_item_id=new_item.id, option_id=chosen.option.id, quantity=chosen.quantity,
+                    per_line=chosen.per_line,
                 ))
             # Nuevo consumo (con lock; puede 400 y hacer rollback total).
             # spec 089 (A-96): un insumo agotado nombra el PRODUCTO, no solo el insumo.

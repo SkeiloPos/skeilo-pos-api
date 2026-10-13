@@ -12,11 +12,13 @@ Ejecutar solo este módulo:
     python -m unittest app.characterization_tests.test_orders_draft_preview_parity -v
 """
 from decimal import Decimal
+from uuid import uuid4
 import unittest
 
 from app.characterization_tests import orders_fixtures as fx
-from app.api.v1.orders import checkout
-from app.api.v1.orders.schemas import DraftPreviewIn, OrderItemIn
+from app.api.v1.catalog.schemas import OptionSelectionIn
+from app.api.v1.orders import checkout, service
+from app.api.v1.orders.schemas import DraftPreviewIn, OrderChannel, OrderCreate, OrderItemIn
 
 PRECIO = Decimal("8000")
 
@@ -113,6 +115,42 @@ class TestDraftPreviewParity(unittest.TestCase):
 
         self.assertEqual(total_mostrado, cobro.total)
         self.assertEqual(cobro.total, Decimal("8000") + precio_combo)
+
+    def test_grupo_cantidad_fuera_de_1a1_coincide_con_el_cobro_real(self):
+        """Hallazgo 1 de `tasks.md`: `compute_draft_preview` es un 7º call-site de
+        escritura no listado en `plan.md`/`research.md` -- construye su propia
+        `SaleLine` con `compute_line_price` "folded" (sin separar `addons_total`), así
+        que hoy diverge de `create_order` + `compute_checkout_preview` para una línea
+        "cantidad" fuera de 1:1 (2 unidades de producto, 1 de la adición)."""
+        db = fx.new_session()
+        category = fx.make_category(db)
+        variant = fx.make_variant(db, product=fx.make_product(db, category=category), price=PRECIO)
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("100"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        group = fx.make_option_group(
+            db, selection_mode="cantidad", pricing_type="incluido", min_select=0, max_select=1,
+        )
+        fx.link_variant_group(db, variant, group, min_select=0, max_select=1)
+        gomitas = fx.make_option(db, group=group, extra_price=Decimal("1000"))
+        db.commit()
+
+        item_in = OrderItemIn(
+            product_variant_id=variant.id, quantity=2,
+            options=[OptionSelectionIn(option_id=gomitas.id, quantity=1)],
+        )
+        preview = checkout.compute_draft_preview(db, DraftPreviewIn(items=[item_in]))
+
+        order = service.create_order(
+            db,
+            OrderCreate(
+                channel=OrderChannel.POS, customer_name="Cliente de prueba", items=[item_in],
+            ),
+            uuid4(),
+        )
+        cobro = checkout.compute_checkout_preview(db, order.id)
+
+        self.assertEqual(preview.total, cobro.total)
+        self.assertEqual(preview.total, PRECIO * 2 + Decimal("1000"))
 
 
 if __name__ == "__main__":

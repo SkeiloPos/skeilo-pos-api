@@ -37,7 +37,8 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.characterization_tests import orders_fixtures as fx
-from app.api.v1.orders import checkout
+from app.api.v1.catalog.schemas import OptionSelectionIn
+from app.api.v1.orders import checkout, consolidation
 from app.api.v1.orders.schemas import (
     BlockIn, CancelIn, CheckoutAndSendIn, DraftPreviewIn, OrderItemIn, PayIn,
 )
@@ -1086,6 +1087,49 @@ class TestCheckout(unittest.TestCase):
         sale = checkout.checkout_and_send(db, order.id, data, cashier)
 
         self.assertEqual(sale.total, PRECIO)
+
+    def test_pagos_por_confirmar_valida_el_mismo_total_que_el_menu_qr_para_una_linea_cantidad_no_1a1(self):
+        """Spec 117 (A-126): cierra el lazo end-to-end para "Pagos por confirmar" --
+        memoria del proyecto: es la superficie que con más frecuencia queda
+        desalineada en specs de precios anteriores (Historia 2, FR-009 a FR-011).
+        Línea creada vía `add_item_to_order` (real, no un fixture manual con `per_line`
+        fijado a mano): 2 unidades de producto + 1 "gomitas" (grupo "cantidad",
+        `extra_price=1000`) → total esperado $21.000 (FR-002), no $22.000.
+        `compute_checkout_preview` y `confirm_cash_payment_attempt` (efectivo, "Pagos
+        por confirmar") deben coincidir exactamente en ese total."""
+        s = self._seed_order_con_receta(order_status="recibida")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        group = fx.make_option_group(
+            db, selection_mode="cantidad", pricing_type="incluido", min_select=0, max_select=1,
+        )
+        fx.link_variant_group(db, variant, group, min_select=0, max_select=1)
+        gomitas = fx.make_option(db, group=group, extra_price=Decimal("1000"))
+        user = fx.make_user_double()
+        db.commit()
+
+        order_out = consolidation.add_item_to_order(
+            db, order.id,
+            OrderItemIn(
+                product_variant_id=variant.id, quantity=2,
+                options=[OptionSelectionIn(option_id=gomitas.id, quantity=1)],
+            ),
+            user,
+        )
+        self.assertEqual(order_out.items[0].line_total, Decimal("21000"))
+
+        preview = checkout.compute_checkout_preview(db, order.id)
+        self.assertEqual(preview.total, Decimal("21000"))
+
+        efectivo = fx.make_payment_method(db, name="efe", is_cash=True)
+        attempt = fx.make_payment_attempt(db, order, efectivo, status="pendiente")
+        shift = fx.make_cash_shift(db)
+        db.commit()
+
+        checkout.confirm_cash_payment_attempt(
+            db, attempt.id, Decimal("21000"), shift.id, user,
+        )
+        sale = db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalar_one()
+        self.assertEqual(sale.total, Decimal("21000"))
 
 
 # spec 063 (A-58…A-65): la clase `TestCoexistenciaPromoPresentacion` (spec 040,

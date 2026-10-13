@@ -67,6 +67,16 @@ class CartItemOptionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AdjustedOptionOut(BaseModel):
+    """Spec 117 (A-126, D4/D5): una adición "Por cantidad" que `update_item` tuvo que
+    reducir automáticamente porque el nuevo tope escalado (por la cantidad de producto
+    reducida) ya no la admitía."""
+    option_id: UUID
+    option_name: str
+    previous_quantity: int
+    new_quantity: int
+
+
 class CartItemResponse(BaseModel):
     id: UUID
     product_variant_id: UUID
@@ -85,6 +95,11 @@ class CartItemResponse(BaseModel):
     notes: str | None = None
     combo_id: UUID | None = None
     options: list[CartItemOptionResponse] = Field(default_factory=list)
+    # Spec 117 (A-126, D5): poblado SOLO en la respuesta del `PATCH` que disparó el
+    # ajuste automático (contracts/cart-item-auto-adjust.md) -- `[]` en toda otra
+    # lectura/escritura, incluido `GET /cart`, que nunca lo repite. Aditivo: no rompe a
+    # ningún cliente que lo ignore.
+    adjusted_options: list[AdjustedOptionOut] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
