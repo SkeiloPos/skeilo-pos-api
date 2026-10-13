@@ -21,13 +21,12 @@ from app.models.session_participant import SessionParticipant
 from app.models.cart import Cart
 from app.models.cart_item import CartItem
 from app.models.option import Option
-from app.catalog_engine import ChosenOption
+from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
 from app.models.product_variant import ProductVariant
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem, OrderItemOption
 from app.api.v1.orders.consumption import deduct_order_items, deduct_order_items_naming_product
 from app.api.v1.catalog.line_pricing import (
-    compute_line_price,
     ensure_product_available,
     load_valid_options,
 )
@@ -220,18 +219,21 @@ def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> Customer
     if not variant.active:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Variante inactiva: {variant.id}")
     ensure_product_available(variant)
-    options = load_valid_options(db, data.options, variant=variant)
-    lines = [(variant.id, data.quantity, options, compute_line_price(variant, options), None)]
+    options = load_valid_options(db, data.options, variant=variant, quantity=data.quantity)
+    # spec 117 (A-126): nunca es el carrito QR -- `qr_addons_per_line=False`.
+    options = mark_per_line(db, options, qr_addons_per_line=False)
+    lines = [(variant.id, data.quantity, options, None)]
 
     try:
         entries: list[tuple[OrderItem, list[ChosenOption]]] = []
-        for product_variant_id, quantity, options, unit_price, combo_id in lines:
+        for product_variant_id, quantity, options, combo_id in lines:
             item = OrderItem(
                 order_id=order.id,
                 participant_id=None,  # ítem agregado por el mesero, sin comensal asignado
                 product_variant_id=product_variant_id,
                 quantity=quantity,
-                unit_price=unit_price,
+                unit_price=compute_unit_price(variant, options),
+                addons_total=compute_addons_total(options),
                 notes=data.notes,
                 combo_id=combo_id,
                 estado_cocina="pendiente",
@@ -241,6 +243,7 @@ def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> Customer
             for chosen in options:
                 db.add(OrderItemOption(
                     order_item_id=item.id, option_id=chosen.option.id, quantity=chosen.quantity,
+                    per_line=chosen.per_line,
                 ))
             entries.append((item, options))
 

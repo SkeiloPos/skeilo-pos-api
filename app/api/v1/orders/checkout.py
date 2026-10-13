@@ -30,7 +30,13 @@ from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
 from app.models.session_participant import SessionParticipant
 from app.models.cart import Cart
-from app.catalog_engine import ChosenOption, compute_line_price, load_valid_options
+from app.catalog_engine import (
+    ChosenOption,
+    compute_addons_total,
+    compute_unit_price,
+    load_valid_options,
+    mark_per_line,
+)
 from app.catalog_engine.core import format_item_description
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
@@ -436,7 +442,9 @@ def compute_draft_preview(db: Session, data: DraftPreviewIn) -> CheckoutPreviewR
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"Variante inexistente o inactiva: {item.product_variant_id}",
             )
-        options = load_valid_options(db, item.options, variant=variant)
+        options = load_valid_options(db, item.options, variant=variant, quantity=item.quantity)
+        # spec 117 (A-126): el borrador de pedido manual nunca es canal QR.
+        options = mark_per_line(db, options, qr_addons_per_line=False)
         product = db.get(Product, variant.product_id)
         description = format_item_description(product, variant)
         lines.append(SaleLine(
@@ -444,11 +452,13 @@ def compute_draft_preview(db: Session, data: DraftPreviewIn) -> CheckoutPreviewR
             description=description,
             options=[
                 {"option_id": str(chosen.option.id), "name": chosen.option.name,
-                 "extra_price": str(chosen.option.extra_price), "quantity": chosen.quantity}
+                 "extra_price": str(chosen.option.extra_price), "quantity": chosen.quantity,
+                 **({"per_line": True} if chosen.per_line else {})}
                 for chosen in options
             ],
             quantity=item.quantity,
-            unit_price=compute_line_price(variant, options),
+            unit_price=compute_unit_price(variant, options),
+            addons_total=compute_addons_total(options),
         ))
 
     raw_subtotal = sum((line.line_total for line in lines), start=Decimal("0"))

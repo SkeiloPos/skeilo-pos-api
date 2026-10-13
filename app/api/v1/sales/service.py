@@ -24,7 +24,8 @@ from app.models.cash_shift import CashShift
 from app.models.payment import Payment, PaymentMethod
 from app.models.payment_method_catalog import PaymentMethodCatalog
 from app.models.sale import Sale, SaleItem
-from app.api.v1.catalog.line_pricing import compute_line_price, load_valid_options
+from app.api.v1.catalog.line_pricing import load_valid_options
+from app.catalog_engine import compute_addons_total, compute_unit_price, mark_per_line
 from app.catalog_engine.core import format_item_description
 from app.api.v1.orders import checkout as orders_checkout
 from app.api.v1.sales.consumption import deduct_sale
@@ -320,14 +321,18 @@ def checkout(db: Session, data: SaleCreate, cashier: User, *, invoice_prefix: st
             # Deduplica, exige que estén activas y valida la selección contra los
             # grupos del producto. Antes este bucle cargaba las opciones a mano y se
             # saltaba las tres cosas.
-            options = load_valid_options(db, line.options, variant=variant)
-            unit_price = compute_line_price(variant, options)
+            options = load_valid_options(db, line.options, variant=variant, quantity=line.quantity)
+            # spec 117 (A-126): nunca es el carrito QR -- `qr_addons_per_line=False`.
+            options = mark_per_line(db, options, qr_addons_per_line=False)
             options_snapshot: list[dict] = [
                 {
                     "option_id": str(chosen.option.id),
                     "name": chosen.option.name,
                     "extra_price": str(chosen.option.extra_price),
                     "quantity": chosen.quantity,
+                    # spec 089/117: ausente = por unidad (snapshots anteriores). Solo se
+                    # escribe la clave en los adicionales que se cobran por línea.
+                    **({"per_line": True} if chosen.per_line else {}),
                 }
                 for chosen in options
             ]
@@ -337,7 +342,8 @@ def checkout(db: Session, data: SaleCreate, cashier: User, *, invoice_prefix: st
                 description=description,
                 options=options_snapshot,
                 quantity=line.quantity,
-                unit_price=unit_price,
+                unit_price=compute_unit_price(variant, options),
+                addons_total=compute_addons_total(options),
             ))
 
         # 2. Descuento automático (RF-012): motor por conjunto de variantes

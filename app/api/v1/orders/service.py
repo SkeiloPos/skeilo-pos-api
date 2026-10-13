@@ -34,7 +34,7 @@ from app.core.order_audit import (
 )
 from app.models.product_variant import ProductVariant
 from app.models.option import Option
-from app.catalog_engine import ChosenOption
+from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
 from app.models.session_participant import SessionParticipant
 from app.models.dining_table import DiningTable
 from app.models.customer_order import CustomerOrder
@@ -44,7 +44,6 @@ from app.models.sale import Sale
 from app.models.table_session import TableSession
 from app.core.models import User
 from app.api.v1.catalog.line_pricing import (
-    compute_line_price,
     ensure_products_available,
     load_valid_options,
 )
@@ -627,7 +626,9 @@ def create_order(
             # Deduplica, exige que estén activas y valida la selección contra los
             # grupos del producto. Antes este bucle cargaba las opciones a mano y se
             # saltaba las tres cosas.
-            options = load_valid_options(db, line.options, variant=variant)
+            options = load_valid_options(db, line.options, variant=variant, quantity=line.quantity)
+            # spec 117 (A-126): nunca es el carrito QR -- `qr_addons_per_line=False`.
+            options = mark_per_line(db, options, qr_addons_per_line=False)
 
             item = OrderItem(
                 order_id=order.id,
@@ -642,9 +643,11 @@ def create_order(
             for chosen in options:
                 db.add(OrderItemOption(
                     order_item_id=item.id, option_id=chosen.option.id, quantity=chosen.quantity,
+                    per_line=chosen.per_line,
                 ))
 
-            item.unit_price = compute_line_price(variant, options)
+            item.unit_price = compute_unit_price(variant, options)
+            item.addons_total = compute_addons_total(options)
             entries.append((item, options))
 
         if not data.hold_for_payment:
