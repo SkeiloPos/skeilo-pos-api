@@ -48,6 +48,7 @@ from app.catalog_engine import (
     compute_addons_total,
     compute_unit_price,
     line_total as compute_line_total,
+    mark_per_line,
 )
 from app.models.payment import PaymentMethod
 from app.models.product_variant import ProductVariant
@@ -62,6 +63,7 @@ from app.api.v1.cash.service import resolve_dine_in_table_order
 from app.api.v1.orders.schemas import CancelIn
 from app.api.v1.promotions import service as promotions
 from app.api.v1.cart.schemas import (
+    AdjustedOptionOut,
     CartItemIn,
     CartItemUpdate,
     CartItemOptionResponse,
@@ -228,20 +230,12 @@ def _chosen_from_cart_rows(db: Session, item: CartItem) -> list[ChosenOption]:
 
 
 def _mark_addons(db: Session, options: list[ChosenOption]) -> list[ChosenOption]:
-    """spec 089 (A-94): marca `per_line=True` las opciones de grupos con recargo (los
-    adicionales) para que se cobren y consuman UNA vez por línea. Solo el Menú QR llama a
-    esto; la terminal POS y el mostrador siguen por unidad. Con `QR_ADDONS_PER_LINE=false`
-    no marca nada (regla histórica) — la bandera solo gobierna la creación de líneas."""
-    if not settings.QR_ADDONS_PER_LINE or not options:
-        return options
-    group_ids = {c.option.option_group_id for c in options}
-    tipos = dict(db.execute(
-        select(OptionGroup.id, OptionGroup.pricing_type).where(OptionGroup.id.in_(group_ids))
-    ).all())
-    return [
-        c._replace(per_line=tipos.get(c.option.option_group_id) == "con_recargo")
-        for c in options
-    ]
+    """spec 089 (A-94) + spec 117 (A-126): marca `per_line=True` las opciones de grupos
+    con recargo del Menú QR (089) y, en todo canal, las de un grupo "Por cantidad" (117)
+    -- envoltorio de `mark_per_line` (`catalog_engine/pricing.py`), que generaliza esta
+    función. Con `QR_ADDONS_PER_LINE=false` solo se apaga el eje 089; el eje nuevo de
+    `selection_mode='cantidad'` nunca se apaga con esa bandera (research.md D1)."""
+    return mark_per_line(db, options, qr_addons_per_line=settings.QR_ADDONS_PER_LINE)
 
 
 def _cart_consumption(
@@ -389,7 +383,9 @@ def add_item(db: Session, participant_id: UUID, data: CartItemIn) -> CartRespons
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Variante inactiva: {variant.id}")
     ensure_product_available(variant)
 
-    options = _mark_addons(db, load_valid_options(db, data.options, variant=variant))
+    options = _mark_addons(
+        db, load_valid_options(db, data.options, variant=variant, quantity=data.quantity)
+    )
 
     # Disponibilidad: consumo del carrito actual + la línea nueva.
     required = _cart_consumption(db, cart)
@@ -423,6 +419,76 @@ def add_item(db: Session, participant_id: UUID, data: CartItemIn) -> CartRespons
     return get_cart(db, participant_id)
 
 
+def _auto_adjust_cantidad_options(
+    db: Session, options: list[ChosenOption], new_qty: int
+) -> tuple[list[ChosenOption], list[AdjustedOptionOut]]:
+    """Spec 117 (A-126, D4/D5): al reducir la cantidad de producto de una línea con
+    adiciones "Por cantidad" ya elegidas, reduce automáticamente las que excedan su
+    tope ya escalado por la nueva cantidad (contracts/cart-item-auto-adjust.md).
+
+    Un grupo sin ningún tope configurado nunca entra aquí (FR-008 de spec 065 sigue
+    vigente sin cambios). Un grupo "conteo" nunca entra aquí (no tiene topes de
+    cantidad -- su límite es `min_select`/`max_select`, ajeno a este algoritmo)."""
+    if not options:
+        return options, []
+    group_ids = {c.option.option_group_id for c in options}
+    groups = {
+        g.id: g for g in db.execute(
+            select(OptionGroup).where(OptionGroup.id.in_(group_ids))
+        ).scalars()
+    }
+    result = list(options)
+    by_group: dict[UUID, list[int]] = defaultdict(list)
+    for idx, chosen in enumerate(result):
+        group = groups.get(chosen.option.option_group_id)
+        if group is not None and group.selection_mode == "cantidad":
+            by_group[group.id].append(idx)
+
+    adjusted: list[AdjustedOptionOut] = []
+    for gid, idxs in by_group.items():
+        group = groups[gid]
+        previous = {i: result[i].quantity for i in idxs}
+
+        # Paso 2 (D4): tope individual escalado.
+        if group.max_quantity_per_option is not None:
+            tope = group.max_quantity_per_option * new_qty
+            for i in idxs:
+                if result[i].quantity > tope:
+                    result[i] = result[i]._replace(quantity=tope)
+
+        # Paso 3 (D4): tope total escalado, orden alfabético descendente sobre el
+        # nombre normalizado, desempate por option_id, una unidad a la vez.
+        if group.max_total_quantity is not None:
+            tope_total = group.max_total_quantity * new_qty
+            total = sum(result[i].quantity for i in idxs)
+            if total > tope_total:
+                ordered = sorted(
+                    idxs,
+                    key=lambda i: (result[i].option.name.casefold(), str(result[i].option.id)),
+                    reverse=True,
+                )
+                pos = 0
+                while total > tope_total and pos < len(ordered):
+                    i = ordered[pos]
+                    if result[i].quantity <= 0:
+                        pos += 1
+                        continue
+                    result[i] = result[i]._replace(quantity=result[i].quantity - 1)
+                    total -= 1
+                    if result[i].quantity <= 0:
+                        pos += 1
+
+        for i in idxs:
+            if result[i].quantity != previous[i]:
+                adjusted.append(AdjustedOptionOut(
+                    option_id=result[i].option.id,
+                    option_name=result[i].option.name,
+                    previous_quantity=previous[i],
+                    new_quantity=result[i].quantity,
+                ))
+    return result, adjusted
+
+
 def update_item(
     db: Session, participant_id: UUID, item_id: UUID, data: CartItemUpdate
 ) -> CartResponse:
@@ -435,15 +501,22 @@ def update_item(
     variant = get_or_404(db, ProductVariant, item.product_variant_id, "Variant not found")
     ensure_product_available(variant)
 
+    adjusted_options: list[AdjustedOptionOut] = []
     if data.options is not None:
         # Editar la selección adopta la regla nueva (spec 089: líneas nuevas o editadas).
-        options = _mark_addons(db, load_valid_options(db, data.options, variant=variant))
+        options = _mark_addons(
+            db, load_valid_options(db, data.options, variant=variant, quantity=new_qty)
+        )
     else:
         # Selección ya guardada: no se revalida, o un cambio de min/max en el catálogo
         # impediría hasta bajar la cantidad de una línea que ya estaba en el carrito.
         # spec 089: conserva la marca `per_line` de cada fila (una línea histórica sigue
         # con la regla histórica al cambiar solo la cantidad).
         options = _chosen_from_cart_rows(db, item)
+        if new_qty < item.quantity:
+            # Spec 117 (A-126, D4): único camino de backend donde puede reducirse la
+            # cantidad de una línea ya creada con adiciones "cantidad" ya elegidas.
+            options, adjusted_options = _auto_adjust_cantidad_options(db, options, new_qty)
 
     # Disponibilidad: resto del carrito (sin esta línea) + la línea editada.
     required = _cart_consumption(db, cart, exclude_item_id=item_id)
@@ -466,13 +539,28 @@ def update_item(
                     cart_item_id=item.id, option_id=chosen.option.id, quantity=chosen.quantity,
                     per_line=chosen.per_line,
                 ))
+        elif adjusted_options:
+            # Spec 117 (A-126, D4): mismas filas de siempre (no se tocó `data.options`),
+            # solo se corrige la cantidad de las que el ajuste automático redujo.
+            rows_by_option = {o.option_id: o for o in item.options}
+            for a in adjusted_options:
+                rows_by_option[a.option_id].quantity = a.new_quantity
         db.commit()
     except Exception:
         db.rollback()
         logger.exception("Error editando ítem del carrito")
         raise
 
-    return get_cart(db, participant_id)
+    response = get_cart(db, participant_id)
+    if adjusted_options:
+        # Spec 117 (A-126, D5): solo en la respuesta de ESTE `PATCH` -- `GET /cart`
+        # (vía `get_cart` arriba) y cualquier lectura posterior nunca lo repiten.
+        for out_item in response.items:
+            if out_item.id == item_id:
+                out_item.adjusted_options = adjusted_options
+                break
+
+    return response
 
 
 def list_my_orders(db: Session, participant_id: UUID) -> list[CustomerOrder]:

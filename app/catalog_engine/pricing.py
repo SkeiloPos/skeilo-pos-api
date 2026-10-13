@@ -35,7 +35,11 @@ logger = logging.getLogger(__name__)
 
 
 def load_valid_options(
-    db: Session, selections: list[OptionSelectionIn], *, variant: ProductVariant | None = None
+    db: Session,
+    selections: list[OptionSelectionIn],
+    *,
+    variant: ProductVariant | None = None,
+    quantity: int = 1,
 ) -> list[ChosenOption]:
     """Carga las opciones elegidas validando existencia y que estén activas, junto con
     la cantidad que trajo cada una (spec 065).
@@ -43,6 +47,10 @@ def load_valid_options(
     Pasar `variant` valida además la selección contra los grupos del producto (ver
     `validate_option_selection`). Es opcional solo por compatibilidad con los pocos
     llamadores que aún no tienen la variante a mano; **pasarla siempre que se pueda**.
+
+    `quantity` es la cantidad de producto de la línea (spec 117, D2): escala los topes
+    `max_quantity_per_option`/`max_total_quantity` de los grupos "cantidad". Se reenvía a
+    `validate_option_selection` solo cuando hay `variant` (igual que antes).
     """
     seen: set[UUID] = set()
     chosen: list[ChosenOption] = []
@@ -60,7 +68,7 @@ def load_valid_options(
             )
         chosen.append(ChosenOption(option, sel.quantity))
     if variant is not None:
-        validate_option_selection(db, variant, chosen)
+        validate_option_selection(db, variant, chosen, quantity=quantity)
     return chosen
 
 
@@ -103,11 +111,17 @@ def grupos_que_descuentan(db: Session, links: Sequence[VariantOptionGroup]) -> s
 
 
 def validate_option_selection(
-    db: Session, variant: ProductVariant, options: Sequence[ChosenOption]
+    db: Session, variant: ProductVariant, options: Sequence[ChosenOption], *, quantity: int = 1
 ) -> None:
     """Comprueba que la selección respeta los grupos que ofrece **esta variante** y sus
     `min_select`/`max_select` (grupos "conteo") o sus topes de cantidad (grupos
     "cantidad", spec 065).
+
+    `quantity` es la cantidad de producto de la línea (spec 117, D2): los topes
+    `max_quantity_per_option`/`max_total_quantity` de un grupo "cantidad" se escalan por
+    ella (`tope × quantity`). El default `1` reproduce el tope fijo de hoy para quien no
+    lo pase (solo tests aislados de esta función -- ningún camino de producción llega
+    aquí sin pasar la cantidad real de la línea).
 
     Hasta hace poco esto no se validaba en ningún camino de pedido (solo el frontend), y
     era un fallo de UX tolerable. **Con consumo por opción deja de serlo**: lo que se
@@ -202,17 +216,20 @@ def validate_option_selection(
         group = group_cache[gid]
         total = sum(por_opcion.values())
         if group.max_quantity_per_option is not None:
+            tope_por_opcion = group.max_quantity_per_option * quantity
             for option_id, qty in por_opcion.items():
-                if qty > group.max_quantity_per_option:
+                if qty > tope_por_opcion:
                     hard_problems.append(
-                        (gid, f"admite como máximo {group.max_quantity_per_option} "
+                        (gid, f"admite como máximo {tope_por_opcion} "
                               f"unidad(es) por opción, se pidieron {qty}")
                     )
-        if group.max_total_quantity is not None and total > group.max_total_quantity:
-            hard_problems.append(
-                (gid, f"admite como máximo {group.max_total_quantity} unidad(es) en total, "
-                      f"se pidieron {total}")
-            )
+        if group.max_total_quantity is not None:
+            tope_total = group.max_total_quantity * quantity
+            if total > tope_total:
+                hard_problems.append(
+                    (gid, f"admite como máximo {tope_total} unidad(es) en total, "
+                          f"se pidieron {total}")
+                )
 
     if not problems and not hard_problems:
         return
@@ -242,6 +259,40 @@ def validate_option_selection(
         status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail={"error": f"Selección de opciones inválida: {detalle}", "grupos": detalle},
     )
+
+
+def mark_per_line(
+    db: Session, options: list[ChosenOption], *, qr_addons_per_line: bool = False
+) -> list[ChosenOption]:
+    """Marca `per_line=True` en las opciones que se cobran/consumen una vez por línea,
+    en vez de multiplicadas por la cantidad de producto (spec 117, D1).
+
+    Unión de dos ejes independientes, ninguno apaga al otro:
+
+    - `qr_addons_per_line AND group.pricing_type == 'con_recargo'`: la regla de la spec
+      089 (A-94), que solo aplica en el Menú QR y se reversa con
+      `settings.QR_ADDONS_PER_LINE=False`.
+    - `group.selection_mode == 'cantidad'`: la regla nueva de esta spec (A-126) -- un
+      grupo "Por cantidad" (spec 065) siempre se cobra/consume por línea, en **todo**
+      canal, sin bandera de reversa. El modo "Conteo" nunca entra por este eje
+      (`FR-013`).
+    """
+    if not options:
+        return options
+    group_ids = {c.option.option_group_id for c in options}
+    rows = db.execute(
+        select(OptionGroup.id, OptionGroup.pricing_type, OptionGroup.selection_mode).where(
+            OptionGroup.id.in_(group_ids)
+        )
+    ).all()
+    por_grupo = {gid: (pricing_type, selection_mode) for gid, pricing_type, selection_mode in rows}
+    return [
+        c._replace(per_line=(
+            (qr_addons_per_line and por_grupo.get(c.option.option_group_id, (None, None))[0] == "con_recargo")
+            or por_grupo.get(c.option.option_group_id, (None, None))[1] == "cantidad"
+        ))
+        for c in options
+    ]
 
 
 def check_availability(

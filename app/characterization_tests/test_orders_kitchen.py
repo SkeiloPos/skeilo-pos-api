@@ -27,6 +27,7 @@ import unittest
 from fastapi import HTTPException
 
 from app.characterization_tests import orders_fixtures as fx
+from app.api.v1.catalog.schemas import OptionSelectionIn
 from app.api.v1.orders import checkout, kitchen
 from app.api.v1.orders.schemas import BlockIn, CancelIn, KitchenTransitionIn, OrderItemIn, PayIn, VoidItemIn
 from app.api.v1.sales.schemas import PaymentIn
@@ -207,6 +208,40 @@ class TestKitchen(unittest.TestCase):
         # idéntica (1 unidad de receta): stock termina igual que al empezar.
         db.refresh(insumo)
         self.assertEqual(Decimal(insumo.current_stock), stock_inicial)
+
+    def test_void_item_con_reemplazo_de_grupo_cantidad_separa_unit_price_y_marca_per_line(self):
+        """Spec 117 (A-126): el ítem de reemplazo de un `void_item` separa
+        `unit_price`/`addons_total` y persiste `per_line=True` en su
+        `OrderItemOption` cuando la selección del reemplazo trae una opción de un
+        grupo "Por cantidad" -- mismo tratamiento que los demás call-sites de
+        escritura, nunca listado hasta ahora como séptimo call-site equivalente."""
+        s = self._seed_item(estado_cocina="pendiente")
+        db, item, user = s["db"], s["item"], self._user()
+        group = fx.make_option_group(
+            db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1,
+        )
+        fx.link_variant_group(db, s["variant"], group, min_select=0, max_select=1)
+        gomitas = fx.make_option(db, group=group, extra_price=Decimal("1000"))
+        db.commit()
+
+        resultado = kitchen.void_item(
+            db, item.id,
+            VoidItemIn(
+                motivo="cambio de sabor",
+                replacement=OrderItemIn(
+                    product_variant_id=s["variant"].id, quantity=2,
+                    options=[OptionSelectionIn(option_id=gomitas.id, quantity=1)],
+                ),
+            ),
+            user,
+        )
+
+        nuevo = next(it for it in resultado.items if it.void_de == item.id)
+        self.assertEqual(nuevo.unit_price, PRECIO)
+        self.assertEqual(nuevo.addons_total, Decimal("1000"))
+        self.assertEqual(nuevo.line_total, PRECIO * 2 + Decimal("1000"))
+        self.assertTrue(nuevo.options[0].per_line)
 
     # ----------------------------------- invariante A-25 [PROTEGIDA] de referencia (T040)
 

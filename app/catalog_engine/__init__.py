@@ -30,5 +30,6 @@ from app.catalog_engine.pricing import (
     ensure_products_available as ensure_products_available,
     grupos_que_descuentan as grupos_que_descuentan,
     load_valid_options as load_valid_options,
+    mark_per_line as mark_per_line,
     validate_option_selection as validate_option_selection,
 )

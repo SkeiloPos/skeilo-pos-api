@@ -567,5 +567,88 @@ class TestConsolidationAddonsPerLine(unittest.TestCase):
         self.assertEqual(self.tocino_stock.current_stock, Decimal("1000"))
 
 
+class TestAddItemToOrderAddonsPerLine(unittest.TestCase):
+    """Spec 117 (A-126): a diferencia de `TestConsolidationAddonsPerLine` (que COPIA
+    `per_line` ya calculado por el carrito), ningún test existente ejercitaba
+    `add_item_to_order` (mesero, canal no-QR) con un grupo "cantidad" -- hoy construye
+    su línea con `compute_line_price` "folded", sin separar `unit_price`/`addons_total`
+    ni persistir `per_line`."""
+
+    def setUp(self):
+        self.db = fx.new_session()
+        self.table = fx.make_dining_table(self.db)
+        category = fx.make_category(self.db)
+        product = fx.make_product(self.db, category=category)
+        self.variant = fx.make_variant(self.db, product=product, price=Decimal("15000"))
+        insumo = fx.make_inventory_item(self.db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(self.db, self.variant, insumo, quantity=Decimal("1"))
+        self.user = fx.make_user_double()
+
+    def _order(self):
+        order = consolidation.get_or_create_open_order(self.db, self.table.id, self.user.id)
+        self.db.commit()
+        return order
+
+    def test_grupo_cantidad_separa_unit_price_y_addons_total_y_persiste_per_line(self):
+        group = fx.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1,
+        )
+        fx.link_variant_group(self.db, self.variant, group, min_select=0, max_select=1)
+        gomitas = fx.make_option(self.db, group=group, extra_price=Decimal("1000"))
+        order = self._order()
+
+        data = OrderItemIn(
+            product_variant_id=self.variant.id, quantity=2,
+            options=[OptionSelectionIn(option_id=gomitas.id, quantity=1)],
+        )
+        order = consolidation.add_item_to_order(self.db, order.id, data, self.user)
+
+        [item] = order.items
+        self.assertEqual(item.unit_price, Decimal("15000"))
+        self.assertEqual(item.addons_total, Decimal("1000"))
+        self.assertEqual(item.line_total, Decimal("31000"))
+        self.assertTrue(item.options[0].per_line)
+
+    def test_grupo_conteo_con_recargo_sigue_con_per_line_false(self):
+        group = fx.make_option_group(
+            self.db, selection_mode="conteo", pricing_type="con_recargo",
+            min_select=0, max_select=1,
+        )
+        fx.link_variant_group(self.db, self.variant, group, min_select=0, max_select=1)
+        tocino = fx.make_option(self.db, group=group, extra_price=Decimal("3000"))
+        order = self._order()
+
+        data = OrderItemIn(
+            product_variant_id=self.variant.id, quantity=2,
+            options=[OptionSelectionIn(option_id=tocino.id)],
+        )
+        order = consolidation.add_item_to_order(self.db, order.id, data, self.user)
+
+        [item] = order.items
+        self.assertEqual(item.unit_price, Decimal("18000"))
+        self.assertEqual(item.addons_total, Decimal("0"))
+        self.assertEqual(item.line_total, Decimal("36000"))
+        self.assertFalse(item.options[0].per_line)
+
+    def test_tope_escalado_por_cantidad_de_producto_acepta_lo_que_antes_rechazaba(self):
+        group = fx.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1, max_quantity_per_option=3,
+        )
+        fx.link_variant_group(self.db, self.variant, group, min_select=0, max_select=1)
+        gomitas = fx.make_option(self.db, group=group, extra_price=Decimal("1000"))
+        order = self._order()
+
+        data = OrderItemIn(
+            product_variant_id=self.variant.id, quantity=2,
+            options=[OptionSelectionIn(option_id=gomitas.id, quantity=4)],
+        )
+        order = consolidation.add_item_to_order(self.db, order.id, data, self.user)
+
+        [item] = order.items
+        self.assertEqual(item.options[0].quantity, 4)
+
+
 if __name__ == "__main__":
     unittest.main()

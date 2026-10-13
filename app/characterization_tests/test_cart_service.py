@@ -771,9 +771,25 @@ class TestQrAddonsPerLine(unittest.TestCase):
 
     def test_bandera_apagada_crea_la_linea_con_la_regla_historica(self):
         """`QR_ADDONS_PER_LINE=false`: la línea nueva vuelve a meter los extras dentro de
-        `unit_price` y sin `per_line`, pero lo ya creado no se invalida."""
+        `unit_price` y sin `per_line`, pero lo ya creado no se invalida.
+
+        Spec 117 (A-126): `self.extras`/`self.tocino` es "cantidad" además de
+        "con_recargo" -- con ese grupo, el eje nuevo (que nunca se apaga con esta
+        bandera, D1) seguiría marcando `per_line=True` sin importar la bandera, así que
+        ya no sirve para demostrar la reversa del eje 089 en aislamiento. Se usa un
+        grupo nuevo, puramente del eje 089 (con_recargo + "conteo"), solo para este test."""
+        recargo_conteo = cart_fixtures.make_option_group(
+            self.db, pricing_type="con_recargo", selection_mode="conteo",
+            min_select=0, max_select=1,
+        )
+        tocino_conteo = cart_fixtures.make_option(
+            self.db, group=recargo_conteo, extra_price=Decimal("3000")
+        )
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, recargo_conteo, min_select=0, max_select=1
+        )
         with mock.patch.object(service.settings, "QR_ADDONS_PER_LINE", False):
-            resp = self._add(2, [self.tocino])
+            resp = self._add(2, [tocino_conteo])
         item = resp.items[0]
         self.assertEqual(item.unit_price, Decimal("18000"))
         self.assertEqual(item.addons_total, Decimal("0"))
@@ -886,6 +902,50 @@ class TestQrAddonsPerLine(unittest.TestCase):
         need = service._cart_consumption(self.db, cart)
         self.assertEqual(need, {insumo.id: Decimal("30")})
 
+    def test_grupo_cantidad_incluido_marca_per_line_igual_que_con_recargo(self):
+        """Spec 117 (A-126): un grupo "Por cantidad" se cobra por línea sin importar su
+        `pricing_type` -- antes de esta spec, solo marcaba `per_line` un grupo con
+        recargo (089); un grupo "cantidad" + "incluido" (ej. gomitas sin costo extra)
+        quedaba, incorrectamente, por unidad de producto."""
+        gomitas_grupo = cart_fixtures.make_option_group(
+            self.db, pricing_type="incluido", selection_mode="cantidad",
+            min_select=0, max_select=1,
+        )
+        gomitas = cart_fixtures.make_option(
+            self.db, group=gomitas_grupo, extra_price=Decimal("1000")
+        )
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, gomitas_grupo, min_select=0, max_select=1
+        )
+        resp = self._add(2, [gomitas])
+        item = resp.items[0]
+        self.assertEqual(item.unit_price, Decimal("15000"))
+        self.assertEqual(item.addons_total, Decimal("1000"))
+        self.assertEqual(item.line_total, Decimal("31000"))
+        self.assertTrue(item.options[0].per_line)
+
+    def test_grupo_cantidad_marca_per_line_incluso_con_la_bandera_089_apagada(self):
+        """A diferencia de la regla 089 (que si se apaga con `QR_ADDONS_PER_LINE=False`
+        no marca nada), el eje nuevo de `selection_mode='cantidad'` nunca se apaga con
+        esa bandera -- gobierna solo su propio eje (research.md D1)."""
+        gomitas_grupo = cart_fixtures.make_option_group(
+            self.db, pricing_type="incluido", selection_mode="cantidad",
+            min_select=0, max_select=1,
+        )
+        gomitas = cart_fixtures.make_option(
+            self.db, group=gomitas_grupo, extra_price=Decimal("1000")
+        )
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, gomitas_grupo, min_select=0, max_select=1
+        )
+        with mock.patch.object(service.settings, "QR_ADDONS_PER_LINE", False):
+            resp = self._add(2, [gomitas])
+        item = resp.items[0]
+        self.assertEqual(item.unit_price, Decimal("15000"))
+        self.assertEqual(item.addons_total, Decimal("1000"))
+        self.assertEqual(item.line_total, Decimal("31000"))
+        self.assertTrue(item.options[0].per_line)
+
 
 class TestQrEditAddons(unittest.TestCase):
     """spec 089 (Historia 3, contracts/addons-per-line.md §4): editar o quitar los adicionales de
@@ -946,11 +1006,16 @@ class TestQrEditAddons(unittest.TestCase):
             OptionSelectionIn(option_id=self.tocino.id, quantity=0)
 
     def test_seleccion_que_viola_el_tope_por_opcion_es_422_con_el_mensaje_del_grupo(self):
+        """Spec 117 (A-126, D2): el tope de `self.extras` (`max_quantity_per_option=2`) se
+        escala por la cantidad de producto de la línea (`quantity=2` en `_add`) a `2×2=4`
+        -- `quantity=3` ya no lo viola (antes de esta spec sí, con el tope fijo); se usa
+        `quantity=5`, por encima incluso del tope ya escalado, para seguir demostrando el
+        422 del mensaje del grupo."""
         resp = self._add(self.ana, self.tocino)
         with self.assertRaises(HTTPException) as ctx:
             self._patch(
                 self.ana, resp.items[0].id,
-                options=[OptionSelectionIn(option_id=self.tocino.id, quantity=3)],
+                options=[OptionSelectionIn(option_id=self.tocino.id, quantity=5)],
             )
         self.assertEqual(ctx.exception.status_code, 422)
         self.assertIn("máximo", str(ctx.exception.detail))
@@ -1006,6 +1071,133 @@ class TestQrEditAddons(unittest.TestCase):
         resp = self._patch(self.ana, resp.items[0].id, notes="sin cebolla")
         self.assertEqual(resp.items[0].notes, "sin cebolla")
         self.assertEqual(resp.items[0].addons_total, Decimal("3000"))
+
+
+class TestAutoAdjustCantidadOptions(unittest.TestCase):
+    """Spec 117 (A-126, D3/D4/D5, contracts/cart-item-auto-adjust.md): al reducir la
+    cantidad de producto de una línea con adiciones "Por cantidad" ya elegidas, si
+    exceden el nuevo tope escalado, `update_item` las reduce automáticamente y lo
+    reporta en `adjusted_options`. Único camino de backend donde esto puede pasar
+    (research.md D3): `PATCH` con solo `quantity` -- hoy ese `PATCH` no revalida nada
+    (línea 441-446 antes de esta spec)."""
+
+    def setUp(self):
+        self.db = cart_fixtures.new_session()
+        table = cart_fixtures.make_dining_table(self.db)
+        ts = cart_fixtures.make_table_session(self.db, table=table)
+        self.participant = cart_fixtures.make_participant(self.db, table_session=ts)
+        category = cart_fixtures.make_category(self.db)
+        product = cart_fixtures.make_product(self.db, category=category)
+        self.variant = cart_fixtures.make_variant(
+            self.db, product=product, price=Decimal("15000")
+        )
+
+    def _add(self, *, quantity, options):
+        return service.add_item(
+            self.db, self.participant.id,
+            CartItemIn(
+                product_variant_id=self.variant.id, quantity=quantity,
+                options=[
+                    OptionSelectionIn(option_id=o.id, quantity=q) for o, q in options
+                ],
+            ),
+        )
+
+    def _patch_quantity(self, item_id, quantity):
+        return service.update_item(
+            self.db, self.participant.id, item_id, CartItemUpdate(quantity=quantity)
+        )
+
+    def test_excede_max_quantity_per_option_se_reduce_al_tope_ya_escalado(self):
+        group = cart_fixtures.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1, max_quantity_per_option=1,
+        )
+        gomitas = cart_fixtures.make_option(
+            self.db, group=group, extra_price=Decimal("4000")
+        )
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, group, min_select=0, max_select=1
+        )
+        resp = self._add(quantity=2, options=[(gomitas, 2)])  # tope 1×2=2: válido
+
+        resp = self._patch_quantity(resp.items[0].id, 1)  # nuevo tope 1×1=1
+
+        item = resp.items[0]
+        self.assertEqual(item.options[0].quantity, 1)
+        self.assertEqual(item.unit_price, Decimal("15000"))
+        self.assertEqual(item.addons_total, Decimal("4000"))
+        self.assertEqual(item.line_total, Decimal("19000"))
+        self.assertEqual(len(item.adjusted_options), 1)
+        adj = item.adjusted_options[0]
+        self.assertEqual(adj.option_name, gomitas.name)
+        self.assertEqual(adj.previous_quantity, 2)
+        self.assertEqual(adj.new_quantity, 1)
+
+    def test_excede_max_total_quantity_reduce_en_orden_alfabetico_descendente(self):
+        """Mismo ejemplo del contrato: "Gomitas" ×2 + "Chocolate" ×1 (suma 3, dentro
+        del tope 2×2=4 al crear la línea con cantidad 2); al reducir a 1, nuevo tope
+        2×1=2 -- se reduce "Gomitas" (alfabéticamente después de "Chocolate") de 2 a
+        1, sin tocar "Chocolate"."""
+        group = cart_fixtures.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=2, max_total_quantity=2,
+        )
+        gomitas = cart_fixtures.make_option(self.db, group=group, name="Gomitas", extra_price=Decimal("1000"))
+        chocolate = cart_fixtures.make_option(self.db, group=group, name="Chocolate", extra_price=Decimal("1500"))
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, group, min_select=0, max_select=2
+        )
+        resp = self._add(quantity=2, options=[(gomitas, 2), (chocolate, 1)])
+
+        resp = self._patch_quantity(resp.items[0].id, 1)
+
+        item = resp.items[0]
+        por_opcion = {o.option_id: o.quantity for o in item.options}
+        self.assertEqual(por_opcion[gomitas.id], 1)
+        self.assertEqual(por_opcion[chocolate.id], 1)
+        self.assertEqual(len(item.adjusted_options), 1)
+        self.assertEqual(item.adjusted_options[0].option_name, "Gomitas")
+        self.assertEqual(item.adjusted_options[0].previous_quantity, 2)
+        self.assertEqual(item.adjusted_options[0].new_quantity, 1)
+
+    def test_grupo_cantidad_sin_topes_nunca_dispara_el_ajuste(self):
+        group = cart_fixtures.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1,
+        )
+        gomitas = cart_fixtures.make_option(self.db, group=group, extra_price=Decimal("1000"))
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, group, min_select=0, max_select=1
+        )
+        resp = self._add(quantity=2, options=[(gomitas, 99)])
+
+        resp = self._patch_quantity(resp.items[0].id, 1)
+
+        self.assertEqual(resp.items[0].options[0].quantity, 99)
+        self.assertEqual(resp.items[0].adjusted_options, [])
+
+    def test_get_cart_tras_el_ajuste_no_repite_adjusted_options(self):
+        group = cart_fixtures.make_option_group(
+            self.db, selection_mode="cantidad", pricing_type="incluido",
+            min_select=0, max_select=1, max_quantity_per_option=1,
+        )
+        gomitas = cart_fixtures.make_option(self.db, group=group, extra_price=Decimal("4000"))
+        cart_fixtures.link_variant_group(
+            self.db, self.variant, group, min_select=0, max_select=1
+        )
+        resp = self._add(quantity=2, options=[(gomitas, 2)])
+        item_id = resp.items[0].id
+        resp = self._patch_quantity(item_id, 1)
+        self.assertEqual(len(resp.items[0].adjusted_options), 1)  # disparó el ajuste
+
+        reread = service.get_cart(self.db, self.participant.id)
+        self.assertEqual(reread.items[0].options[0].quantity, 1)  # ya ajustada
+        self.assertEqual(reread.items[0].adjusted_options, [])  # nunca se repite
+
+        # Un PATCH posterior que no dispara un ajuste nuevo tampoco lo repite.
+        again = self._patch_quantity(item_id, 1)
+        self.assertEqual(again.items[0].adjusted_options, [])
 
 
 if __name__ == "__main__":
