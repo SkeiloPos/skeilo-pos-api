@@ -26,7 +26,7 @@ from app.models.payment_method_catalog import PaymentMethodCatalog
 from app.models.sale import Sale, SaleItem
 from app.api.v1.catalog.line_pricing import compute_line_price, load_valid_options
 from app.catalog_engine.core import format_item_description
-from app.api.v1.orders import checkout
+from app.api.v1.orders import checkout as orders_checkout
 from app.api.v1.sales.consumption import deduct_sale
 from app.api.v1.sales.builder import SaleLine, build_sale, ensure_open_shift
 from app.api.v1.sales.schemas import (
@@ -342,7 +342,7 @@ def checkout(db: Session, data: SaleCreate, cashier: User, *, invoice_prefix: st
 
         # 2. Descuento automático (RF-012): motor por conjunto de variantes
         #    (spec 063). Se suma al descuento manual que haya escrito el cajero.
-        promo_discount, final_promotion_id, applied = checkout.auto_discount(db, lines, now)
+        promo_discount, final_promotion_id, applied = orders_checkout.auto_discount(db, lines, now)
 
         sale = build_sale(
             db,
