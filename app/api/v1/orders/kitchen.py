@@ -171,6 +171,12 @@ def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> Custo
                 db, [(new_item, repl_options)], user.id, reference_id=order_id
             )
 
+        # spec 118 (research.md D3, FR-006): recalcula el descuento de las
+        # líneas vigentes -- la(s) fila(s) restante(s) pierden el descuento si
+        # ya no alcanzan el umbral (import diferido, research.md D2).
+        from app.api.v1.orders.checkout import refresh_order_item_discounts
+        refresh_order_item_discounts(db, item.order)
+
         db.commit()
     except HTTPException:
         db.rollback()

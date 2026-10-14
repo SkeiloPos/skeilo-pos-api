@@ -7,7 +7,7 @@ de cada ítem: solo vuelve al stock lo que cocina no llegó a preparar. Ver
 `cancel_order`."""
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 from uuid import UUID
 
@@ -380,6 +380,58 @@ def promotion_evaluation_instant(
         if o.promotion_evaluated_at is not None
     ]
     return min(frozen) if frozen else now
+
+
+def line_discount_snapshot(
+    result, index: int, line_total: Decimal, quantity: int, addons_total: Decimal = Decimal(0)
+):
+    """`(discounted_unit_price, discounted_line_total)` del ítem `index` a partir
+    del `by_line` de **una sola** llamada a `evaluate_variant_sets`, o
+    `(None, None)` si esa línea no recibió descuento.
+
+    spec 089: `discounted_unit_price` conserva su significado "precio por unidad de
+    producto": los adicionales (`addons_total`, cobrados una vez) no se reparten entre
+    las unidades. Sin adicionales es idéntico al cálculo anterior.
+
+    spec 118 (research.md D2): relocada desde `cart/service.py::_cart_line_discount`
+    -- misma fórmula, ahora pública porque los write-paths de `orders/` también la
+    necesitan, no solo `cart.service.submit_cart`."""
+    d = result.by_line.get(index, Decimal(0))
+    if d <= 0:
+        return None, None
+    discounted_line_total = (line_total - d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    discounted_unit_price = ((discounted_line_total - Decimal(addons_total or 0)) / quantity).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return discounted_unit_price, discounted_line_total
+
+
+def refresh_order_item_discounts(db: Session, order: CustomerOrder) -> None:
+    """spec 118 (research.md D1-D3, contracts/order-item-discount-snapshot.md):
+    recalcula y sobrescribe `discounted_unit_price`/`discounted_line_total` de
+    **todas** las líneas vigentes (`estado_cocina != "anulado"`) de `order`, no
+    solo la que cambió -- el motor de promociones puede redistribuir el
+    descuento entre filas existentes cuando se agrega o se quita una unidad
+    (`_distribute_group_discount`). Escribe `(None, None)` cuando una línea ya
+    no califica (FR-006).
+
+    Se llama al final de cada mutación de líneas de un pedido abierto
+    (`create_order`, `consolidate_table`, `add_item_to_order`, `void_item`),
+    antes del `db.commit()` de esa misma transacción -- nunca sobre un pedido
+    ya cobrado. Usa el mismo instante congelado que `compute_checkout_preview`/
+    `checkout_and_send`/`pay_order` (`promotion_evaluation_instant`), para que
+    el número coincida centavo a centavo con lo que cobrará el módulo de cobro
+    (FR-002)."""
+    lines = order_sale_lines(db, order.id)
+    instant = promotion_evaluation_instant([order], now=datetime.now(timezone.utc))
+    result = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), instant)
+    for idx, line in enumerate(lines):
+        discounted_unit_price, discounted_line_total = line_discount_snapshot(
+            result, idx, line.line_total, line.quantity, line.addons_total,
+        )
+        item = db.get(OrderItem, line.line_id)
+        item.discounted_unit_price = discounted_unit_price
+        item.discounted_line_total = discounted_line_total
 
 
 def compute_checkout_preview(db: Session, order_id: UUID) -> CheckoutPreviewResponse:
