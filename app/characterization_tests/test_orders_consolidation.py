@@ -650,5 +650,90 @@ class TestAddItemToOrderAddonsPerLine(unittest.TestCase):
         self.assertEqual(item.options[0].quantity, 4)
 
 
+class TestConsolidationPersistsDiscounts118(unittest.TestCase):
+    """spec 118 (research.md D1/D3, FR-005/Historia 2 Escenario 1): tanto
+    `add_item_to_order` como `consolidate_table` recalculan y persisten
+    `discounted_unit_price`/`discounted_line_total` sobre TODAS las líneas
+    vigentes del pedido vía `refresh_order_item_discounts` -- antes de esta
+    spec, estas columnas quedaban en `NULL` para toda línea agregada por
+    estos dos caminos (research.md D1).
+
+    No son characterization tests: el defecto que corrigen nunca estuvo
+    congelado (research.md D6)."""
+
+    def _seed_variant_con_receta(self, db, *, price=Decimal("7000")):
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=price)
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        return variant
+
+    def _user(self):
+        return fx.make_user_double()
+
+    def test_dos_llamadas_sucesivas_a_add_item_to_order_dejan_ambas_filas_con_descuento(self):
+        """Historia 2, Escenario 1 del spec: 1 unidad agregada, y luego (en
+        otra llamada, simulando un momento distinto) una segunda unidad de la
+        misma presentación -- tras la SEGUNDA llamada, AMBAS filas quedan con
+        `discounted_unit_price=6000`/`discounted_line_total=6000` (promoción
+        `package_price` `2 x $12.000` sobre una variante a $7.000)."""
+        db = fx.new_session()
+        table = fx.make_dining_table(db)
+        variant = self._seed_variant_con_receta(db)
+        promo = fx.make_promotion(db)
+        fx.add_rule_to_promotion(
+            db, promo, type="package_price", value=Decimal("12000"), min_qty=2,
+            variants=[variant],
+        )
+        db.commit()
+        user = self._user()
+        order = consolidation.get_or_create_open_order(db, table.id, user.id)
+        db.commit()
+
+        data = OrderItemIn(product_variant_id=variant.id, quantity=1)
+        order = consolidation.add_item_to_order(db, order.id, data, user)
+        [primera] = order.items
+        # Todavía 1 sola unidad elegible: no alcanza el umbral `min_qty=2`.
+        self.assertIsNone(primera.discounted_unit_price)
+
+        order = consolidation.add_item_to_order(db, order.id, data, user)
+
+        self.assertEqual(len(order.items), 2)
+        for item in order.items:
+            self.assertEqual(item.discounted_unit_price, Decimal("6000"))
+            self.assertEqual(item.discounted_line_total, Decimal("6000"))
+
+    def test_consolidate_table_con_dos_comensales_sobre_la_misma_presentacion_persiste_en_ambas(self):
+        """`consolidate_table` con carritos de dos comensales distintos sobre
+        la misma presentación produce el mismo resultado que dos adiciones
+        sucesivas del mesero: ambas filas quedan con el descuento combinado
+        persistido."""
+        db = fx.new_session()
+        table = fx.make_dining_table(db)
+        ts = fx.make_table_session(db, table=table)
+        ana = fx.make_participant(db, table_session=ts, display_name="Ana")
+        beto = fx.make_participant(db, table_session=ts, display_name="Beto")
+        variant = self._seed_variant_con_receta(db)
+        promo = fx.make_promotion(db)
+        fx.add_rule_to_promotion(
+            db, promo, type="package_price", value=Decimal("12000"), min_qty=2,
+            variants=[variant],
+        )
+        cart_ana = fx.make_cart(db, participant=ana)
+        fx.make_cart_item(db, cart_ana, variant, quantity=1)
+        cart_beto = fx.make_cart(db, participant=beto)
+        fx.make_cart_item(db, cart_beto, variant, quantity=1)
+        db.commit()
+        user = self._user()
+
+        result = consolidation.consolidate_table(db, table.id, user)
+
+        self.assertEqual(len(result.items), 2)
+        for item in result.items:
+            self.assertEqual(item.discounted_unit_price, Decimal("6000"))
+            self.assertEqual(item.discounted_line_total, Decimal("6000"))
+
+
 if __name__ == "__main__":
     unittest.main()

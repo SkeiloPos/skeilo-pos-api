@@ -309,5 +309,48 @@ class TestKitchen(unittest.TestCase):
         self.assertEqual(ctx7.exception.status_code, 409)
 
 
+class TestVoidItemRevertsDiscounts118(unittest.TestCase):
+    """spec 118 (research.md D3, FR-006): `void_item` recalcula y persiste
+    `discounted_unit_price`/`discounted_line_total` sobre las líneas vigentes
+    restantes del pedido vía `refresh_order_item_discounts` -- al anular una
+    de dos filas con descuento ya persistido, la fila restante vuelve a
+    `None` si la cantidad restante cae bajo el umbral de la promoción.
+
+    No es un characterization test: el defecto que corrige nunca estuvo
+    congelado (research.md D6)."""
+
+    def test_anular_una_de_dos_filas_con_descuento_revierte_la_restante_a_none(self):
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=Decimal("7000"))
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        promo = fx.make_promotion(db)
+        fx.add_rule_to_promotion(
+            db, promo, type="package_price", value=Decimal("12000"), min_qty=2,
+            variants=[variant],
+        )
+        # Dos filas con el descuento ya persistido, como lo dejaría
+        # `refresh_order_item_discounts` tras una segunda adición (Historia 2).
+        item_a = fx.make_order_item(
+            db, order, variant, quantity=1, estado_cocina="pendiente",
+            discounted_unit_price=Decimal("6000"), discounted_line_total=Decimal("6000"),
+        )
+        item_b = fx.make_order_item(
+            db, order, variant, quantity=1, estado_cocina="pendiente",
+            discounted_unit_price=Decimal("6000"), discounted_line_total=Decimal("6000"),
+        )
+        db.commit()
+
+        kitchen.void_item(db, item_a.id, VoidItemIn(motivo="cambio de parecer"), fx.make_user_double())
+
+        db.refresh(item_b)
+        self.assertIsNone(item_b.discounted_unit_price)
+        self.assertIsNone(item_b.discounted_line_total)
+
+
 if __name__ == "__main__":
     unittest.main()
