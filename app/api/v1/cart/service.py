@@ -5,7 +5,7 @@ disponibilidad. **No descuenta inventario**: eso ocurre al confirmar el pedido."
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -60,6 +60,7 @@ from app.api.v1.catalog.line_pricing import (
     required_consumption,
 )
 from app.api.v1.cash.service import resolve_dine_in_table_order
+from app.api.v1.orders.checkout import line_discount_snapshot
 from app.api.v1.orders.schemas import CancelIn
 from app.api.v1.promotions import service as promotions
 from app.api.v1.cart.schemas import (
@@ -301,26 +302,6 @@ def _cart_promo_lines(db: Session, cart: Cart) -> list[dict]:
     return promo_lines
 
 
-def _cart_line_discount(
-    result, index: int, line_total: Decimal, quantity: int, addons_total: Decimal = Decimal(0)
-):
-    """`(discounted_unit_price, discounted_line_total)` del ítem `index` a partir
-    del `by_line` de **una sola** llamada a `evaluate_variant_sets`, o
-    `(None, None)` si esa línea no recibió descuento.
-
-    spec 089: `discounted_unit_price` conserva su significado "precio por unidad de
-    producto": los adicionales (`addons_total`, cobrados una vez) no se reparten entre
-    las unidades. Sin adicionales es idéntico al cálculo anterior."""
-    d = result.by_line.get(index, Decimal(0))
-    if d <= 0:
-        return None, None
-    discounted_line_total = (line_total - d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    discounted_unit_price = ((discounted_line_total - Decimal(addons_total or 0)) / quantity).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    return discounted_unit_price, discounted_line_total
-
-
 def serialize_cart(db: Session, cart: Cart, participant: SessionParticipant) -> CartResponse:
     now = datetime.now(timezone.utc)
     # spec 063: motor por conjunto de variantes, evaluado UNA sola vez sobre las
@@ -335,7 +316,7 @@ def serialize_cart(db: Session, cart: Cart, participant: SessionParticipant) -> 
         # fórmula de siempre para toda línea histórica).
         line_total = compute_line_total(it.unit_price, it.quantity, it.addons_total)
         total += line_total
-        discounted_unit_price, discounted_line_total = _cart_line_discount(
+        discounted_unit_price, discounted_line_total = line_discount_snapshot(
             result, idx, line_total, it.quantity, it.addons_total,
         )
         if discounted_line_total is not None:
@@ -812,7 +793,7 @@ def submit_cart(
 
         for idx, ci in enumerate(cart.items):
             line_total = compute_line_total(ci.unit_price, ci.quantity, ci.addons_total)
-            discounted_unit_price, discounted_line_total = _cart_line_discount(
+            discounted_unit_price, discounted_line_total = line_discount_snapshot(
                 result, idx, line_total, ci.quantity, ci.addons_total,
             )
             item = OrderItem(
