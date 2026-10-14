@@ -650,6 +650,12 @@ def create_order(
             item.addons_total = compute_addons_total(options)
             entries.append((item, options))
 
+        # spec 118 (research.md D3): persiste el descuento por línea de las
+        # promociones por volumen/porcentuales vigentes -- import diferido para
+        # romper el ciclo service.py <-> checkout.py (research.md D2).
+        from app.api.v1.orders.checkout import refresh_order_item_discounts
+        refresh_order_item_discounts(db, order)
+
         if not data.hold_for_payment:
             # Nace confirmada, así que compromete stock aquí y ahora. Si falta
             # un insumo (o alguna variante no tiene receta) revienta la

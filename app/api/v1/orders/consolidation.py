@@ -177,6 +177,12 @@ def consolidate_table(db: Session, table_id: UUID, user: User) -> CustomerOrder:
 
         deduct_order_items(db, entries, user.id, reference_id=order.id)
 
+        # spec 118 (research.md D3): persiste el descuento por línea de las
+        # promociones por volumen/porcentuales vigentes sobre el pedido completo
+        # -- import diferido (patrón del resto de write-paths, research.md D2).
+        from app.api.v1.orders.checkout import refresh_order_item_discounts
+        refresh_order_item_discounts(db, order)
+
         db.commit()
     except HTTPException:
         db.rollback()
@@ -249,6 +255,12 @@ def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> Customer
 
         # spec 089 (A-96): un insumo agotado nombra el PRODUCTO, no solo el insumo.
         deduct_order_items_naming_product(db, entries, user.id, reference_id=order.id)
+
+        # spec 118 (research.md D3): caso central de la Historia 2 -- una
+        # segunda unidad agregada en otro momento recalcula el descuento de
+        # TODAS las líneas vigentes del pedido (import diferido, research.md D2).
+        from app.api.v1.orders.checkout import refresh_order_item_discounts
+        refresh_order_item_discounts(db, order)
 
         db.commit()
     except HTTPException:

@@ -747,5 +747,74 @@ class TestConfirmCashChequeoPrevioConPromocion073(unittest.TestCase):
         self.assertEqual(result.change_amount, Decimal("0"))
 
 
+class TestConfirmCashConAdicionesSucesivasPorCanalesDistintos118(unittest.TestCase):
+    """spec 118 (research.md D5, FR-004, Acceptance Scenario 4 de Historia 1,
+    Edge Case de canales mixtos): un pedido QR con 1 unidad recibe una
+    segunda unidad de la misma presentación vía `add_item_to_order` (mesero)
+    antes de que `confirm_cash_payment_attempt` se llame -- el monto
+    validado ya incluye el descuento combinado.
+
+    No hay cambio de código en `confirm_cash_payment_attempt`/
+    `approve_payment_attempt`: ambos ya comparan contra
+    `compute_checkout_preview`, que agrupa entre filas distintas sin importar
+    por qué camino se creó cada una (research.md D5) -- esta es cobertura
+    nueva, no una corrección."""
+
+    PRECIO = Decimal("7000")
+
+    def _user(self):
+        return fx.make_user_double()
+
+    def _shift(self, db):
+        return fx.make_cash_shift(db)
+
+    def test_segunda_unidad_agregada_por_el_mesero_ya_incluye_el_descuento_combinado(self):
+        from app.api.v1.orders import consolidation
+        from app.api.v1.orders.schemas import OrderItemIn
+
+        db = fx.new_session()
+        table = fx.make_dining_table(db)
+        ts = fx.make_table_session(db, table=table)
+        participant = fx.make_participant(db, table_session=ts)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=self.PRECIO)
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        order = fx.make_customer_order(
+            db, ts, participant=participant, status="recibida", channel="QR_MENU",
+        )
+        # 1 unidad pedida por el comensal vía el menú QR.
+        fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
+        promo = fx.make_promotion(db)
+        fx.add_rule_to_promotion(
+            db, promo, type="package_price", value=Decimal("12000"), min_qty=2,
+            variants=[variant],
+        )
+        efectivo = fx.make_payment_method(db, name="Efectivo", is_cash=True)
+        attempt = fx.make_payment_attempt(db, order, efectivo, status="pendiente")
+        db.commit()
+
+        # El mesero anexa 1 unidad más de la misma presentación, por un
+        # camino distinto (Terminal, no el menú QR del comensal) y en un
+        # momento posterior, antes de que el cajero abra "Pagos por confirmar".
+        order = consolidation.add_item_to_order(
+            db, order.id, OrderItemIn(product_variant_id=variant.id, quantity=1), self._user(),
+        )
+        self.assertEqual(len(order.items), 2)
+
+        result = checkout.confirm_cash_payment_attempt(
+            db, attempt.id, Decimal("12000"), self._shift(db).id, self._user(),
+        )
+
+        self.assertEqual(result.status, "confirmado")
+        self.assertEqual(result.change_amount, Decimal("0"))
+        sale = db.execute(
+            select(Sale).where(Sale.customer_order_id == order.id)
+        ).scalar_one()
+        self.assertEqual(sale.total, Decimal("12000"))
+        self.assertEqual(sale.discount, Decimal("2000"))
+
+
 if __name__ == "__main__":
     unittest.main()

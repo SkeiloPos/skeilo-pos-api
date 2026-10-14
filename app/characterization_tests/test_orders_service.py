@@ -29,6 +29,7 @@ from app.api.v1.orders import service
 from app.api.v1.orders.schemas import OrderChannel, OrderCreate, OrderItemIn, OrderType
 from app.api.v1.catalog.schemas import OptionSelectionIn
 from app.models.inventory_movement import InventoryMovement
+from app.models.order_item import OrderItem
 from app.models.sale import Sale
 
 PRECIO = Decimal("10000")
@@ -1098,6 +1099,85 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         self.db.expire_all()
         # Rollback total: la línea original sigue viva y sin reversa.
         self.assertNotEqual(self.db.get(type(original), original.id).estado_cocina, "anulado")
+
+
+class TestCreateOrderPersistsDiscounts118(unittest.TestCase):
+    """spec 118 (research.md D1/D3; FR-001): `create_order` recalcula y
+    persiste `discounted_unit_price`/`discounted_line_total` sobre TODAS las
+    líneas vigentes del pedido vía `refresh_order_item_discounts` -- antes de
+    esta spec, estas columnas quedaban en `NULL` para toda línea creada por la
+    comanda directa de mostrador/mesero (research.md D1).
+
+    No son characterization tests: el defecto que corrigen nunca estuvo
+    congelado (research.md D6)."""
+
+    def setUp(self):
+        self.db = fx.new_session()
+        category = fx.make_category(self.db)
+        product = fx.make_product(self.db, category=category)
+        self.variant = fx.make_variant(self.db, product=product, price=Decimal("7000"))
+        insumo = fx.make_inventory_item(self.db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(self.db, self.variant, insumo, quantity=Decimal("1"))
+
+    def _order_items(self, order_id):
+        return self.db.execute(
+            select(OrderItem).where(OrderItem.order_id == order_id)
+        ).scalars().all()
+
+    def test_dos_lineas_de_la_misma_presentacion_alcanzan_package_price_y_persisten_en_ambas(self):
+        """2 líneas de 1 unidad cada una (misma llamada) sobre una variante a
+        $7.000 con regla `package_price` `2 x $12.000` vigente -> AMBAS filas
+        quedan con `discounted_unit_price=6000`/`discounted_line_total=6000`
+        (14000 - 12000 = 2000 repartido 1000 cada una)."""
+        promo = fx.make_promotion(self.db)
+        fx.add_rule_to_promotion(
+            self.db, promo, type="package_price", value=Decimal("12000"), min_qty=2,
+            variants=[self.variant],
+        )
+        self.db.commit()
+
+        data = OrderCreate(
+            channel=OrderChannel.POS,
+            customer_name="Cliente de prueba",
+            items=[
+                OrderItemIn(product_variant_id=self.variant.id, quantity=1),
+                OrderItemIn(product_variant_id=self.variant.id, quantity=1),
+            ],
+        )
+        order = service.create_order(self.db, data, uuid4())
+
+        items = self._order_items(order.id)
+        self.assertEqual(len(items), 2)
+        for item in items:
+            self.assertEqual(item.discounted_unit_price, Decimal("6000"))
+            self.assertEqual(item.discounted_line_total, Decimal("6000"))
+
+    def test_dos_lineas_de_la_misma_presentacion_con_regla_percent_persisten_en_ambas(self):
+        """Idem con una regla `percent` (20%, `min_qty=1`) vigente sobre la
+        misma presentación: `evaluate_variant_sets` persiste el descuento
+        porcentual por línea igual que el de volumen (research.md D1)."""
+        promo = fx.make_promotion(self.db)
+        fx.add_rule_to_promotion(
+            self.db, promo, type="percent", value=Decimal("20"), min_qty=1,
+            variants=[self.variant],
+        )
+        self.db.commit()
+
+        data = OrderCreate(
+            channel=OrderChannel.POS,
+            customer_name="Cliente de prueba",
+            items=[
+                OrderItemIn(product_variant_id=self.variant.id, quantity=1),
+                OrderItemIn(product_variant_id=self.variant.id, quantity=1),
+            ],
+        )
+        order = service.create_order(self.db, data, uuid4())
+
+        items = self._order_items(order.id)
+        self.assertEqual(len(items), 2)
+        for item in items:
+            self.assertEqual(item.discounted_unit_price, Decimal("5600"))
+            self.assertEqual(item.discounted_line_total, Decimal("5600"))
 
 
 if __name__ == "__main__":
