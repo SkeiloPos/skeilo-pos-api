@@ -52,6 +52,9 @@ def _list_orders(db, **kw):
         active_sessions_only=False,
         page=kw["page"],
         size=kw["size"],
+        date_from=None,
+        date_to=None,
+        q=None,
         db=db,
         _=fx.make_user_double(),
     )

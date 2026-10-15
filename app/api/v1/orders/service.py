@@ -15,13 +15,14 @@ camino — mismo criterio de "un único punto de descuento", solo que movido.
 El pedido anónimo por QR **no** entra por aquí: llega como `recibida` vía
 `/cart/submit` y lo descuenta el staff al confirmarlo."""
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from math import ceil
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import cast, exists, func, or_, select
+from sqlalchemy.types import String
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
@@ -40,6 +41,7 @@ from app.models.dining_table import DiningTable
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem, OrderItemOption
 from app.models.order_payment_attempt import OrderPaymentAttempt
+from app.models.payment import Payment, PaymentMethod
 from app.models.sale import Sale
 from app.models.table_session import TableSession
 from app.core.models import User
@@ -126,6 +128,39 @@ def _venta_propia(db: Session, order_id: UUID) -> Sale | None:
     return db.execute(
         select(Sale).where(Sale.customer_order_id == order_id).limit(1)
     ).scalar_one_or_none()
+
+
+def invoice_and_payment_info(db: Session, order_id: UUID) -> tuple[str | None, str | None]:
+    """Referencia de factura real y nombre del método de pago de la orden,
+    o `(None, None)` si todavía no tiene `Sale` (spec 120, corrección de
+    FR-012: el detalle debe mostrar la factura y el método REALES, no un
+    código sintético derivado del `id` -- hallazgo reportado por el negocio
+    tras ver que "Referencia" no coincidía con la factura registrada).
+
+    `invoice_reference` usa la misma fórmula que `InvoiceResponse.full_number`
+    (`app/api/v1/invoices/schemas.py`): `prefix + number` con el número
+    relleno a 6 dígitos. `payment_method_name` lee `payments` de la venta en
+    vez de `OrderPaymentAttempt` porque los pedidos cobrados por mostrador
+    (`pay_order`/`checkout_and_send`) nunca crean un intento de pago -- solo
+    los cobrados por QR lo hacen -- así que `current_payment_attempt` queda
+    permanentemente vacío para la mayoría de las órdenes pagadas.
+
+    Dos consultas constantes como máximo, ninguna dependiente del número de
+    ítems (mismo presupuesto que `_venta_propia`, guardia
+    `test_orders_billing_summary::TestTrabajoAcotado`)."""
+    sale = db.execute(
+        select(Sale).options(selectinload(Sale.invoice)).where(Sale.customer_order_id == order_id).limit(1)
+    ).scalar_one_or_none()
+    if sale is None:
+        return None, None
+    invoice_reference = f"{sale.invoice.prefix}{sale.invoice.number:06d}" if sale.invoice else None
+    payment_method_name = db.execute(
+        select(PaymentMethod.name)
+        .join(Payment, Payment.payment_method_id == PaymentMethod.id)
+        .where(Payment.sale_id == sale.id)
+        .limit(1)
+    ).scalar()
+    return invoice_reference, payment_method_name
 
 
 def _sesion_tiene_venta(db: Session, table_session_id: UUID) -> bool:
@@ -369,6 +404,7 @@ ESTADOS_MOSTRADOS_ORDENES = ("recibida", "abierta", "bloqueada", "pagada", "canc
 
 def list_orders_query(
     status_mostrado: str | None = None, order_type: str | None = None,
+    date_from: date | None = None, date_to: date | None = None, q: str | None = None,
 ) -> Select:
     """`Select` de comandas para la rama **paginada** de `GET /orders` (spec 079).
 
@@ -389,6 +425,13 @@ def list_orders_query(
 
     `list_orders()` (Terminal/Dashboard) **no se toca**: conserva su firma y su
     salida (plan.md, Constitution Check, Principio III).
+
+    `date_from`/`date_to`/`q` son aditivos (spec 120, research.md §1-§2):
+    `date_from`/`date_to` acotan `created_at` (inclusive en ambos extremos,
+    `date_to` incluye todo su día); `q` hace *match* parcial insensible a
+    mayúsculas contra `customer_name` **o** contra el texto del `id` — el
+    mismo criterio que `orderDisplayCode()` usa en el frontend para el código
+    corto visible.
     """
     stmt = (
         select(CustomerOrder)
@@ -418,6 +461,22 @@ def list_orders_query(
 
     if order_type is not None:
         stmt = stmt.where(CustomerOrder.order_type == order_type)
+
+    if date_from is not None:
+        stmt = stmt.where(CustomerOrder.created_at >= datetime.combine(date_from, time.min))
+    if date_to is not None:
+        stmt = stmt.where(
+            CustomerOrder.created_at < datetime.combine(date_to + timedelta(days=1), time.min)
+        )
+
+    q_normalizado = q.strip() if q else None
+    if q_normalizado:
+        stmt = stmt.where(
+            or_(
+                CustomerOrder.customer_name.ilike(f"%{q_normalizado}%"),
+                cast(CustomerOrder.id, String).ilike(f"%{q_normalizado}%"),
+            )
+        )
 
     return stmt
 
