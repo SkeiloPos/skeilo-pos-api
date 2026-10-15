@@ -24,7 +24,9 @@ from .cash_register import CashRegister
 from .cash_shift import CashShift
 from .cash_movement import CashMovement
 from .cash_count_denomination import CashCountDenomination
-from .shift_sales_report import ShiftSalesReport
+from .shift_sales_report import (
+    ShiftSalesReport, ShiftSalesReportProduct, ShiftSalesReportCategory,
+)
 
 # Mesas y órdenes (QR)
 from .dining_table import DiningTable

@@ -41,6 +41,11 @@ def upgrade(schema: str) -> None:
     # Los esquemas de scratch (tenant_default) pueden no tener las tablas base.
     if not _has_table(schema, "cash_shifts"):
         return
+    # Un tenant creado por `create_all` tras el cambio de la Rev. B ya nació en
+    # la forma final (sin columnas JSONB): se omite el esquema entero para no
+    # fallar aquí antes de llegar a la Rev. B/C (research.md D14 §2).
+    if _has_table(schema, "shift_sales_reports"):
+        return
 
     op.create_table(
         "shift_sales_reports",

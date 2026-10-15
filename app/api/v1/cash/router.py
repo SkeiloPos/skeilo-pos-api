@@ -19,7 +19,6 @@ from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.cash_movement import CashMovement
 from app.models.cash_count_denomination import CashCountDenomination
-from app.models.shift_sales_report import ShiftSalesReport
 from app.api.v1.cash import service, reports, active_orders
 from app.api.v1.cash.schemas import (
     RegisterCreate, RegisterResponse,
@@ -163,14 +162,7 @@ def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
     # la MISMA transacción de cierre -- si el cómputo fallara, todo el
     # cierre revierte (nunca un turno 'closed' sin su reporte).
     report_data = reports.compute_shift_sales_report(db, shift)
-    db.add(ShiftSalesReport(
-        cash_shift_id=shift.id,
-        total_sales=report_data["total_sales"],
-        order_count=report_data["order_count"],
-        avg_ticket=report_data["avg_ticket"],
-        products_breakdown=report_data["products_breakdown"],
-        categories_breakdown=report_data["categories_breakdown"],
-    ))
+    reports.persist_shift_snapshot(db, shift, report_data)
 
     db.commit()
     db.refresh(shift)
@@ -184,7 +176,7 @@ def shift_sales_report(
     shift_id: UUID, db: Session = Depends(get_db), _: User = Depends(require_tenant_admin),
 ):
     shift = get_or_404(db, CashShift, shift_id, "Shift not found")
-    agg = reports.aggregate_shifts(db, [shift])
+    agg = reports.aggregate_shifts(db, reports.shift_selector(shift.id))
     register_name = db.execute(
         select(CashRegister.name).where(CashRegister.id == shift.cash_register_id)
     ).scalar_one_or_none() or "—"
@@ -222,20 +214,12 @@ def current_shift_report(
 ):
     if cash_register_id is not None:
         get_or_404(db, CashRegister, cash_register_id, "Register not found")
-        shift = service.get_open_shift(db, cash_register_id)
-        if shift is None:
+        if service.get_open_shift(db, cash_register_id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "La caja no tiene un turno abierto")
-        shifts = [shift]
-    else:
-        # Sin filtro de caja: agrega TODOS los turnos abiertos del tenant,
-        # incluido el caso de cero turnos abiertos (200 con totales en cero,
-        # no 404 -- contracts/shift-sales-report-api.md).
-        shifts = db.execute(
-            select(CashShift).where(CashShift.status == "open")
-            .order_by(CashShift.opened_at.asc())
-        ).scalars().all()
-
-    agg = reports.aggregate_shifts(db, shifts)
+    # Sin filtro de caja: agrega TODOS los turnos abiertos del tenant, incluido el
+    # caso de cero turnos abiertos (200 con totales en cero, no 404 --
+    # contracts/shift-sales-report-api.md).
+    agg = reports.aggregate_shifts(db, reports.open_shifts_selector(cash_register_id))
     today = reports.business_today(tenant)
     return {
         "period": "current_shift",
