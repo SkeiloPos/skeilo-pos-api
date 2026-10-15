@@ -1,3 +1,4 @@
+from datetime import date
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -69,6 +70,10 @@ def _load_order(db: Session, order_id: UUID) -> CustomerOrder:
     # esta spec lo pide para el listado. Allí `billing` viaja `null`, que la
     # pantalla trata como "no pintar el resumen" — nunca como cero (D15).
     order.billing = service.build_billing_summary(db, order)
+    # spec 120 (corrección FR-012): referencia de factura y método de pago
+    # reales, resueltos solo aquí -- mismo motivo que `billing` (D3, no se
+    # calcula por fila en el listado).
+    order.invoice_reference, order.payment_method_name = service.invoice_and_payment_info(db, order.id)
     return order
 
 
@@ -642,6 +647,9 @@ def list_orders(
     active_sessions_only: bool = Query(False),
     page: int | None = Query(None, ge=1),
     size: int | None = Query(None, ge=1, le=100),
+    date_from: date | None = Query(None, description="Fecha inicial (inclusive) sobre created_at."),
+    date_to: date | None = Query(None, description="Fecha final (inclusive) sobre created_at."),
+    q: str | None = Query(None, description="Búsqueda por nombre de cliente o identificador de la orden."),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -655,10 +663,12 @@ def list_orders(
 
     **Con `page` y/o `size`** — pantalla "Órdenes": `service.list_orders_query`
     (orden `created_at DESC, id DESC`, `status` como "estado que ve la persona",
-    `order_type` opcional) paginado con `paginate` + `clamp_page`; `paid` y
+    `order_type` opcional, `date_from`/`date_to`/`q` opcionales — spec 120,
+    research.md §1-§2) paginado con `paginate` + `clamp_page`; `paid` y
     `staff_user_name` solo sobre los `items` de la página; **sin `ETag`** (la
     pantalla se recarga a mano); `active_sessions_only` se ignora (ningún
-    consumidor legítimo lo combina con paginación)."""
+    consumidor legítimo lo combina con paginación). `date_from`/`date_to`/`q`
+    solo aplican a esta rama — la rama sin paginar no los recibe."""
     if page is None and size is None:
         orders = service.list_orders(db, status_filter, active_sessions_only)
         _decorate_orders(db, orders)
@@ -674,6 +684,9 @@ def list_orders(
     stmt = service.list_orders_query(
         status_mostrado=status_filter,
         order_type=order_type.value if order_type is not None else None,
+        date_from=date_from,
+        date_to=date_to,
+        q=q,
     )
     effective_size = size or 20
     effective_page = service.clamp_page(db, stmt, page or 1, effective_size)
