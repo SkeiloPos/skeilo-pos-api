@@ -76,6 +76,7 @@ from app.models.product_variant import ProductVariant
 from app.models.promotion import Promotion, PromotionRule, PromotionVariant
 from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
+from app.models.shift_sales_report import ShiftSalesReport
 from app.models.payment import Payment, PaymentMethod
 from app.models.sale import Sale, SaleItem
 from app.models.invoice import Invoice, InvoiceCounter
@@ -119,6 +120,7 @@ _ORDERS_TABLE_NAMES = [
     "promotion_variants",
     "cash_registers",
     "cash_shifts",
+    "shift_sales_reports",
     "payment_methods",
     "payments",
     "sales",
