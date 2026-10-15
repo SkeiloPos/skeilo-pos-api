@@ -42,6 +42,9 @@ def _ids(db, *, status=None, order_type=None):
         active_sessions_only=False,
         page=1,
         size=50,
+        date_from=None,
+        date_to=None,
+        q=None,
         db=db,
         _=fx.make_user_double(),
     )

@@ -313,6 +313,10 @@ class OrderResponse(BaseModel):
     # Un `null` NO significa "cero": la pantalla trata la ausencia como "no
     # pintar el resumen" (D15).
     billing: OrderBillingSummary | None = None
+    # spec 120 (corrección FR-012): resueltos solo en el detalle (`_load_order`),
+    # igual que `billing` -- `None` en el listado, nunca inventados (D15/RN-005).
+    invoice_reference: str | None = None
+    payment_method_name: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

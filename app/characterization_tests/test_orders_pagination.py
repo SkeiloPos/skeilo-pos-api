@@ -61,6 +61,9 @@ def _call_list_orders(db, *, status=None, order_type=None, active_sessions_only=
         active_sessions_only=active_sessions_only,
         page=page,
         size=size,
+        date_from=None,
+        date_to=None,
+        q=None,
         db=db,
         _=fx.make_user_double(),
     )
