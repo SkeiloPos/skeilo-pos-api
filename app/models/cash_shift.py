@@ -54,5 +54,11 @@ class CashShift(UUIDPrimaryKeyMixin, Base):
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
+        # spec 119 US6 (FR-021, research.md D13): "turnos por fecha de apertura",
+        # sin y con filtro de caja. Los nombres deben ser IDÉNTICOS a los de la
+        # Rev. C de Alembic: un tenant nuevo (create_all) y uno migrado tendrían
+        # nombres distintos y `IF NOT EXISTS` no los reconocería.
+        Index("ix__cash_shifts__opened_at", "opened_at"),
+        Index("ix__cash_shifts__register_opened_at", "cash_register_id", "opened_at"),
         {"schema": "tenant"},
     )
