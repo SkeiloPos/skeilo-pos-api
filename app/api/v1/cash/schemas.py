@@ -1,3 +1,4 @@
+from datetime import date
 from enum import Enum
 from uuid import UUID
 from decimal import Decimal
@@ -141,3 +142,64 @@ class ShiftSummaryResponse(BaseModel):
     close_note: str | None = None
     expected: Decimal
     difference: Decimal | None = None
+
+
+# ---------- Reporte operativo por turno (spec 119) ----------
+class ProductBreakdownRow(BaseModel):
+    product_variant_id: UUID
+    name: str
+    units: int
+    revenue: Decimal
+
+
+class CategoryBreakdownRow(BaseModel):
+    category_id: UUID | None = None
+    category_name: str
+    units: int
+    revenue: Decimal
+
+
+class ShiftSalesReportResponse(BaseModel):
+    shift_id: UUID
+    cash_register_id: UUID
+    cash_register_name: str
+    status: str
+    # `true` si `status="open"`, o si `status="closed"` sin snapshot todavía
+    # (turno cerrado antes de que esta funcionalidad existiera, research.md D8).
+    is_live: bool
+    opened_at: UtcDatetime
+    closed_at: UtcDatetime | None = None
+    total_sales: Decimal
+    order_count: int
+    avg_ticket: Decimal
+    top_products: list[ProductBreakdownRow]
+    categories: list[CategoryBreakdownRow]
+    # Solo relevante/no-null cuando status="open" (FR-012).
+    active_orders_count: int | None = None
+
+
+class PeriodSalesReportResponse(BaseModel):
+    period: str  # "shift" | "current_shift" | "day" | "week" | "month" | "range"
+    date_from: date
+    date_to: date
+    cash_register_id: UUID | None = None
+    shift_ids: list[UUID]
+    is_live: bool
+    total_sales: Decimal
+    order_count: int
+    avg_ticket: Decimal
+    top_products: list[ProductBreakdownRow]
+    categories: list[CategoryBreakdownRow]
+
+
+# ---------- Pedidos activos / bloqueo de cierre (spec 119) ----------
+class ActiveOrderSummary(BaseModel):
+    id: UUID
+    order_type: str | None = None
+    status: str
+    dining_table_id: UUID | None = None
+    table_number: int | None = None
+    customer_name: str | None = None
+    created_at: UtcDatetime
+
+    model_config = ConfigDict(from_attributes=True)
