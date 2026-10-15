@@ -114,7 +114,12 @@ def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
     # intento, sin caché de un intento anterior (contracts/active-orders-
     # close-gate-api.md). El cuerpo del 409 es plano (sin envolver en otro
     # "detail") para que el frontend lea `active_orders` directo.
-    active = active_orders.list_active_orders(db)
+    # US6 (FR-023, research.md D12): se cuenta primero con un COUNT y la lista
+    # solo se trae si hay algo que mostrar. Si entre el conteo y la lista el
+    # pedido se resolvió (lista vacía), el cierre continúa con el estado vigente.
+    active = (
+        active_orders.list_active_orders(db) if active_orders.count_active_orders(db) else []
+    )
     if active:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
@@ -184,7 +189,7 @@ def shift_sales_report(
     # Solo relevante cuando el turno sigue abierto (FR-012) -- tenant-wide,
     # igual que el propio bloqueo de cierre (research.md D1).
     active_orders_count = (
-        len(active_orders.list_active_orders(db)) if shift.status == "open" else None
+        active_orders.count_active_orders(db) if shift.status == "open" else None
     )
 
     return {

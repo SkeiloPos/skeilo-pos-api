@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.customer_order import CustomerOrder
@@ -22,6 +22,10 @@ from app.models.dining_table import DiningTable
 # aquí por el mismo motivo que ya documentan esos dos módulos (evitar un
 # import cruzado entre paquetes de API hermanos).
 _NON_TERMINAL_ORDER_STATUSES = ("recibida", "abierta", "bloqueada")
+
+# Un único predicado de "activo" para el conteo y para la lista (US6, FR-023):
+# así no pueden divergir.
+_IS_ACTIVE = CustomerOrder.status.in_(_NON_TERMINAL_ORDER_STATUSES)
 
 
 @dataclass
@@ -51,7 +55,7 @@ def list_active_orders(db: Session) -> list[ActiveOrderRow]:
         )
         .select_from(CustomerOrder)
         .outerjoin(DiningTable, DiningTable.id == CustomerOrder.dining_table_id)
-        .where(CustomerOrder.status.in_(_NON_TERMINAL_ORDER_STATUSES))
+        .where(_IS_ACTIVE)
         .order_by(CustomerOrder.created_at.asc())
     ).all()
     return [
@@ -62,3 +66,10 @@ def list_active_orders(db: Session) -> list[ActiveOrderRow]:
         )
         for id_, order_type, status, dining_table_id, table_number, customer_name, created_at in rows
     ]
+
+
+def count_active_orders(db: Session) -> int:
+    """Cuántos pedidos activos hay en todo el tenant, con un `COUNT` en la base
+    de datos (US6, FR-023, research.md D12) en vez de traer todas las filas para
+    llamar `len()`. Mismo predicado que `list_active_orders`."""
+    return db.execute(select(func.count()).select_from(CustomerOrder).where(_IS_ACTIVE)).scalar_one()
