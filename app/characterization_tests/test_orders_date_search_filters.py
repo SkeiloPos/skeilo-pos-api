@@ -48,6 +48,7 @@ def _ids(db, *, date_from=None, date_to=None, q=None, status=None, order_type=No
         date_to=date_to,
         q=q,
         db=db,
+        tenant=fx.make_tenant_double(),
         _=fx.make_user_double(),
     )
     return {o.id for o in result["items"]}
@@ -80,13 +81,30 @@ class TestFiltroDeFecha(_Base):
         self.assertNotIn(anterior.id, ids)
 
     def test_date_to_es_inclusive_hasta_el_fin_del_dia(self):
-        limite = self._order(created_at=datetime(2026, 10, 14, 23, 59, 59))
-        siguiente_dia = self._order(created_at=datetime(2026, 10, 15, 0, 0, 1))
+        # `created_at` guarda un instante UTC naive; el tenant de prueba usa
+        # `America/Bogota` (UTC-5), así que la medianoche local del 15 cae en
+        # 2026-10-15 05:00 UTC — el límite real del "fin del día" del 14.
+        limite = self._order(created_at=datetime(2026, 10, 15, 4, 59, 59))
+        siguiente_dia = self._order(created_at=datetime(2026, 10, 15, 5, 0, 1))
         self.db.commit()
 
         ids = _ids(self.db, date_to=date(2026, 10, 14))
         self.assertIn(limite.id, ids)
         self.assertNotIn(siguiente_dia.id, ids)
+
+    def test_orden_tarde_en_la_noche_bogota_no_cae_en_hoy_por_medianoche_utc(self):
+        """Regresión del bug de producción: una orden de las 11:30 p.m. hora
+        Bogotá del día 14 se guarda como 2026-10-15 04:30 UTC — antes de la
+        medianoche Bogotá del 15 (05:00 UTC) — así que debe seguir contando
+        como "ayer" (14), no colarse en "hoy" (15) por tratarse la medianoche
+        UTC como si fuera la medianoche local (spec 120 / zona horaria)."""
+        anoche_bogota = self._order(created_at=datetime(2026, 10, 15, 4, 30, 0))
+        self.db.commit()
+
+        ids_ayer = _ids(self.db, date_from=date(2026, 10, 14), date_to=date(2026, 10, 14))
+        ids_hoy = _ids(self.db, date_from=date(2026, 10, 15), date_to=date(2026, 10, 15))
+        self.assertIn(anoche_bogota.id, ids_ayer)
+        self.assertNotIn(anoche_bogota.id, ids_hoy)
 
     def test_date_from_y_date_to_acotan_un_solo_dia(self):
         ayer = self._order(created_at=datetime(2026, 10, 14, 12, 0))
