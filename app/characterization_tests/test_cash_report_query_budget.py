@@ -38,6 +38,11 @@ from sqlalchemy import event
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.cash import active_orders, reports, router
 from app.api.v1.cash.schemas import ShiftClose
+
+# spec 121 (D-1/D-2, A-130/A-131): ya no existe el cierre "sin conteo". Estos tests
+# cierran con efectivo contado $0 (lista vacía), que casi siempre difiere del esperado
+# y exige observación; el usuario que cierra ya no se descarta (FR-029).
+_NOTA_CIERRE = "Cierre de prueba sin conteo (spec 121: D-1/D-2)"
 from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.sale import Sale, SaleItem
@@ -100,7 +105,7 @@ def _seed_shifts(db, n, kind, variants, *, offset=0, sales_per_shift=2):
     db.commit()
     if kind == "snapshot":
         for shift in shifts:
-            router.close_shift(shift.id, ShiftClose(), db)
+            router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
     return shifts
 
 
@@ -203,7 +208,7 @@ class TestPresupuestoDeUnTurno(unittest.TestCase):
         db.add_all(rows)
         db.commit()
         if kind == "snapshot":
-            router.close_shift(shift.id, ShiftClose(), db)
+            router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
         _, sql = _capturar(db, lambda: router.shift_sales_report(shift.id, db))
         return len(sql)
 
@@ -227,7 +232,7 @@ class TestEscrituraDelCierre(unittest.TestCase):
         db.commit()
         db.add_all([row for v in variants for row in _sale_pair(shift, v)])
         db.commit()
-        _, sql = _capturar(db, lambda: router.close_shift(shift.id, ShiftClose(), db))
+        _, sql = _capturar(db, lambda: router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double()))
         return len([s for s in sql if s.lstrip().upper().startswith("INSERT")])
 
     def test_el_cierre_ejecuta_el_mismo_numero_de_insert_con_1_y_con_80_productos(self):
@@ -248,7 +253,7 @@ class TestAgregacionEnLaBaseDeDatos(unittest.TestCase):
         db.commit()
         db.add_all([row for v in variants for row in _sale_pair(shift, v)])
         db.commit()
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         resultado, sql = _capturar(db, lambda: _periodo(db))
 
@@ -289,7 +294,7 @@ class TestContadoresDePedidosActivos(unittest.TestCase):
         with mock.patch.object(
             active_orders, "list_active_orders", wraps=active_orders.list_active_orders
         ) as espia:
-            router.close_shift(shift.id, ShiftClose(), db)
+            router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
         espia.assert_not_called()
 
     def test_con_pedidos_activos_close_shift_trae_la_lista_una_sola_vez(self):

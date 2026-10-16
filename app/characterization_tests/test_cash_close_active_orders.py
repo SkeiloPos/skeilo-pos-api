@@ -5,6 +5,11 @@ spec ninguna regla de `specs/006-turnos-caja-arqueo` (`RN-CASH-01` a
 `RN-CASH-18`) validaba esto (research.md D6); el resto de `close_shift`
 corre exactamente igual que antes cuando no hay pedidos activos.
 
+Adaptado por la spec 121 (D-1/D-2, A-130/A-131): ya no existe el cierre "sin
+conteo", así que los cierres que se COMPLETAN usan contado $0 con una observación
+(`_NOTA_CIERRE`) y reciben al usuario que cierra (FR-029); los que terminan en 409
+antes de persistir no cambian. La intención de cada prueba es la de siempre.
+
 Invoca `app/api/v1/cash/router.py::close_shift` directamente como función
 Python (mismo patrón que `test_cash_shift_sales_report.py`).
 
@@ -22,6 +27,11 @@ from fastapi.responses import JSONResponse
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.cash import router
 from app.api.v1.cash.schemas import ShiftClose
+
+# spec 121 (D-1/D-2, A-130/A-131): ya no existe el cierre "sin conteo". Estos tests
+# cierran con efectivo contado $0 (lista vacía), que casi siempre difiere del esperado
+# y exige observación; el usuario que cierra ya no se descarta (FR-029).
+_NOTA_CIERRE = "Cierre de prueba sin conteo (spec 121: D-1/D-2)"
 
 
 def _seed_active_order(db, *, order_type: str, status: str = "abierta", **kw):
@@ -91,7 +101,7 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         activos = router.list_active_orders_endpoint(db)
         self.assertEqual(activos, [])
 
-        cerrado = router.close_shift(shift.id, ShiftClose(), db)
+        cerrado = router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
         self.assertFalse(isinstance(cerrado, JSONResponse))
         self.assertEqual(cerrado.status, "closed")
 
@@ -106,7 +116,7 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         shift = fx.make_cash_shift(db, register=register)
         db.commit()
 
-        resultado = router.close_shift(shift.id, ShiftClose(), db)
+        resultado = router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         self.assertFalse(isinstance(resultado, JSONResponse))
         self.assertEqual(resultado.status, "closed")
@@ -129,7 +139,7 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         orden.status = "pagada"
         db.commit()
 
-        segundo = router.close_shift(shift.id, ShiftClose(), db)
+        segundo = router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
         self.assertFalse(isinstance(segundo, JSONResponse))
         self.assertEqual(segundo.status, "closed")
 
