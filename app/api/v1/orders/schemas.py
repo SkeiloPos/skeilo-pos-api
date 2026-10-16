@@ -317,6 +317,16 @@ class OrderResponse(BaseModel):
     # igual que `billing` -- `None` en el listado, nunca inventados (D15/RN-005).
     invoice_reference: str | None = None
     payment_method_name: str | None = None
+    # spec 121 (FR-001/FR-002): monto final de la orden, igual a `billing.total`
+    # pero disponible también donde `billing` sigue `null` a propósito (el
+    # listado paginado) -- no reabre el N+1 que D3 evita: se resuelve en bloque
+    # para toda la página (`service.order_totals`), nunca por fila. `None` en
+    # la rama SIN paginar de `GET /orders` (Terminal/Dashboard), que no cambia.
+    #
+    # OJO: no confundir con `total` del envoltorio `Page[OrderResponse]` (el
+    # conteo de resultados de la página) -- este es el monto en dinero de ESTA
+    # orden puntual, un campo totalmente distinto que vive un nivel más abajo.
+    total: Decimal | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

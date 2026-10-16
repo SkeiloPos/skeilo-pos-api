@@ -74,6 +74,9 @@ def _load_order(db: Session, order_id: UUID) -> CustomerOrder:
     # reales, resueltos solo aquí -- mismo motivo que `billing` (D3, no se
     # calcula por fila en el listado).
     order.invoice_reference, order.payment_method_name = service.invoice_and_payment_info(db, order.id)
+    # spec 121 (FR-001/FR-002): mismo total que `billing.total`, costo cero
+    # (ya está calculado) -- disponible también donde `billing` sigue `null`.
+    order.total = order.billing.total
     return order
 
 
@@ -694,6 +697,11 @@ def list_orders(
     effective_page = service.clamp_page(db, stmt, page or 1, effective_size)
     result = paginate(db, stmt, effective_page, effective_size)
     _decorate_orders(db, result["items"])
+    # spec 121 (FR-001/FR-002): `total` en bloque, solo en esta rama paginada
+    # -- la rama sin paginar (arriba, `service.list_orders`) no se toca.
+    totales = service.order_totals(db, result["items"])
+    for o in result["items"]:
+        o.total = totales.get(o.id)
     return result
 
 
