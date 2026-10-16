@@ -55,6 +55,7 @@ __all__ = [
     "make_cart", "make_cart_item",
     "make_promotion", "add_rule_to_promotion",
     "make_cash_register", "make_cash_shift", "make_payment_method",
+    "seed_denomination_catalog", "make_cash_count_denomination",
     "make_sale", "make_payment_attempt",
     "make_tenant_double", "make_user_double",
     "force_flush_integrity_error",
@@ -76,6 +77,8 @@ from app.models.product_variant import ProductVariant
 from app.models.promotion import Promotion, PromotionRule, PromotionVariant
 from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
+from app.models.cash_count_denomination import CashCountDenomination
+from app.models.denomination_catalog import seed_default_denominations
 from app.models.shift_sales_report import (
     ShiftSalesReport, ShiftSalesReportProduct, ShiftSalesReportCategory,
 )
@@ -122,6 +125,12 @@ _ORDERS_TABLE_NAMES = [
     "promotion_variants",
     "cash_registers",
     "cash_shifts",
+    # spec 121: desglose del conteo y catálogo de denominaciones del tenant.
+    "cash_count_denominations",
+    "denomination_catalog",
+    # spec 121 (D-2): `close_shift` ya siempre concilia (no hay cierre "sin
+    # conteo"), y `service.reconcile` lee los movimientos manuales del turno.
+    "cash_movements",
     "shift_sales_reports",
     "shift_sales_report_products",
     "shift_sales_report_categories",
@@ -428,6 +437,29 @@ def make_cash_shift(db: Session, register: CashRegister | None = None, **kw) -> 
     kw.setdefault("opened_at", datetime.now())
     kw.setdefault("status", "open")
     obj = CashShift(**kw)
+    db.add(obj)
+    db.flush()
+    return obj
+
+
+def seed_denomination_catalog(db: Session) -> None:
+    """spec 121: siembra el catálogo COP por defecto (11 filas) en la sesión de
+    prueba, con la misma función que usa `tenant_create`."""
+    seed_default_denominations(db)
+    db.flush()
+
+
+def make_cash_count_denomination(
+    db: Session, shift: CashShift, **kw
+) -> CashCountDenomination:
+    """spec 121: una línea de desglose ya persistida (snapshot). Por defecto
+    1 × $10.000 billete."""
+    kw.setdefault("id", _uid())
+    kw.setdefault("cash_shift_id", shift.id)
+    kw.setdefault("denomination", Decimal("10000"))
+    kw.setdefault("kind", "billete")
+    kw.setdefault("quantity", 1)
+    obj = CashCountDenomination(**kw)
     db.add(obj)
     db.flush()
     return obj
