@@ -614,5 +614,46 @@ class TestAislamiento(unittest.TestCase):
         self.assertNotIn(str(order_de_a.id), str(ajeno.exception.detail))
 
 
+class TestTotalDelDetalleIgualABilling(unittest.TestCase):
+    """spec 121, FR-001/FR-002, contracts/orders-total-field.md: `OrderResponse.total`
+    en el detalle siempre coincide con `billing.total`, en los tres estados de
+    facturación — es el mismo cálculo, solo expuesto también fuera de `billing`."""
+
+    def test_factura_propia_total_del_detalle_igual_a_billing_total(self):
+        db, order, _ = _seed(items=2)  # Σ line_total = 16.000
+        fx.make_sale(
+            db, order=order, table_session_id=order.table_session_id,
+            subtotal=Decimal("16000"), discount=Decimal("1000"),
+            delivery_fee=Decimal("0"), total=Decimal("15000"),
+        )
+        db.commit()
+
+        response = _get_order(db, order.id)
+
+        self.assertEqual(response.billing.state, "factura_propia")
+        self.assertEqual(response.total, Decimal("15000"))
+        self.assertEqual(response.total, response.billing.total)
+
+    def test_factura_agrupada_total_del_detalle_igual_a_billing_total(self):
+        db, order, _ = _seed(items=2)  # Σ line_total = 16.000
+        fx.make_sale(db, table_session_id=order.table_session_id, subtotal=Decimal("99999"), total=Decimal("99999"))
+        db.commit()
+
+        response = _get_order(db, order.id)
+
+        self.assertEqual(response.billing.state, "factura_agrupada")
+        self.assertEqual(response.total, Decimal("16000"))
+        self.assertEqual(response.total, response.billing.total)
+
+    def test_sin_factura_total_del_detalle_igual_a_billing_total(self):
+        db, order, _ = _seed(items=2)  # Σ line_total = 16.000, sin ninguna Sale
+
+        response = _get_order(db, order.id)
+
+        self.assertEqual(response.billing.state, "sin_factura")
+        self.assertEqual(response.total, Decimal("16000"))
+        self.assertEqual(response.total, response.billing.total)
+
+
 if __name__ == "__main__":
     unittest.main()
