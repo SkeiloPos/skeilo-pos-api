@@ -651,6 +651,7 @@ def list_orders(
     date_to: date | None = Query(None, description="Fecha final (inclusive) sobre created_at."),
     q: str | None = Query(None, description="Búsqueda por nombre de cliente o identificador de la orden."),
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     _: User = Depends(get_current_user),
 ):
     """Dos ramas (spec 079, contracts/orders-list-api.md):
@@ -682,6 +683,7 @@ def list_orders(
             f"status debe ser uno de {', '.join(service.ESTADOS_MOSTRADOS_ORDENES)}.",
         )
     stmt = service.list_orders_query(
+        tenant=tenant,
         status_mostrado=status_filter,
         order_type=order_type.value if order_type is not None else None,
         date_from=date_from,

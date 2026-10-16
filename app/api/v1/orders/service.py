@@ -15,7 +15,7 @@ camino — mismo criterio de "un único punto de descuento", solo que movido.
 El pedido anónimo por QR **no** entra por aquí: llega como `recibida` vía
 `/cart/submit` y lo descuenta el staff al confirmarlo."""
 import logging
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from math import ceil
 from uuid import UUID
@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
+from app.core.timezone import local_day_bounds_utc, resolve_timezone
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -403,6 +404,7 @@ ESTADOS_MOSTRADOS_ORDENES = ("recibida", "abierta", "bloqueada", "pagada", "canc
 
 
 def list_orders_query(
+    tenant,
     status_mostrado: str | None = None, order_type: str | None = None,
     date_from: date | None = None, date_to: date | None = None, q: str | None = None,
 ) -> Select:
@@ -428,10 +430,12 @@ def list_orders_query(
 
     `date_from`/`date_to`/`q` son aditivos (spec 120, research.md §1-§2):
     `date_from`/`date_to` acotan `created_at` (inclusive en ambos extremos,
-    `date_to` incluye todo su día); `q` hace *match* parcial insensible a
-    mayúsculas contra `customer_name` **o** contra el texto del `id` — el
-    mismo criterio que `orderDisplayCode()` usa en el frontend para el código
-    corto visible.
+    `date_to` incluye todo su día) interpretados como día calendario en la
+    zona horaria del tenant, no medianoche UTC (mismo criterio que
+    `list_sales_query`, spec 030 FR-004, contracts/date-range-filters.md); `q`
+    hace *match* parcial insensible a mayúsculas contra `customer_name` **o**
+    contra el texto del `id` — el mismo criterio que `orderDisplayCode()` usa
+    en el frontend para el código corto visible.
     """
     stmt = (
         select(CustomerOrder)
@@ -462,12 +466,14 @@ def list_orders_query(
     if order_type is not None:
         stmt = stmt.where(CustomerOrder.order_type == order_type)
 
-    if date_from is not None:
-        stmt = stmt.where(CustomerOrder.created_at >= datetime.combine(date_from, time.min))
-    if date_to is not None:
-        stmt = stmt.where(
-            CustomerOrder.created_at < datetime.combine(date_to + timedelta(days=1), time.min)
-        )
+    if date_from is not None or date_to is not None:
+        tz = resolve_timezone(tenant)
+        if date_from is not None:
+            start, _ = local_day_bounds_utc(date_from, tz)
+            stmt = stmt.where(CustomerOrder.created_at >= start)
+        if date_to is not None:
+            _, end = local_day_bounds_utc(date_to, tz)
+            stmt = stmt.where(CustomerOrder.created_at < end)
 
     q_normalizado = q.strip() if q else None
     if q_normalizado:
