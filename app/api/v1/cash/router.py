@@ -19,13 +19,13 @@ from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.cash_movement import CashMovement
 from app.models.cash_count_denomination import CashCountDenomination
-from app.api.v1.cash import service, reports, active_orders
+from app.api.v1.cash import service, reports, active_orders, denominations
 from app.api.v1.cash.schemas import (
     RegisterCreate, RegisterResponse,
     ShiftOpen, ShiftClose, ShiftResponse,
     CashMovementIn, CashMovementResponse,
     ReconciliationResponse, ShiftReportResponse,
-    DenominationIn,
+    CountLineOut, DenominationCatalogItem,
     ShiftSummaryResponse,
     ShiftSalesReportResponse, PeriodSalesReportResponse, ActiveOrderSummary,
 )
@@ -53,6 +53,15 @@ def create_register(
     db.commit()
     db.refresh(reg)
     return reg
+
+
+# ============================ Catálogo de denominaciones (spec 121) ============================
+@router.get("/denominations", response_model=list[DenominationCatalogItem],
+            summary="Catálogo de denominaciones del tenant")
+def list_denominations(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    # Solo lectura (FR-011, FR-012): no hay POST/PUT/PATCH/DELETE sobre el catálogo.
+    # No se toca `_MESERO_ALLOWED_ROUTES`: el Mesero tampoco cierra turnos (R7).
+    return denominations.list_catalog(db)
 
 
 # ============================ Turnos ============================
@@ -103,8 +112,18 @@ def current_shift(cash_register_id: UUID, db: Session = Depends(get_db), _: User
 
 
 @router.post("/shifts/{shift_id}/close", response_model=ShiftResponse, summary="Cerrar turno (arqueo)")
-def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    shift = get_or_404(db, CashShift, shift_id, "Shift not found")
+def close_shift(
+    shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    # spec 121 (D-1, A-130, FR-002): ningún valor monetario del cliente. Va PRIMERO,
+    # antes de leer el turno y antes del bloqueo por pedidos activos: la causa más
+    # probable es una pantalla desactualizada y ahí lo útil es decir "recarga".
+    denominations.reject_client_totals(body)
+
+    # spec 121 (FR-019, R5): `SELECT ... FOR UPDATE` serializa los cierres
+    # simultáneos del mismo turno (cierra la ventana de carrera A-17 en este punto).
+    shift = service.get_shift_for_update(db, shift_id)
     if shift.status == "closed":
         raise HTTPException(status.HTTP_409_CONFLICT, "El turno ya está cerrado")
 
@@ -135,32 +154,36 @@ def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
             },
         )
 
-    # counted = Σ(denominación*cantidad) si se envían denominaciones; si no, el valor enviado.
-    if body.denominations:
-        counted = sum((d.denomination * d.quantity for d in body.denominations), start=0)
-    else:
-        counted = body.counted_amount
+    # spec 121 (D-1/D-2, A-130/A-131): el efectivo contado lo calcula SOLO el
+    # servidor como Σ(denominación × cantidad) de las líneas validadas contra el
+    # catálogo del tenant. Ya no existe el cierre "sin conteo" (RN-CASH-09, A-20):
+    # sin líneas el contado es $0 y, si hay esperado, la diferencia exige observación.
+    lines = denominations.resolve_count_lines(db, body.denominations)
+    counted = denominations.total_of(lines)
 
     shift.counted_amount = counted
 
     # difference != 0 exige observación (close_note).
-    if counted is not None:
-        recon = service.reconcile(db, shift)
-        if recon["difference"] != 0 and not (body.close_note and body.close_note.strip()):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "El arqueo no cuadra: la observación (close_note) es obligatoria",
-            )
+    recon = service.reconcile(db, shift)
+    if recon["difference"] != 0 and not (body.close_note and body.close_note.strip()):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "El arqueo no cuadra: la observación (close_note) es obligatoria",
+        )
 
-    if body.denominations:
-        for d in body.denominations:
-            db.add(CashCountDenomination(
-                cash_shift_id=shift.id, denomination=d.denomination, quantity=d.quantity
-            ))
+    # spec 121 (D-3, D-4): una fila por línea con cantidad > 0, con su tipo (snapshot).
+    for line in lines:
+        db.add(CashCountDenomination(
+            cash_shift_id=shift.id, denomination=line.denomination,
+            kind=line.kind, quantity=line.quantity,
+        ))
 
     shift.close_note = body.close_note
     shift.status = "closed"
     shift.closed_at = utc_now()
+    # spec 121 (D-5, A-134, FR-029): quién confirma el conteo (puede no ser quien abrió).
+    shift.closed_by_user_id = user.id
+    shift.closed_by_user_name = user.name
 
     # spec 119 (FR-013, research.md D2): snapshot inmutable del reporte
     # operativo de ventas, calculado una última vez y persistido dentro de
@@ -169,7 +192,13 @@ def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
     report_data = reports.compute_shift_sales_report(db, shift)
     reports.persist_shift_snapshot(db, shift, report_data)
 
-    db.commit()
+    # spec 121 (FR-019): si aun así dos cierres chocaran contra el índice único
+    # (cash_shift_id, denomination), el perdedor recibe 409, nunca un 500.
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "El turno ya está cerrado")
     db.refresh(shift)
     return shift
 
@@ -290,7 +319,7 @@ def shift_report(shift_id: UUID, db: Session = Depends(get_db), _: User = Depend
         .where(CashMovement.cash_shift_id == shift.id)
         .order_by(CashMovement.occurred_at.desc())
     ).scalars().all()
-    denominations = db.execute(
+    count_lines = db.execute(
         select(CashCountDenomination)
         .where(CashCountDenomination.cash_shift_id == shift.id)
         .order_by(CashCountDenomination.denomination.desc())
@@ -299,9 +328,13 @@ def shift_report(shift_id: UUID, db: Session = Depends(get_db), _: User = Depend
         "shift": shift,
         "reconciliation": service.reconcile(db, shift),
         "movements": movements,
+        # spec 121 (FR-020/FR-021): con tipo y subtotal DERIVADO (no almacenado).
         "denominations": [
-            DenominationIn(denomination=d.denomination, quantity=d.quantity)
-            for d in denominations
+            CountLineOut(
+                denomination=d.denomination, kind=d.kind, quantity=d.quantity,
+                subtotal=d.denomination * d.quantity,
+            )
+            for d in count_lines
         ],
         "close_note": shift.close_note,
     }

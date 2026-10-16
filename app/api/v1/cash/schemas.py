@@ -34,12 +34,21 @@ class ShiftOpen(BaseModel):
 
 
 class DenominationIn(BaseModel):
+    # spec 121: `extra="allow"` (no "forbid") para que `reject_client_totals` pueda
+    # rechazar `subtotal`/`total` con un 422 en español. Con "forbid" FastAPI
+    # devolvería `detail` como lista y en inglés (research.md R4).
+    model_config = ConfigDict(extra="allow")
+
     denomination: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2)
     quantity: int = Field(..., ge=0)
 
 
 class ShiftClose(BaseModel):
-    counted_amount: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+    # spec 121 (D-1, A-130): el efectivo contado ya NO lo envía el cliente; el
+    # servidor lo calcula del desglose. Un `counted_amount` (u otro total) con valor
+    # llega aquí como campo extra y lo rechaza `denominations.reject_client_totals`.
+    model_config = ConfigDict(extra="allow")
+
     denominations: list[DenominationIn] = Field(default_factory=list)
     # Obligatoria si difference != 0 (se valida en el router).
     close_note: str | None = Field(None, max_length=500)
@@ -56,6 +65,18 @@ class ShiftResponse(BaseModel):
     counted_amount: Decimal | None = None
     status: str
     close_note: str | None = None
+    # spec 121 (D-5, FR-029): quien CERRÓ el turno (`user_*` es quien lo abrió).
+    # Nulos en turnos abiertos e históricos.
+    closed_by_user_id: UUID | None = None
+    closed_by_user_name: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Catálogo de denominaciones (spec 121) ----------
+class DenominationCatalogItem(BaseModel):
+    denomination: Decimal
+    kind: str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -119,11 +140,20 @@ class ReconciliationResponse(BaseModel):
 
 
 # ---------- Reporte de cierre ----------
+class CountLineOut(BaseModel):
+    """Línea del desglose en el reporte (spec 121). `subtotal` se DERIVA al leer
+    (`denomination × quantity`); no se almacena."""
+    denomination: Decimal
+    kind: str
+    quantity: int
+    subtotal: Decimal
+
+
 class ShiftReportResponse(BaseModel):
     shift: ShiftResponse
     reconciliation: ReconciliationResponse
     movements: list[CashMovementResponse]
-    denominations: list[DenominationIn]
+    denominations: list[CountLineOut]
     close_note: str | None = None
 
 

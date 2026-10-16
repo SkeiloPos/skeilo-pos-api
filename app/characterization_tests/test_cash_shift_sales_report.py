@@ -24,6 +24,11 @@ from uuid import uuid4
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.cash import reports, router
 from app.api.v1.cash.schemas import ShiftClose
+
+# spec 121 (D-1/D-2, A-130/A-131): ya no existe el cierre "sin conteo". Estos tests
+# cierran con efectivo contado $0 (lista vacía), que casi siempre difiere del esperado
+# y exige observación; el usuario que cierra ya no se descarta (FR-029).
+_NOTA_CIERRE = "Cierre de prueba sin conteo (spec 121: D-1/D-2)"
 from app.models.sale import Sale, SaleItem
 
 
@@ -31,8 +36,8 @@ def _seed_sale(db, shift, variant, *, total: Decimal, quantity: int = 1,
                description: str | None = None, sold_at: datetime | None = None) -> Sale:
     """Venta pagada del turno `shift` -- sin `Payment` (el arqueo de
     efectivo, `cash/service.py::reconcile`, no es el objeto de esta spec;
-    los tests de cierre usan `ShiftClose()` sin `counted_amount` para
-    saltárselo por completo)."""
+    desde la spec 121 (D-1/D-2, A-130/A-131) el cierre ya siempre concilia, así
+    que los tests cierran con contado $0 y una observación, `_NOTA_CIERRE`)."""
     sale = Sale(
         id=uuid4(), cash_shift_id=shift.id, user_id=uuid4(), user_name="Cajero de prueba",
         customer_name="Mostrador", subtotal=total, total=total, status="paid",
@@ -89,7 +94,7 @@ class TestComputeShiftSalesReport(unittest.TestCase):
         db.commit()
         _seed_sale(db, shift, variant, total=Decimal("100000"), quantity=10)
         db.commit()
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         tenant = fx.make_tenant_double()
         result = reports.compute_period_sales_report(
@@ -113,7 +118,7 @@ class TestSnapshotInmutable(unittest.TestCase):
         sale = _seed_sale(db, shift, variant, total=Decimal("200000"), quantity=10)
         db.commit()
 
-        closed = router.close_shift(shift.id, ShiftClose(), db)
+        closed = router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
         self.assertEqual(closed.status, "closed")
 
         antes = router.shift_sales_report(shift.id, db)
@@ -140,7 +145,7 @@ class TestAtribucionPorTurnoDeCobro(unittest.TestCase):
         register = fx.make_cash_register(db)
         shift_a = fx.make_cash_shift(db, register=register, opened_at=datetime(2026, 10, 12, 17, 0))
         db.commit()
-        router.close_shift(shift_a.id, ShiftClose(), db)
+        router.close_shift(shift_a.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         # Otra caja -- el punto de este test es la atribución por
         # `cash_shift_id`, no el filtro por caja (ver research.md D1).
@@ -177,7 +182,7 @@ class TestReportePorPeriodo(unittest.TestCase):
         _seed_sale(db, shift_12, variant, total=Decimal("150000"), quantity=15,
                    sold_at=datetime(2026, 10, 13, 1, 50))
         db.commit()
-        router.close_shift(shift_12.id, ShiftClose(), db)
+        router.close_shift(shift_12.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         # Otra caja -- el índice único parcial que permite reabrir una caja ya
         # usada (`idx_open_shift_per_register`, `postgresql_where=...`) no
@@ -287,7 +292,7 @@ class TestReportePorPeriodo(unittest.TestCase):
         _seed_sale(db, shift_a, compartido, total=Decimal("40000"), quantity=5, description="Cono Chocolate")
         _seed_sale(db, shift_a, exclusivo_a, total=Decimal("12000"), quantity=1, description="Malteada")
         db.commit()
-        router.close_shift(shift_a.id, ShiftClose(), db)
+        router.close_shift(shift_a.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         # Otra caja -- el índice único parcial que permitiría reabrir
         # `register` tras cerrarla no aplica bajo SQLite (ver notas arriba);
@@ -298,7 +303,7 @@ class TestReportePorPeriodo(unittest.TestCase):
         _seed_sale(db, shift_b, compartido, total=Decimal("24000"), quantity=3, description="Cono Chocolate")
         _seed_sale(db, shift_b, exclusivo_b, total=Decimal("9000"), quantity=3, description="Paleta")
         db.commit()
-        router.close_shift(shift_b.id, ShiftClose(), db)
+        router.close_shift(shift_b.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         tenant = fx.make_tenant_double()
         result = reports.compute_period_sales_report(db, tenant, "week", ref_date=date(2026, 10, 13))
@@ -367,7 +372,7 @@ class TestReporteEnVivoDeTurnoEnCurso(unittest.TestCase):
         db.commit()
 
         antes_de_cerrar = router.shift_sales_report(shift.id, db)
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
         despues_de_cerrar = router.shift_sales_report(shift.id, db)
 
         self.assertEqual(despues_de_cerrar["status"], "closed")
@@ -413,7 +418,7 @@ class TestTurnoSinVentas(unittest.TestCase):
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
         db.commit()
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         result = router.shift_sales_report(shift.id, db)
         self.assertEqual(result["total_sales"], Decimal("0"))

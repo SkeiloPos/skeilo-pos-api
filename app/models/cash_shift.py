@@ -40,6 +40,13 @@ class CashShift(UUIDPrimaryKeyMixin, Base):
     # Observación del arqueo; obligatoria si difference != 0 (se valida en el router).
     close_note: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
+    # spec 121 (D-5, FR-029): quién cerró el turno (puede diferir de quien lo
+    # abrió). Misma forma que `user_id`/`user_name`: referencia blanda a
+    # shared.users + snapshot del nombre. NULL en turnos abiertos e históricos
+    # (no se infiere del usuario de apertura).
+    closed_by_user_id: Mapped[Optional[UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    closed_by_user_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
     __table_args__ = (
         CheckConstraint("opening_amount > 0", name="ck_cash_shift_opening_positive"),
         CheckConstraint(

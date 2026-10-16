@@ -24,6 +24,7 @@ from .cash_register import CashRegister
 from .cash_shift import CashShift
 from .cash_movement import CashMovement
 from .cash_count_denomination import CashCountDenomination
+from .denomination_catalog import DenominationCatalog
 from .shift_sales_report import (
     ShiftSalesReport, ShiftSalesReportProduct, ShiftSalesReportCategory,
 )

@@ -352,8 +352,17 @@ def main():
         check("las ventas NO escriben cash_movements (se derivan de Payment)",
               len(movs), 0)
 
-        api("POST", f"/api/v1/cash/shifts/{shift['id']}/close",
-            json={"counted_amount": "30.00"})
+        # spec 121 (D-1, A-130): el cliente ya no envía `counted_amount`; el servidor
+        # calcula el contado desde el desglose del catálogo de denominaciones. El
+        # esperado ($30,00) no es componible con el catálogo COP (la menor
+        # denominación es $50), así que se cuenta 1 × $50 y la diferencia ≠ 0
+        # exige observación.
+        r = api("POST", f"/api/v1/cash/shifts/{shift['id']}/close",
+                json={"denominations": [{"denomination": 50, "quantity": 1}],
+                      "close_note": "E2E: el desglose del catálogo COP no compone $30"})
+        check("el cierre con desglose responde 200", r.status_code, 200)
+        check("el servidor calcula el efectivo contado desde el desglose",
+              Decimal(r.json()["counted_amount"]), Decimal("50.00"))
 
         print("TODO OK ✔")
         return 0
