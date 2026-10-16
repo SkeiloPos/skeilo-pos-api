@@ -73,6 +73,14 @@ class ShiftResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ---------- Catálogo de denominaciones (spec 121) ----------
+class DenominationCatalogItem(BaseModel):
+    denomination: Decimal
+    kind: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # ---------- Movimientos de efectivo ----------
 class CashMovementIn(BaseModel):
     kind: CashMovementKind
@@ -132,11 +140,20 @@ class ReconciliationResponse(BaseModel):
 
 
 # ---------- Reporte de cierre ----------
+class CountLineOut(BaseModel):
+    """Línea del desglose en el reporte (spec 121). `subtotal` se DERIVA al leer
+    (`denomination × quantity`); no se almacena."""
+    denomination: Decimal
+    kind: str
+    quantity: int
+    subtotal: Decimal
+
+
 class ShiftReportResponse(BaseModel):
     shift: ShiftResponse
     reconciliation: ReconciliationResponse
     movements: list[CashMovementResponse]
-    denominations: list[DenominationIn]
+    denominations: list[CountLineOut]
     close_note: str | None = None
 
 

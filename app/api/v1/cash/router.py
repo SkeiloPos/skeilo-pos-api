@@ -25,7 +25,7 @@ from app.api.v1.cash.schemas import (
     ShiftOpen, ShiftClose, ShiftResponse,
     CashMovementIn, CashMovementResponse,
     ReconciliationResponse, ShiftReportResponse,
-    DenominationIn,
+    CountLineOut, DenominationCatalogItem,
     ShiftSummaryResponse,
     ShiftSalesReportResponse, PeriodSalesReportResponse, ActiveOrderSummary,
 )
@@ -53,6 +53,15 @@ def create_register(
     db.commit()
     db.refresh(reg)
     return reg
+
+
+# ============================ Catálogo de denominaciones (spec 121) ============================
+@router.get("/denominations", response_model=list[DenominationCatalogItem],
+            summary="Catálogo de denominaciones del tenant")
+def list_denominations(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    # Solo lectura (FR-011, FR-012): no hay POST/PUT/PATCH/DELETE sobre el catálogo.
+    # No se toca `_MESERO_ALLOWED_ROUTES`: el Mesero tampoco cierra turnos (R7).
+    return denominations.list_catalog(db)
 
 
 # ============================ Turnos ============================
@@ -310,7 +319,7 @@ def shift_report(shift_id: UUID, db: Session = Depends(get_db), _: User = Depend
         .where(CashMovement.cash_shift_id == shift.id)
         .order_by(CashMovement.occurred_at.desc())
     ).scalars().all()
-    denominations = db.execute(
+    count_lines = db.execute(
         select(CashCountDenomination)
         .where(CashCountDenomination.cash_shift_id == shift.id)
         .order_by(CashCountDenomination.denomination.desc())
@@ -319,9 +328,13 @@ def shift_report(shift_id: UUID, db: Session = Depends(get_db), _: User = Depend
         "shift": shift,
         "reconciliation": service.reconcile(db, shift),
         "movements": movements,
+        # spec 121 (FR-020/FR-021): con tipo y subtotal DERIVADO (no almacenado).
         "denominations": [
-            DenominationIn(denomination=d.denomination, quantity=d.quantity)
-            for d in denominations
+            CountLineOut(
+                denomination=d.denomination, kind=d.kind, quantity=d.quantity,
+                subtotal=d.denomination * d.quantity,
+            )
+            for d in count_lines
         ],
         "close_note": shift.close_note,
     }
