@@ -343,6 +343,66 @@ def paid_order_ids(db: Session, order_ids: list[UUID]) -> set[UUID]:
     return set(rows)
 
 
+def order_totals(db: Session, orders: list[CustomerOrder]) -> dict[UUID, Decimal]:
+    """Versión en bloque de `build_billing_summary` (solo el campo `total`, no
+    el desglose completo) para la rama paginada de `GET /orders` (spec 121,
+    research.md §1) -- **no** reabre el N+1 que D3 evita: como máximo 2
+    consultas para todo el lote, nunca una por fila.
+
+    Misma fórmula de 3 ramas que `build_billing_summary` (`factura_propia` lee
+    `Sale.total`; `factura_agrupada`/`sin_factura` derivan de la suma de
+    líneas no anuladas ± descuento + domicilio, `max(total, 0)`), pero
+    resuelta así: (1) una consulta en bloque trae el `Sale.total` de las
+    órdenes con factura propia; (2) para las órdenes sin factura propia, se
+    resuelve en bloque si la SESIÓN de mesa de cada una ya tiene alguna venta
+    (`factura_agrupada`) -- la suma de líneas sale de `order.items`, ya
+    precargados por `list_orders_query` (`selectinload`), cero consultas
+    extra ahí."""
+    if not orders:
+        return {}
+
+    order_ids = [o.id for o in orders]
+    ventas_propias = dict(
+        db.execute(
+            select(Sale.customer_order_id, Sale.total).where(Sale.customer_order_id.in_(order_ids))
+        ).all()
+    )
+
+    sin_venta_propia = [o for o in orders if o.id not in ventas_propias]
+    session_ids = {o.table_session_id for o in sin_venta_propia if o.table_session_id is not None}
+    sesiones_con_venta: set[UUID] = set()
+    if session_ids:
+        rows = db.execute(
+            select(Sale.table_session_id).where(Sale.table_session_id.in_(session_ids))
+        ).scalars().all()
+        sesiones_con_venta = set(rows)
+
+    totales: dict[UUID, Decimal] = {}
+    for order in orders:
+        venta_total = ventas_propias.get(order.id)
+        if venta_total is not None:
+            totales[order.id] = _monto(venta_total)
+            continue
+
+        items = [it for it in (order.items or []) if it.estado_cocina != _ESTADO_ANULADO]
+        suma_de_lineas = sum((it.line_total for it in items), Decimal("0"))
+        delivery_fee = _monto(order.delivery_fee)
+
+        if (
+            order.status != "cancelada"
+            and order.table_session_id is not None
+            and order.table_session_id in sesiones_con_venta
+        ):
+            discount = _monto(order.discount)
+            total = suma_de_lineas - discount + delivery_fee
+        else:
+            total = suma_de_lineas + delivery_fee
+
+        totales[order.id] = max(total, Decimal("0"))
+
+    return totales
+
+
 def staff_user_names(db: Session, user_ids: list[UUID]) -> dict[UUID, str]:
     """Nombre para mostrar de cada usuario de staff (Cajero o Mesero, sin
     distinción de rol) que aparezca como `CustomerOrder.user_id` — spec 076,

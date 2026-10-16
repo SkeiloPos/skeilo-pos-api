@@ -264,6 +264,7 @@ class TestOrdersListModoPaginado(unittest.TestCase):
 
     def test_guardia_de_trabajo_acotado_numero_de_sentencias_constante(self):
         conteos = []
+        resultados = []
         for n in (5, 25):
             db = fx.new_session()
             ts = fx.make_table_session(db)
@@ -280,14 +281,21 @@ class TestOrdersListModoPaginado(unittest.TestCase):
 
             event.listen(bind, "before_cursor_execute", _rec)
             try:
-                _call_list_orders(db, page=1, size=20)
+                resultado = _call_list_orders(db, page=1, size=20)
             finally:
                 event.remove(bind, "before_cursor_execute", _rec)
             conteos.append(len(sentencias))
+            resultados.append(resultado)
 
         # 5 ítems vs 20 ítems en la página: el nº de sentencias no puede crecer
-        # con el tamaño del lote (un N+1 en `paid`/`staff_user_name` lo haría).
+        # con el tamaño del lote (un N+1 en `paid`/`staff_user_name`/`total` lo
+        # haría — spec 121 añade `service.order_totals` a este mismo punto, en
+        # bloque, sin reabrir esta guardia).
         self.assertEqual(conteos[0], conteos[1])
+        # spec 121 (FR-001/FR-002): `total` ya viaja poblado (no `None`) en esta
+        # misma rama paginada, sin que eso mueva el conteo de sentencias de arriba.
+        for resultado in resultados:
+            self.assertTrue(all(o.total is not None for o in resultado["items"]))
 
     def test_paid_se_asigna_solo_sobre_los_items_de_la_pagina(self):
         db = fx.new_session()
@@ -303,6 +311,45 @@ class TestOrdersListModoPaginado(unittest.TestCase):
         by_id = {o.id: o for o in result["items"]}
         self.assertTrue(by_id[pagada.id].paid)
         self.assertFalse(any(o.paid for oid, o in by_id.items() if oid != pagada.id))
+
+    def test_total_correcto_para_los_tres_estados_de_facturacion_en_el_listado(self):
+        # spec 121 (FR-001/FR-002, contracts/orders-total-field.md): el `total`
+        # del listado paginado debe coincidir con el mismo cálculo de 3 ramas
+        # que ya usa `billing.total` en el detalle (`test_orders_billing_summary`).
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        variant = fx.make_variant(db, price=PRECIO)
+        base = datetime(2026, 9, 1, 12, 0, 0)
+
+        propia = fx.make_customer_order(db, ts, created_at=base)
+        fx.make_order_item(db, propia, variant, unit_price=PRECIO, quantity=2)  # Σ=20.000
+        fx.make_sale(
+            db, order=propia, table_session_id=ts.id,
+            subtotal=Decimal("20000"), discount=Decimal("2000"),
+            delivery_fee=Decimal("0"), total=Decimal("18000"),
+        )
+
+        agrupada = fx.make_customer_order(db, ts, created_at=base + timedelta(minutes=1))
+        fx.make_order_item(db, agrupada, variant, unit_price=PRECIO, quantity=1)  # Σ=10.000
+        fx.make_sale(db, table_session_id=ts.id, subtotal=Decimal("99999"), total=Decimal("99999"))
+
+        sin_factura = fx.make_customer_order(db, ts, created_at=base + timedelta(minutes=2))
+        fx.make_order_item(db, sin_factura, variant, unit_price=PRECIO, quantity=3)  # Σ=30.000
+        db.commit()
+
+        result = _call_list_orders(db, page=1, size=20)
+
+        by_id = {o.id: o for o in result["items"]}
+        self.assertEqual(by_id[propia.id].total, Decimal("18000"))
+        self.assertEqual(by_id[agrupada.id].total, Decimal("10000"))
+        self.assertEqual(by_id[sin_factura.id].total, Decimal("30000"))
+        # `billing` sigue sin calcularse en el listado (D3/D15) -- solo cambia `total`.
+        # `getattr(..., None)`: el objeto ORM crudo no trae `billing` seteado
+        # (solo lo haría `_load_order`, que esta rama no llama) -- mismo criterio
+        # que `test_orders_billing_summary::test_d3_el_listado_devuelve_billing_en_null_en_todos_sus_items`.
+        self.assertIsNone(getattr(by_id[propia.id], "billing", None))
+        self.assertIsNone(getattr(by_id[agrupada.id], "billing", None))
+        self.assertIsNone(getattr(by_id[sin_factura.id], "billing", None))
 
 
 class TestTablesListPaginado(unittest.TestCase):
