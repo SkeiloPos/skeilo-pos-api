@@ -28,6 +28,11 @@ from sqlalchemy.exc import IntegrityError
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.cash import reports, router
 from app.api.v1.cash.schemas import ShiftClose
+
+# spec 121 (D-1/D-2, A-130/A-131): ya no existe el cierre "sin conteo". Estos tests
+# cierran con efectivo contado $0 (lista vacía), que casi siempre difiere del esperado
+# y exige observación; el usuario que cierra ya no se descarta (FR-029).
+_NOTA_CIERRE = "Cierre de prueba sin conteo (spec 121: D-1/D-2)"
 from app.models.sale import Sale, SaleItem
 from app.models.shift_sales_report import (
     ShiftSalesReport, ShiftSalesReportCategory, ShiftSalesReportProduct,
@@ -37,8 +42,9 @@ from app.models.shift_sales_report import (
 def _seed_sale(db, shift, variant, *, total: Decimal, quantity: int = 1,
                description: str | None = None, sold_at: datetime | None = None) -> Sale:
     """Venta pagada del turno `shift` -- sin `Payment` (el arqueo de efectivo no
-    es el objeto de esta spec; los tests de cierre usan `ShiftClose()` sin
-    `counted_amount` para saltárselo)."""
+    es el objeto de esta spec). Desde la spec 121 (D-1/D-2, A-130/A-131) el cierre
+    ya siempre concilia: los tests cierran con contado $0 y una observación
+    (`_NOTA_CIERRE`) en vez de saltarse el arqueo con `ShiftClose()` vacío."""
     sale = Sale(
         id=uuid4(), cash_shift_id=shift.id, user_id=uuid4(), user_name="Cajero de prueba",
         customer_name="Mostrador", subtotal=total, total=total, status="paid",
@@ -74,7 +80,7 @@ class TestSnapshotEnFilas(unittest.TestCase):
         db.commit()
 
         expected = reports.compute_shift_sales_report(db, shift)
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         productos = db.execute(
             select(ShiftSalesReportProduct).where(ShiftSalesReportProduct.cash_shift_id == shift.id)
@@ -111,7 +117,7 @@ class TestSnapshotEnFilas(unittest.TestCase):
         _seed_sale(db, shift, variant, total=Decimal("20000"), quantity=2)
         db.commit()
 
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         cabecera = db.execute(
             select(ShiftSalesReport).where(ShiftSalesReport.cash_shift_id == shift.id)
@@ -127,7 +133,7 @@ class TestSnapshotEnFilas(unittest.TestCase):
         shift = fx.make_cash_shift(db)
         db.commit()
 
-        router.close_shift(shift.id, ShiftClose(), db)
+        router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
         cabecera = db.execute(
             select(ShiftSalesReport).where(ShiftSalesReport.cash_shift_id == shift.id)
@@ -181,7 +187,7 @@ def _turno_d8(db, **kw):
 
 
 def _cerrar(db, shift):
-    router.close_shift(shift.id, ShiftClose(), db)
+    router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())
 
 
 def _filas(rows):

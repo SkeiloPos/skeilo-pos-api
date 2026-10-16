@@ -8,6 +8,7 @@ Sale → Payment → PaymentMethod filtrando por `Sale.cash_shift_id` y
 from decimal import Decimal
 from uuid import UUID
 
+from fastapi import HTTPException, status
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,19 @@ def get_open_shift(db: Session, cash_register_id: UUID) -> CashShift | None:
             CashShift.status == "open",
         )
     ).scalar_one_or_none()
+
+
+def get_shift_for_update(db: Session, shift_id: UUID) -> CashShift:
+    """spec 121 (FR-019, R5, cierra A-17 para `close_shift`): lee el turno con
+    `SELECT ... FOR UPDATE`. Dos cierres simultáneos del mismo turno se serializan:
+    el segundo espera, relee la fila ya `closed` y recibe 409. Mismo patrón que
+    `resolve_dine_in_table_order`. SQLite (suite de pruebas) ignora el bloqueo."""
+    shift = db.execute(
+        select(CashShift).where(CashShift.id == shift_id).with_for_update()
+    ).scalar_one_or_none()
+    if shift is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Shift not found")
+    return shift
 
 
 def resolve_dine_in_table_order(db: Session) -> tuple[UUID | None, int | None]:

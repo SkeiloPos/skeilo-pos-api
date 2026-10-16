@@ -21,6 +21,7 @@ from app.core.models import Tenant, User, convention, Base
 import app.models  # registra modelos tenant en Base.metadata
 from app.core.timezone import utc_now
 from app.models.plan import Plan
+from app.models.denomination_catalog import seed_default_denominations
 from psycopg.errors import UniqueViolation
 from sqlalchemy.exc import IntegrityError
 
@@ -98,6 +99,12 @@ def tenant_create(
 
             db.execute(sch.CreateSchema(schema))
             get_tenant_specific_metadata().create_all(bind=db.connection())
+
+            # spec 121 (R2, FR-012): el tenant nace con el catálogo de
+            # denominaciones por defecto, dentro de la misma transacción. Sin
+            # esto no podría cerrar ningún turno desde la pantalla (FR-013). La
+            # sesión ya traduce `tenant -> schema`; no se abre una nueva.
+            seed_default_denominations(db)
 
             admin_role = db.execute(
                 text("SELECT id FROM shared.roles WHERE name = 'ADMIN' LIMIT 1")
