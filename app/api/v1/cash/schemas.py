@@ -192,6 +192,23 @@ class PeriodSalesReportResponse(BaseModel):
     categories: list[CategoryBreakdownRow]
 
 
+# ---------- Ingresos por método de pago (spec 122, FR-007) ----------
+class PaymentMethodBucketRow(BaseModel):
+    """Una fila por `(bucket, método de pago)` con pagos > 0 -- sin ceros
+    rellenados (contracts/payment-methods-report-api.md)."""
+    bucket_start: UtcDatetime
+    payment_method_id: UUID
+    payment_method_name: str
+    amount: Decimal
+
+
+class PaymentMethodsReportResponse(BaseModel):
+    """`bucket_unit` es una sola unidad para TODA la respuesta -- no se repite
+    por fila (data-model.md §3, corrección post-`/speckit-analyze`)."""
+    bucket_unit: str  # "hour" | "day" | "week"
+    rows: list[PaymentMethodBucketRow]
+
+
 # ---------- Pedidos activos / bloqueo de cierre (spec 119) ----------
 class ActiveOrderSummary(BaseModel):
     id: UUID

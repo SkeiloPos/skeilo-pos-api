@@ -21,10 +21,11 @@ estándar que corre igual en PostgreSQL y en SQLite (la suite): ninguna función
 exclusiva de PostgreSQL (T068 lo comprueba con una búsqueda de texto).
 """
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone as dt_timezone
 from decimal import Decimal
 from typing import Sequence
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import case, func, insert, select, union_all
 from sqlalchemy.orm import Session
@@ -33,6 +34,7 @@ from sqlalchemy.sql import ColumnElement, Select
 from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now
 from app.models.cash_shift import CashShift
 from app.models.category import Category
+from app.models.payment import Payment, PaymentMethod
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.models.sale import Sale, SaleItem
@@ -450,3 +452,92 @@ def compute_period_sales_report(
         "cash_register_id": cash_register_id,
         **agg,
     }
+
+
+# ---------- Ingresos por método de pago (spec 122, FR-007) ----------
+#
+# Bucket (hora/día/semana) resuelto en PYTHON, no en SQL: `cash/reports.py`
+# exige SQL sin funciones exclusivas de PostgreSQL (docstring del módulo), y
+# `date_trunc('hour'|'week', ...)` no tiene equivalente portable sencillo (a
+# diferencia de `func.date(...)`, que sí compila igual en SQLite y Postgres,
+# ya usado por `reports/service.py`). Una sola consulta trae los pagos ya
+# unidos a su turno y a su método; el conteo de filas es el de pagos del
+# período -- no hay N+1 ni una consulta por bucket.
+
+#: Período-resuelto → unidad del bucket (research.md §6).
+_BUCKET_UNIT_BY_PERIOD = {
+    "shift": "hour", "current_shift": "hour", "day": "hour",
+    "week": "day", "month": "week", "range": "day",
+}
+
+
+def _bucket_start(local_dt: datetime, unit: str) -> datetime:
+    """Inicio del intervalo que contiene `local_dt` (ya en la zona del
+    tenant), en esa misma zona -- el llamador lo vuelve a UTC antes de
+    publicarlo."""
+    if unit == "hour":
+        return local_dt.replace(minute=0, second=0, microsecond=0)
+    if unit == "week":
+        monday = local_dt.date() - timedelta(days=local_dt.weekday())
+        return datetime.combine(monday, time.min, tzinfo=local_dt.tzinfo)
+    return datetime.combine(local_dt.date(), time.min, tzinfo=local_dt.tzinfo)  # "day"
+
+
+def _payment_methods_for_selector(
+    db: Session, selector: ShiftSelector, tz: ZoneInfo, bucket_unit: str,
+) -> list[dict]:
+    """Agrega `Payment.amount` por `(bucket, método)` sobre los pagos de los
+    turnos que cumplen `selector` -- mismo selector que `aggregate_shifts`,
+    reutilizado tal cual (no se modifica). `Payment.amount` (no `Sale.total`):
+    un pago dividido entre métodos se atribuye a cada uno por separado."""
+    rows = db.execute(
+        select(Payment.paid_at, Payment.payment_method_id, PaymentMethod.name, Payment.amount)
+        .select_from(Payment)
+        .join(Sale, Sale.id == Payment.sale_id)
+        .join(CashShift, CashShift.id == Sale.cash_shift_id)
+        .join(PaymentMethod, PaymentMethod.id == Payment.payment_method_id)
+        .where(*selector)
+    ).all()
+
+    sums: dict[tuple[datetime, UUID], Decimal] = {}
+    names: dict[UUID, str] = {}
+    for paid_at, method_id, method_name, amount in rows:
+        local = paid_at.replace(tzinfo=dt_timezone.utc).astimezone(tz)
+        bucket_local = _bucket_start(local, bucket_unit)
+        bucket_utc = bucket_local.astimezone(dt_timezone.utc).replace(tzinfo=None)
+        key = (bucket_utc, method_id)
+        sums[key] = sums.get(key, Decimal("0")) + amount
+        names[method_id] = method_name
+
+    return [
+        {
+            "bucket_start": bucket_utc, "payment_method_id": method_id,
+            "payment_method_name": names[method_id], "amount": amount,
+        }
+        for (bucket_utc, method_id), amount in sorted(sums.items())
+    ]
+
+
+def payment_methods_report(
+    db: Session, tenant, period: str, *,
+    ref_date: date | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    shift_id: UUID | None = None,
+    cash_register_id: UUID | None = None,
+) -> dict:
+    """Ingresos por método de pago, con la unidad de bucket que corresponda al
+    período resuelto (FR-007) -- reutiliza los mismos selectores de turno que
+    `aggregate_shifts`/`compute_period_sales_report`, sin modificarlos."""
+    bucket_unit = _BUCKET_UNIT_BY_PERIOD[period]
+    if period == "shift":
+        selector = shift_selector(shift_id)
+    elif period == "current_shift":
+        selector = open_shifts_selector(cash_register_id)
+    else:
+        bounds_from, bounds_to = resolve_period_bounds(tenant, period, ref_date, date_from, date_to)
+        selector = period_selector(tenant, bounds_from, bounds_to, cash_register_id)
+
+    tz = resolve_timezone(tenant)
+    rows = _payment_methods_for_selector(db, selector, tz, bucket_unit)
+    return {"bucket_unit": bucket_unit, "rows": rows}

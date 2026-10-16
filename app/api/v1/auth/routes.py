@@ -217,6 +217,7 @@ async def login(body: LoginRequest, req: Request):
 
             user_data = {
                 "email": user.email,
+                "name": user.name,
                 "uid": str(user.id),
                 "tenant_id": user.tenant_id,
                 "is_super_admin": user.tenant_id is None,
@@ -440,6 +441,7 @@ async def get_new_access_token(
 
     user_data = {
         "email": user.email,
+        "name": user.name,
         "uid": str(user.id),
         "tenant_id": user.tenant_id,
         "is_super_admin": user.tenant_id is None,

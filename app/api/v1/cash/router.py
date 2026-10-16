@@ -28,6 +28,7 @@ from app.api.v1.cash.schemas import (
     DenominationIn,
     ShiftSummaryResponse,
     ShiftSalesReportResponse, PeriodSalesReportResponse, ActiveOrderSummary,
+    PaymentMethodsReportResponse,
 )
 
 router = APIRouter(prefix="/cash", tags=["cash"])
@@ -264,6 +265,52 @@ def period_sales_report(
     return reports.compute_period_sales_report(
         db, tenant, period, ref_date=date, date_from=date_from, date_to=date_to,
         cash_register_id=cash_register_id,
+    )
+
+
+@router.get("/reports/payment-methods", response_model=PaymentMethodsReportResponse,
+            summary="Ingresos por método de pago, con granularidad adaptativa al período")
+def payment_methods_report(
+    period: Literal["shift", "current_shift", "day", "week", "month", "range"] = Query(...),
+    shift_id: UUID | None = Query(None, description="Obligatorio si period='shift'."),
+    date: date | None = Query(None, description="Día de referencia (day/week/month)."),
+    date_from: date | None = Query(None, description="Obligatorio si period='range'."),
+    date_to: date | None = Query(None, description="Obligatorio si period='range'."),
+    cash_register_id: UUID | None = Query(None),
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    _: User = Depends(require_tenant_admin),
+):
+    """Spec 122, FR-007/contracts/payment-methods-report-api.md: mismos 6
+    tipos de período ya usados por el reporte operativo (`shift` cubre lo que
+    `/shifts/{id}/sales-report` resuelve para un turno puntual; los demás,
+    lo que `/reports/current` y `/reports/period` ya resuelven), unificados
+    aquí en un solo endpoint porque la forma de respuesta (filas bucketed) es
+    la misma sin importar el tipo de período."""
+    if period == "shift":
+        if shift_id is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "shift_id es obligatorio cuando period='shift'",
+            )
+        get_or_404(db, CashShift, shift_id, "Shift not found")
+    if period == "range":
+        if date_from is None or date_to is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "date_from y date_to son obligatorios cuando period='range'",
+            )
+        if date_from > date_to:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "date_from no puede ser posterior a date_to",
+            )
+    if cash_register_id is not None:
+        get_or_404(db, CashRegister, cash_register_id, "Register not found")
+
+    return reports.payment_methods_report(
+        db, tenant, period, ref_date=date, date_from=date_from, date_to=date_to,
+        shift_id=shift_id, cash_register_id=cash_register_id,
     )
 
 
