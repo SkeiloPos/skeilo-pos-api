@@ -1,6 +1,9 @@
+from datetime import date
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -16,7 +19,7 @@ from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.cash_movement import CashMovement
 from app.models.cash_count_denomination import CashCountDenomination
-from app.api.v1.cash import service
+from app.api.v1.cash import service, reports, active_orders
 from app.api.v1.cash.schemas import (
     RegisterCreate, RegisterResponse,
     ShiftOpen, ShiftClose, ShiftResponse,
@@ -24,6 +27,7 @@ from app.api.v1.cash.schemas import (
     ReconciliationResponse, ShiftReportResponse,
     DenominationIn,
     ShiftSummaryResponse,
+    ShiftSalesReportResponse, PeriodSalesReportResponse, ActiveOrderSummary,
 )
 
 router = APIRouter(prefix="/cash", tags=["cash"])
@@ -104,6 +108,33 @@ def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
     if shift.status == "closed":
         raise HTTPException(status.HTTP_409_CONFLICT, "El turno ya está cerrado")
 
+    # spec 119 (FR-007/FR-008/FR-009, A-129): no se permite cerrar ningún
+    # turno mientras existan pedidos activos sin cobrar en TODO el tenant
+    # (research.md D1) -- se re-evalúa contra el estado vigente en cada
+    # intento, sin caché de un intento anterior (contracts/active-orders-
+    # close-gate-api.md). El cuerpo del 409 es plano (sin envolver en otro
+    # "detail") para que el frontend lea `active_orders` directo.
+    # US6 (FR-023, research.md D12): se cuenta primero con un COUNT y la lista
+    # solo se trae si hay algo que mostrar. Si entre el conteo y la lista el
+    # pedido se resolvió (lista vacía), el cierre continúa con el estado vigente.
+    active = (
+        active_orders.list_active_orders(db) if active_orders.count_active_orders(db) else []
+    )
+    if active:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": (
+                    f"No se puede cerrar el turno: hay {len(active)} "
+                    "pedidos activos sin cobrar."
+                ),
+                "active_orders": [
+                    ActiveOrderSummary.model_validate(o).model_dump(mode="json")
+                    for o in active
+                ],
+            },
+        )
+
     # counted = Σ(denominación*cantidad) si se envían denominaciones; si no, el valor enviado.
     if body.denominations:
         counted = sum((d.denomination * d.quantity for d in body.denominations), start=0)
@@ -130,9 +161,119 @@ def close_shift(shift_id: UUID, body: ShiftClose, db: Session = Depends(get_db),
     shift.close_note = body.close_note
     shift.status = "closed"
     shift.closed_at = utc_now()
+
+    # spec 119 (FR-013, research.md D2): snapshot inmutable del reporte
+    # operativo de ventas, calculado una última vez y persistido dentro de
+    # la MISMA transacción de cierre -- si el cómputo fallara, todo el
+    # cierre revierte (nunca un turno 'closed' sin su reporte).
+    report_data = reports.compute_shift_sales_report(db, shift)
+    reports.persist_shift_snapshot(db, shift, report_data)
+
     db.commit()
     db.refresh(shift)
     return shift
+
+
+# ============================ Reporte operativo por turno (spec 119) ============================
+@router.get("/shifts/{shift_id}/sales-report", response_model=ShiftSalesReportResponse,
+            summary="Reporte operativo de ventas de un turno puntual")
+def shift_sales_report(
+    shift_id: UUID, db: Session = Depends(get_db), _: User = Depends(require_tenant_admin),
+):
+    shift = get_or_404(db, CashShift, shift_id, "Shift not found")
+    agg = reports.aggregate_shifts(db, reports.shift_selector(shift.id))
+    register_name = db.execute(
+        select(CashRegister.name).where(CashRegister.id == shift.cash_register_id)
+    ).scalar_one_or_none() or "—"
+
+    # Solo relevante cuando el turno sigue abierto (FR-012) -- tenant-wide,
+    # igual que el propio bloqueo de cierre (research.md D1).
+    active_orders_count = (
+        active_orders.count_active_orders(db) if shift.status == "open" else None
+    )
+
+    return {
+        "shift_id": shift.id,
+        "cash_register_id": shift.cash_register_id,
+        "cash_register_name": register_name,
+        "status": shift.status,
+        "is_live": agg["is_live"],
+        "opened_at": shift.opened_at,
+        "closed_at": shift.closed_at,
+        "total_sales": agg["total_sales"],
+        "order_count": agg["order_count"],
+        "avg_ticket": agg["avg_ticket"],
+        "top_products": agg["top_products"],
+        "categories": agg["categories"],
+        "active_orders_count": active_orders_count,
+    }
+
+
+@router.get("/reports/current", response_model=PeriodSalesReportResponse,
+            summary="Reporte agregado del/de los turno(s) actualmente abiertos")
+def current_shift_report(
+    cash_register_id: UUID | None = Query(None),
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    _: User = Depends(require_tenant_admin),
+):
+    if cash_register_id is not None:
+        get_or_404(db, CashRegister, cash_register_id, "Register not found")
+        if service.get_open_shift(db, cash_register_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "La caja no tiene un turno abierto")
+    # Sin filtro de caja: agrega TODOS los turnos abiertos del tenant, incluido el
+    # caso de cero turnos abiertos (200 con totales en cero, no 404 --
+    # contracts/shift-sales-report-api.md).
+    agg = reports.aggregate_shifts(db, reports.open_shifts_selector(cash_register_id))
+    today = reports.business_today(tenant)
+    return {
+        "period": "current_shift",
+        "date_from": today,
+        "date_to": today,
+        "cash_register_id": cash_register_id,
+        **agg,
+    }
+
+
+@router.get("/reports/period", response_model=PeriodSalesReportResponse,
+            summary="Reporte agregado por día, semana, mes o rango personalizado")
+def period_sales_report(
+    period: Literal["day", "week", "month", "range"] = Query(...),
+    date: date | None = Query(None, description="Día de referencia (day/week/month)."),
+    date_from: date | None = Query(None, description="Obligatorio si period='range'."),
+    date_to: date | None = Query(None, description="Obligatorio si period='range'."),
+    cash_register_id: UUID | None = Query(None),
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    _: User = Depends(require_tenant_admin),
+):
+    if period == "range":
+        if date_from is None or date_to is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "date_from y date_to son obligatorios cuando period='range'",
+            )
+        if date_from > date_to:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "date_from no puede ser posterior a date_to",
+            )
+    if cash_register_id is not None:
+        get_or_404(db, CashRegister, cash_register_id, "Register not found")
+
+    return reports.compute_period_sales_report(
+        db, tenant, period, ref_date=date, date_from=date_from, date_to=date_to,
+        cash_register_id=cash_register_id,
+    )
+
+
+# ============================ Pedidos activos / bloqueo de cierre (spec 119) ============================
+@router.get("/active-orders", response_model=list[ActiveOrderSummary],
+            summary="Pedidos activos que bloquean cualquier intento de cierre")
+def list_active_orders_endpoint(
+    db: Session = Depends(get_db), _: User = Depends(get_current_user),
+):
+    return active_orders.list_active_orders(db)
 
 
 @router.get("/shifts/{shift_id}/reconciliation", response_model=ReconciliationResponse, summary="Arqueo del turno")
