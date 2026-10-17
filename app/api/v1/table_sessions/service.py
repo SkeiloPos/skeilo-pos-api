@@ -26,6 +26,7 @@ from app.models.sale import Sale
 from app.models.session_participant import SessionParticipant
 from app.models.table_session import TableSession
 from app.api.v1.orders import checkout
+from app.api.v1.orders.service import order_pending_balance
 from app.api.v1.sales.builder import build_sale, ensure_open_shift
 from app.api.v1.table_sessions.schemas import (
     BillingMode, CloseSessionIn, CloseSessionResponse,
@@ -83,6 +84,21 @@ def has_billable_orders(db: Session, table_session_id: UUID) -> bool:
             CustomerOrder.id.notin_(ya_facturados),
         ).limit(1)
     ).scalar() is not None
+
+
+def has_pending_balance(db: Session, table_session_id: UUID) -> bool:
+    """¿Alguna orden de la sesión (no cancelada) tiene saldo pendiente por
+    adiciones agregadas después de facturar (spec 123)? Hermana de
+    `has_billable_orders` — a propósito NO reusa ese chequeo: un pedido con
+    saldo pendiente es justo uno de los que `has_billable_orders` ya excluye
+    (tiene una `Sale`), así que necesita su propia consulta."""
+    order_ids = db.execute(
+        select(CustomerOrder.id).where(
+            CustomerOrder.table_session_id == table_session_id,
+            CustomerOrder.status != "cancelada",
+        )
+    ).scalars().all()
+    return any(order_pending_balance(db, oid) > 0 for oid in order_ids)
 
 
 def try_release_if_empty(db: Session, table_session_id: UUID) -> list[TableSession]:
@@ -237,12 +253,28 @@ def compute_bill(db: Session, table_session_id: UUID) -> SessionBillResponse:
             discount=promo_discount,
         ))
 
+    # spec 123 (contracts/pending-balance-exposure.md): a propósito, **no**
+    # se reusa `orders` (viene de `_billable_orders`, que excluye cualquier
+    # pedido con `Sale` ya emitida) -- un pedido con saldo pendiente por
+    # adiciones es justo uno de esos pedidos ya facturados. Se recorren todas
+    # las órdenes no canceladas de la sesión, sin ese filtro.
+    pending_order_ids = db.execute(
+        select(CustomerOrder.id).where(
+            CustomerOrder.table_session_id == ts.id,
+            CustomerOrder.status != "cancelada",
+        )
+    ).scalars().all()
+    pending_balance = sum(
+        (order_pending_balance(db, oid) for oid in pending_order_ids), Decimal("0")
+    )
+
     return SessionBillResponse(
         table_session_id=ts.id,
         dining_table_id=ts.dining_table_id,
         total=total,
         order_ids=[o.id for o in orders],
         split=split,
+        pending_balance=pending_balance,
     )
 
 
@@ -411,6 +443,11 @@ def release_paid_session(
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "Todavía hay algo por cobrar en esta mesa; cóbralo antes de liberarla.",
+        )
+
+    if has_pending_balance(db, ts.id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Hay un saldo pendiente por cobrar",
         )
 
     orders = db.execute(

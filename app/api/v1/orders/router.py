@@ -21,13 +21,16 @@ from app.models.dining_table import DiningTable
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem
 from app.models.order_payment_attempt import OrderPaymentAttempt
+from app.api.v1.orders import additions
 from app.api.v1.orders import service
 from app.api.v1.orders.consolidation import consolidate_table, add_item_to_order
 from app.api.v1.orders import kitchen
 from app.api.v1.orders import checkout
 from app.api.v1.orders import tables_advanced
 from app.api.v1.table_sessions.service import notify_sessions_closed
-from app.api.v1.sales.schemas import SaleResponse
+from app.api.v1.catalog.schemas import OptionSelectionIn, UpdateAdditionQuantityIn
+from app.api.v1.sales import complementary
+from app.api.v1.sales.schemas import ComplementaryPaymentIn, SaleResponse
 from app.api.v1.orders.schemas import (
     TableCreate, TableUpdate, TableResponse, TableQrTokenResponse,
     OrderCreate, OrderResponse, OrderItemIn, OrderType,
@@ -59,6 +62,10 @@ def _load_order(db: Session, order_id: UUID) -> CustomerOrder:
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
     order.paid = service.order_has_sale(db, order.id)  # spec 029, D2
+    # spec 123: saldo pendiente generado por adiciones agregadas después de que
+    # el pedido ya tenía una `Sale` emitida, aún no cubiertas por un pago
+    # complementario. Computado (no una columna), 0 cuando no aplica.
+    order.pending_balance = service.order_pending_balance(db, order.id)
     if order.user_id is not None:
         # spec 076, Historia 4
         names = service.staff_user_names(db, [order.user_id])
@@ -417,6 +424,92 @@ def void_item(
     return _load_order(db, order.id)
 
 
+@router.post(
+    "/items/{item_id}/additions",
+    response_model=OrderResponse,
+    summary="Agregar una adición a una línea de pedido ya creada (spec 123)",
+)
+def add_addition(
+    item_id: UUID, body: OptionSelectionIn,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    order = additions.add_addition_to_order_item(db, item_id, body, user, tenant)
+    item = next((i for i in order.items if i.id == item_id), None)
+    option_name = None
+    if item is not None:
+        fila = next((o for o in item.options if o.option_id == body.option_id), None)
+        option_name = fila.name if fila is not None else None
+    events.item_addon_added(
+        tenant.id,
+        order_id=order.id,
+        table_session_id=order.table_session_id,
+        item_id=item_id,
+        option_name=option_name,
+        quantity=body.quantity,
+    )
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+    return _load_order(db, order.id)
+
+
+@router.patch(
+    "/items/{item_id}/additions/{option_id}",
+    response_model=OrderResponse,
+    summary="Editar la cantidad de una adición que ya está en la línea (spec 123)",
+)
+def update_addition(
+    item_id: UUID, option_id: UUID, body: UpdateAdditionQuantityIn,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    order = additions.update_addition_quantity(db, item_id, option_id, body, user, tenant)
+    item = next((i for i in order.items if i.id == item_id), None)
+    option_name = None
+    new_quantity = body.quantity
+    if item is not None:
+        fila = next((o for o in item.options if o.option_id == option_id), None)
+        if fila is not None:
+            option_name = fila.name
+            new_quantity = fila.quantity
+    # Mismo evento que agregar una adición -- el frontend solo lo usa como señal de
+    # recarga (`pos-terminal.store.ts`), no lee el payload.
+    events.item_addon_added(
+        tenant.id,
+        order_id=order.id,
+        table_session_id=order.table_session_id,
+        item_id=item_id,
+        option_name=option_name,
+        quantity=new_quantity,
+    )
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+    return _load_order(db, order.id)
+
+
+@router.delete(
+    "/items/{item_id}/additions/{option_id}",
+    response_model=OrderResponse,
+    summary="Quitar del todo una adición que ya está en la línea (spec 123)",
+)
+def remove_addition(
+    item_id: UUID, option_id: UUID,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    order = additions.remove_addition(db, item_id, option_id, user, tenant)
+    # Mismo evento que agregar/editar una adición -- el frontend solo lo usa como señal
+    # de recarga (`pos-terminal.store.ts`), no lee el payload.
+    events.item_addon_added(
+        tenant.id,
+        order_id=order.id,
+        table_session_id=order.table_session_id,
+        item_id=item_id,
+        option_name=None,
+        quantity=0,
+    )
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+    return _load_order(db, order.id)
+
+
 # ============================ Cobro / cierre (Fase 7) ============================
 @router.get(
     "/tables/{table_id}/bill",
@@ -472,6 +565,31 @@ def block_order(
 ):
     order = checkout.block_order(db, order_id, body)
     return _load_order(db, order.id)
+
+
+@router.post(
+    "/{order_id}/complementary-payment",
+    response_model=SaleResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Cobrar el saldo pendiente de un pedido como pago complementario (spec 123)",
+)
+def pay_complementary_balance(
+    order_id: UUID, body: ComplementaryPaymentIn,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    sale = complementary.settle_pending_balance(db, order_id, body, user, tenant)
+    order = db.get(CustomerOrder, order_id)
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id if order else None)
+    events.payment_completed(
+        tenant.id,
+        sale_id=sale.id,
+        table_session_id=order.table_session_id if order else None,
+        total=sale.total,
+        customer_name=order.customer_name if order else None,
+        billing_mode="counter",
+    )
+    return sale
 
 
 @router.post(

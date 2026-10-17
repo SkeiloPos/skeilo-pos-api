@@ -33,7 +33,7 @@ from app.api.v1.table_sessions.schemas import CloseSessionIn, ItemAssignmentIn
 from app.api.v1.sales.schemas import PaymentIn
 from app.models.cart import Cart
 from app.models.dining_table import DiningTable
-from app.models.order_item import OrderItem
+from app.models.order_item import OrderItem, OrderItemOption
 from app.models.sale import Sale
 from app.models.session_participant import SessionParticipant
 from app.models.table_session import TableSession
@@ -123,6 +123,84 @@ class TestTableSessionsService(unittest.TestCase):
         fx.make_order_item(db, order_cancelada, variant)
         db.commit()
         self.assertFalse(service.has_billable_orders(db, ts.id))
+
+    # ------------------------------------------- has_pending_balance (spec 123)
+
+    def _seed_pending_balance(self, db, ts, variant, *, cubierta=False):
+        """Pedido ya facturado (tiene `Sale`) con una línea que tiene una
+        adición agregada después de facturar -- `added_after_sale=True`.
+        `cubierta=True` simula que ya se cobró el pago complementario
+        (`complementary_sale_id` fijado), sin pasar por ese endpoint."""
+        order = fx.make_customer_order(db, ts, status="abierta")
+        item = fx.make_order_item(db, order, variant, estado_cocina="pendiente")
+        group = fx.make_option_group(db)
+        option = fx.make_option(db, group=group, extra_price=Decimal("2000"))
+        register = fx.make_cash_register(db)
+        shift = fx.make_cash_shift(db, register=register)
+        sale = Sale(
+            customer_order_id=order.id, cash_shift_id=shift.id, user_id=uuid4(),
+            total=Decimal("22000"), status="paid",
+        )
+        db.add(sale)
+        db.flush()
+        complementaria = None
+        if cubierta:
+            complementaria = Sale(
+                cash_shift_id=shift.id, user_id=uuid4(), customer_order_id=order.id,
+                total=Decimal("2000"), status="paid", kind="complementario",
+            )
+            db.add(complementaria)
+            db.flush()
+        db.add(OrderItemOption(
+            order_item_id=item.id, option_id=option.id, quantity=1,
+            added_after_sale=True,
+            complementary_sale_id=complementaria.id if complementaria else None,
+        ))
+        db.commit()
+        return order
+
+    def test_has_pending_balance_true_y_false(self):
+        db, table, ts = self._seed_bare_session()
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+
+        self.assertFalse(service.has_pending_balance(db, ts.id))
+
+        self._seed_pending_balance(db, ts, variant)
+        self.assertTrue(service.has_pending_balance(db, ts.id))
+
+    def test_release_paid_session_409_con_saldo_pendiente_por_adicion(self):
+        db, table, ts = self._seed_bare_session()
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        order = self._seed_pending_balance(db, ts, variant)
+        for it in order.items:
+            it.estado_cocina = "listo"
+        db.commit()
+        cashier = fx.make_user_double()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.release_paid_session(db, ts.id, cashier)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail, "Hay un saldo pendiente por cobrar")
+        db.refresh(ts)
+        self.assertEqual(ts.status, "active")
+
+    def test_release_paid_session_libera_una_vez_el_saldo_pendiente_esta_cubierto(self):
+        db, table, ts = self._seed_bare_session()
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        order = self._seed_pending_balance(db, ts, variant, cubierta=True)
+        for it in order.items:
+            it.estado_cocina = "listo"
+        db.commit()
+        cashier = fx.make_user_double()
+
+        resp = service.release_paid_session(db, ts.id, cashier)
+        self.assertEqual(resp.status, "libre")
 
     # ----------------------------------------------- try_release_if_empty (T019)
 

@@ -124,6 +124,22 @@ class OrderItemOption(UUIDPrimaryKeyMixin, Base):
         Boolean, nullable=False, default=False, server_default=false()
     )
 
+    # spec 123: `true` si, al insertarse esta fila (adición agregada después de
+    # creada la línea), el pedido ya tenía una `Sale` emitida (`order_has_sale`).
+    # Se fija una sola vez al crear la fila; nunca se recalcula después. Las filas
+    # anteriores a esta spec (creadas con la línea) quedan en `false` por default,
+    # sin excepción (Principio VII).
+    added_after_sale: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+
+    # spec 123: `Sale` complementaria que liquidó esta adición. `NULL` mientras
+    # el saldo pendiente de la adición sigue sin cobrarse; se fija exactamente
+    # una vez, al cobrarse con éxito el pago complementario que la cubre.
+    complementary_sale_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("sales.id"), nullable=True
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "order_item_id", "option_id",

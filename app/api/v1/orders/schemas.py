@@ -164,6 +164,9 @@ class OrderItemOptionResponse(BaseModel):
     # `OrderItemOption` recién creado y devuelto sin recargar los trae en `None`.
     name: str | None = None
     group_name: str | None = None
+    # spec 123: `true` si esta adición se agregó después de que el pedido ya
+    # tenía una `Sale` emitida -- la línea quedó "Modificada" tras cobrarse.
+    added_after_sale: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -289,6 +292,11 @@ class OrderResponse(BaseModel):
     # "pagada" en los caminos QR/mostrador vigentes. El router lo asigna
     # antes de serializar (`orders.service.order_has_sale`/`paid_order_ids`).
     paid: bool = False
+    # spec 123: computado por `_load_order` (mismo patrón que `paid`) — saldo
+    # pendiente por adiciones agregadas después de que el pedido ya tenía una
+    # `Sale` emitida. 0 cuando el pedido no tiene saldo pendiente (incluido
+    # todo pedido anterior a esta spec).
+    pending_balance: Decimal = Decimal("0")
     # Spec 076, Historia 4: nombre para mostrar del usuario de staff (Cajero o
     # Mesero, sin distinción de rol) que creó este pedido — computado, no una
     # columna nueva: resuelve `CustomerOrder.user_id` (ya existente) contra

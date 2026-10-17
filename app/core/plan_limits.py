@@ -144,6 +144,21 @@ def ensure_module_access(db: Session, tenant: Tenant, module_key: str) -> None:
         )
 
 
+def has_module_access(db: Session, tenant: Tenant, module_key: str) -> bool:
+    """Versión no-lanzante de `ensure_module_access` (spec 123): para un
+    endpoint que debe seguir funcionando igual con o sin el módulo, solo
+    cambiando qué validación aplica (ej. "¿se valida stock de esta adición?").
+
+    A propósito NO delega en `ensure_module_access` envuelto en un
+    `try/except HTTPException`: ese envoltorio también atraparía el 403 de
+    `ensure_plan_not_expired` (plan vencido) y lo confundiría con "sin
+    módulo", cuando son dos motivos de negocio distintos — un plan vencido
+    debería seguir siendo un problema de plan, no degradar en silencio a "sin
+    inventario". Esta función solo mira el acceso al módulo en sí."""
+    plan = db.get(Plan, tenant.plan_id)
+    return bool(getattr(plan, f"{module_key}_access", False))
+
+
 def require_module_access(module_key: str) -> Callable:
     """Dependencia FastAPI: deniega el acceso si el plan vigente del tenant
     no incluye `module_key` (FR-008/FR-009), o si el plan venció (FR-019).
