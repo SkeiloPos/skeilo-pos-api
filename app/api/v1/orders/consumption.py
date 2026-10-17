@@ -8,6 +8,8 @@ adición de un solo ítem de Fase 5.
 Qué consume cada línea lo decide `catalog/consumption_plan.py`, compartido con la
 venta de mostrador: aquí solo se elige la dirección del movimiento ('out' al
 descontar, 'in' al revertir)."""
+from collections import defaultdict
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -22,10 +24,12 @@ from app.models.option import Option
 from app.models.order_item import OrderItem
 from app.api.v1.inventory.stock import lock_items, record_movement
 from app.api.v1.catalog.consumption_plan import (
+    ConsumptionLine,
     ensure_lines_consume_inventory,
     plan_line_consumption,
     required_consumption,
 )
+from app.api.v1.catalog.line_pricing import check_availability
 
 
 def chosen_from_rows(db: Session, item: OrderItem) -> list[ChosenOption]:
@@ -140,6 +144,76 @@ def deduct_order_item(
         record_movement(
             db, line.inventory_item_id, type="out", quantity=line.quantity,
             reason=reasons.VENTA, reference_type=reasons.REF_ORDER,
+            reference_id=reference_id, user_id=user_id,
+        )
+
+
+def plan_addition_consumption(
+    db: Session, order_item: OrderItem, chosen_option: ChosenOption,
+) -> list[ConsumptionLine]:
+    """Qué consume UNA adición agregada después de que la línea ya existe (spec 123).
+
+    A diferencia de `plan_line_consumption`, nunca incluye la receta base de la
+    variante (`source == "receta"`) — esa ya se descontó cuando el `OrderItem` se
+    creó/consolidó. `plan_line_consumption` siempre la agrega multiplicada por
+    `order_item.quantity`; llamar a `deduct_order_item`/`deduct_order_items`
+    "acotado a la nueva opción" la volvería a descontar (research.md D9 de la
+    spec 123) — por eso esta función filtra esas líneas antes de devolver nada."""
+    return [
+        line for line in plan_line_consumption(
+            db, order_item.product_variant_id, order_item.quantity, [chosen_option]
+        )
+        if line.source != "receta"
+    ]
+
+
+def check_addition_availability(
+    db: Session, order_item: OrderItem, chosen_option: ChosenOption, *, extra_context: str = "",
+) -> None:
+    """Chequeo preventivo (sin lock) de UNA adición post-hoc — mismo filtro que
+    `plan_addition_consumption`, para no exigir de más contando la receta base."""
+    required: dict[UUID, Decimal] = defaultdict(Decimal)
+    for line in plan_addition_consumption(db, order_item, chosen_option):
+        required[line.inventory_item_id] += line.quantity
+    check_availability(db, dict(required), extra_context=extra_context)
+
+
+def deduct_addition(
+    db: Session,
+    order_item: OrderItem,
+    chosen_option: ChosenOption,
+    user_id: UUID | None,
+    reference_id: UUID,
+) -> None:
+    """Descuenta solo el insumo de UNA adición agregada después de que la línea ya
+    existe (spec 123) — nunca la receta base de la variante (ver
+    `plan_addition_consumption`). Usada por `orders/additions.py` (pedido sin pagar)
+    y `sales/complementary.py` (cobro del pago complementario) — ninguno de los dos
+    llama a `deduct_order_item`/`deduct_order_items` directamente."""
+    for line in plan_addition_consumption(db, order_item, chosen_option):
+        record_movement(
+            db, line.inventory_item_id, type="out", quantity=line.quantity,
+            reason=reasons.VENTA, reference_type=reasons.REF_ORDER,
+            reference_id=reference_id, user_id=user_id,
+        )
+
+
+def reverse_addition(
+    db: Session,
+    order_item: OrderItem,
+    chosen_option: ChosenOption,
+    user_id: UUID | None,
+    reference_id: UUID,
+) -> None:
+    """Inverso de `deduct_addition`: devuelve al stock la porción de UNA adición que se
+    le quitó a la línea al bajarle la cantidad (spec 123, `orders/additions.py`) —
+    nunca la receta base. Movimiento 'in' con `reason=AJUSTE` (mismo criterio que
+    `reverse_order_item`): no es una venta, es la corrección de lo que ya se había
+    descontado de más; nunca falla por stock insuficiente."""
+    for line in plan_addition_consumption(db, order_item, chosen_option):
+        record_movement(
+            db, line.inventory_item_id, type="in", quantity=line.quantity,
+            reason=reasons.AJUSTE, reference_type=reasons.REF_ORDER,
             reference_id=reference_id, user_id=user_id,
         )
 

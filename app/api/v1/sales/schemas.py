@@ -119,6 +119,16 @@ class PaymentIn(BaseModel):
     reference: str | None = Field(None, max_length=255)
 
 
+class ComplementaryPaymentIn(BaseModel):
+    """Cobro del saldo pendiente de un pedido (spec 123,
+    `sales/complementary.py::settle_pending_balance`). FR-018: un único pago
+    por el monto exacto del saldo vigente. El tope de "un único pago" se
+    valida en el servicio (no con `max_length=1` aquí) para devolver un 422
+    con el mensaje en español, no el genérico de Pydantic."""
+    cash_shift_id: UUID
+    payments: list[PaymentIn] = Field(..., min_length=1)
+
+
 class SaleCreate(BaseModel):
     cash_shift_id: UUID
     participant_id: UUID | None = None

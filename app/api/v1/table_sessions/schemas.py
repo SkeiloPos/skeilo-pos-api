@@ -105,6 +105,10 @@ class SessionBillResponse(BaseModel):
     total: Decimal
     order_ids: list[UUID] = Field(default_factory=list)
     split: list[SessionBillLine] = Field(default_factory=list)
+    # spec 123: saldo pendiente acumulado de todas las órdenes no canceladas
+    # de la sesión (adiciones agregadas después de facturar, aún sin cobrar).
+    # Campo aditivo: 0 cuando no hay saldo pendiente.
+    pending_balance: Decimal = Decimal("0")
 
 
 class SplitPaymentIn(BaseModel):

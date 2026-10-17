@@ -137,9 +137,15 @@ def build_sale(
     applied_promotions: list[dict] | None = None,
     promotion_evaluated_at: datetime | None = None,
     invoice_prefix: str = "",
+    kind: str = "original",
 ) -> Sale:
     """Arma `Sale` + `SaleItem` + `Payment`, deja la venta en `paid` y **emite su
     factura**.
+
+    `kind` (spec 123): `'original'` (default, sin cambio para ningún llamador
+    existente) o `'complementario'` (pago que liquida un saldo pendiente
+    generado por adiciones agregadas después de que el pedido ya tenía una
+    `Sale` -- `sales/complementary.py::settle_pending_balance`).
 
     Valida que el total no sea negativo y que el pago lo cubra. **No hace commit
     ni toca inventario**: se une a la transacción del caller.
@@ -175,6 +181,7 @@ def build_sale(
         # congelado detrás (venta de mostrador directa, histórico) → columna NULL.
         promotion_evaluated_at=promotion_evaluated_at,
         status="issued",
+        kind=kind,
     )
     db.add(sale)
     db.flush()
