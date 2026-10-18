@@ -529,12 +529,13 @@ def checkout_preview(
     order_id: UUID,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     """spec 073, FR-001/FR-004: `{subtotal, discount, delivery_fee, total,
     promotion_evaluated_at}` calculado por la misma autoridad que emite la
     venta. Solo lectura — no bloquea el pedido ni exige turno de caja. `409`
     si el pedido ya está pagado o cancelado."""
-    return checkout.compute_checkout_preview(db, order_id)
+    return checkout.compute_checkout_preview(db, order_id, tenant)
 
 
 @router.post(
@@ -546,12 +547,13 @@ def draft_preview(
     body: DraftPreviewIn,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     """spec 073, FR-013: mismo desglose para un borrador que todavía no existe
     como pedido — el frontend manda las mismas líneas que usará para el
     `POST /orders` real. `promotion_evaluated_at` es la hora de la llamada (sin
     congelar). Sin `404`/`409`: no hay ningún recurso persistido."""
-    return checkout.compute_draft_preview(db, body)
+    return checkout.compute_draft_preview(db, body, tenant)
 
 
 @router.post(
@@ -603,7 +605,7 @@ def pay_order(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    sale = checkout.pay_order(db, order_id, body, user)
+    sale = checkout.pay_order(db, order_id, body, user, tenant)
     order = db.get(CustomerOrder, order_id)
     events.payment_completed(
         tenant.id,
@@ -641,7 +643,7 @@ def checkout_and_send(
     'recibida'): cobra la orden y, en la misma transacción, la envía a cocina
     (descuenta inventario) — spec 028, T016."""
     sale = checkout.checkout_and_send(
-        db, order_id, body, user, request_id=current_request_id(request)
+        db, order_id, body, user, request_id=current_request_id(request), tenant=tenant
     )
     order = db.get(CustomerOrder, order_id)
     events.payment_completed(

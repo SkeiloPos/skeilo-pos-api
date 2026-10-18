@@ -80,13 +80,14 @@ def _option_availability(db: Session) -> dict[UUID, bool]:
     return out
 
 
-def _build_menu(db: Session) -> list[MenuCategoryResponse]:
+def _build_menu(db: Session, tenant: Tenant | None = None) -> list[MenuCategoryResponse]:
     avail = _option_availability(db)
     now = datetime.now(timezone.utc)
     # spec 063 (revisión 2026-09-01): reglas de promoción por conjunto de
     # variantes vigentes en este instante (la vigencia es de la promoción,
-    # compartida por todas sus reglas).
-    rules = active_variant_set_rules(db, now)
+    # compartida por todas sus reglas). spec 127: `tenant`, cuando el caller
+    # lo tiene resuelto, evalúa la vigencia en SU zona horaria real.
+    rules = active_variant_set_rules(db, now, tenant)
     # spec 066: los nombres del descriptor, **una vez por llamada** y fuera del
     # bucle de variantes — dentro sería un N+1 (research.md D-12).
     promo_names = variant_display_names(
@@ -221,11 +222,15 @@ def _money(value: Decimal) -> str:
     return "$" + f"{int(value):,}".replace(",", ".")
 
 
-def _build_menu_promotions(db: Session, now: datetime) -> list[MenuPromotionAnnouncement]:
+def _build_menu_promotions(
+    db: Session, now: datetime, tenant: Tenant | None = None
+) -> list[MenuPromotionAnnouncement]:
     """Anuncios de promociones por conjunto de variantes **vigentes en este
     instante** (spec 063, FR-022 / SC-007): `status == "active"` **y**
     `_valid_now` verdadero (ventana de día/hora en la zona del tenant).
-    `_build_menu` no se toca. `now` viene aware, no arrastra A-08.
+    `_build_menu` no se toca. `now` viene aware, no arrastra A-08. `tenant`
+    (spec 127): si el caller lo tiene resuelto, la vigencia se evalúa en SU
+    zona horaria real.
 
     spec 063 (revisión 2026-09-01): una promoción anuncia **una `rules[]` por
     cada `PromotionRule` vigente** que tenga (antes: siempre 1, una promoción
@@ -235,7 +240,7 @@ def _build_menu_promotions(db: Session, now: datetime) -> list[MenuPromotionAnno
     # (vigencia en ese instante, FR-022 / SC-007), evaluado sobre la
     # promoción dueña de cada regla.
     by_promotion: dict = {}   # promotion_id -> MenuPromotionAnnouncement
-    reglas = active_variant_set_rules(db, now)
+    reglas = active_variant_set_rules(db, now, tenant)
     # spec 066: los nombres del descriptor se resuelven **una vez por llamada**,
     # sobre la unión de los conjuntos vigentes. Dentro del bucle sería un N+1
     # (research.md D-12).
@@ -272,14 +277,14 @@ def _build_menu_promotions(db: Session, now: datetime) -> list[MenuPromotionAnno
 
 
 @router.get("", response_model=list[MenuCategoryResponse], summary="Menú público (catálogo activo)")
-def public_menu(db: Session = Depends(get_db)):
-    return _build_menu(db)
+def public_menu(db: Session = Depends(get_db), tenant: Tenant = Depends(get_tenant)):
+    return _build_menu(db, tenant)
 
 
 @router.get("/promotions", response_model=list[MenuPromotionAnnouncement],
             summary="Anuncios de promociones de precio por presentación vigentes")
-def public_menu_promotions(db: Session = Depends(get_db)):
-    return _build_menu_promotions(db, datetime.now(timezone.utc))
+def public_menu_promotions(db: Session = Depends(get_db), tenant: Tenant = Depends(get_tenant)):
+    return _build_menu_promotions(db, datetime.now(timezone.utc), tenant)
 
 
 # NOTA: se eliminó `GET /menu/qr/{qr_token}` (UUID plano + header x-tenant-host).
@@ -307,7 +312,7 @@ async def menu_by_signed_qr(token: str, request: Request):
         return {
             "table": MenuTableResponse.model_validate(table),
             "business": MenuBusinessResponse.model_validate(ctx.tenant),
-            "menu": _build_menu(ctx.db),
+            "menu": _build_menu(ctx.db, ctx.tenant),
             # spec 040 (FR-021): clave aditiva; el resto del dict no cambia.
-            "promotions": _build_menu_promotions(ctx.db, datetime.now(timezone.utc)),
+            "promotions": _build_menu_promotions(ctx.db, datetime.now(timezone.utc), ctx.tenant),
         }
