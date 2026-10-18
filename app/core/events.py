@@ -53,6 +53,15 @@ def session_channel(table_session_id: UUID | str) -> str:
     return f"session:{table_session_id}"
 
 
+def menu_channel(tenant_id: int) -> str:
+    """spec 128 (US3, FR-009): canal que reciben TODOS los comensales del
+    tenant con el menú QR abierto, sin importar su mesa -- a diferencia de
+    `session_channel`, que es exclusivo de una mesa. Distinto también de
+    `CH_STAFF` (exclusivo del personal): un comensal nunca debe escuchar los
+    eventos de todo el tenant que ese canal lleva."""
+    return f"menu:{tenant_id}"
+
+
 # ------------------------------------------------------------------ Publicador
 
 _publisher: SyncRedis | None = None
@@ -344,4 +353,17 @@ def table_status_changed(
             "table_number": table_number,
             "status": status,
         },
+    )
+
+
+def menu_updated(tenant_id: int) -> str | None:
+    """spec 128 (US3, FR-009): una categoría cambió de visibilidad en el
+    menú QR. Evento delgado a propósito -- sin payload más allá del aviso
+    mismo (mismo principio que el resto del catálogo, ver docstring del
+    módulo): el cliente vuelve a pedir el menú completo, no recibe un diff
+    de qué cambió."""
+    return publish(
+        tenant_id,
+        type="menu.updated",
+        channels=[menu_channel(tenant_id)],
     )

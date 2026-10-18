@@ -27,7 +27,7 @@ import anyio
 from fastapi import HTTPException, status
 
 from app.core.config import settings
-from app.core.events import CH_STAFF, session_channel
+from app.core.events import CH_STAFF, menu_channel, session_channel
 from app.core.qr_context import open_session_context
 from app.core.redis import token_blocklist as redis
 
@@ -58,7 +58,12 @@ def _validate_diner_sync(token: str) -> Subscriber:
     with open_session_context(token, touch=False) as ctx:
         return Subscriber(
             tenant_id=ctx.tenant.id,
-            channels=frozenset({session_channel(ctx.table_session.id)}),
+            # spec 128 (US3, FR-009): además de su propia mesa, todo
+            # comensal recibe el canal de menú del tenant -- un cambio de
+            # visibilidad en QR no está atado a ninguna mesa en particular.
+            channels=frozenset({
+                session_channel(ctx.table_session.id), menu_channel(ctx.tenant.id),
+            }),
             kind="diner",
             table_session_id=ctx.table_session.id,
         )
