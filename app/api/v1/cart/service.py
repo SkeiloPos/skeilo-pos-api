@@ -765,13 +765,42 @@ def submit_cart(
         # orden ni intento ni borra el carrito. Se persiste (y se audita) la key resuelta.
         receipt_file_url = resolve_receipt_key(receipt_file_url, _require_receipt_schema(tenant_schema))
 
+    variants = [
+        get_or_404(db, ProductVariant, i.product_variant_id, "Variant not found")
+        for i in cart.items
+    ]
+
     # spec 093 (FR-021/FR-022, escenario 7): si algún producto del carrito se
     # marcó agotado DESPUÉS de que el comensal lo agregara, se rechaza el envío
     # completo aquí -- nombrando todos los agotados a la vez -- antes de crear
     # la orden; el carrito no se toca, así que el comensal puede ajustarlo.
-    ensure_products_available(
-        [get_or_404(db, ProductVariant, i.product_variant_id, "Variant not found") for i in cart.items]
-    )
+    ensure_products_available(variants)
+
+    # spec 128 (FR-007, research.md Decisión 5): si la categoría de un
+    # producto dejó de ser visible en QR (se ocultó o se desactivó) DESPUÉS
+    # de que el comensal lo agregara al carrito, se rechaza el envío --
+    # pero a diferencia de agotados, aquí el carrito SÍ se actualiza: las
+    # líneas afectadas se eliminan como parte de esta misma llamada, para
+    # que el comensal no tenga que encontrarlas y quitarlas él mismo. Ningún
+    # pedido se crea en esta llamada.
+    items_by_variant_id = {i.product_variant_id: i for i in cart.items}
+    ocultos = {
+        (v.product.name): items_by_variant_id[v.id]
+        for v in variants
+        if not (v.product.category.active and v.product.category.visible_en_qr)
+    }
+    if ocultos:
+        for item in ocultos.values():
+            db.delete(item)
+        db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "error": "Algunos productos ya no están disponibles y se quitaron de tu carrito",
+                "productos_no_disponibles": sorted(ocultos.keys()),
+            },
+        )
+
     check_availability(db, _cart_consumption(db, cart), extra_context="envío de pedido")
 
     # spec 087 (FR-006, A-86): segundo punto de creación de CustomerOrder que

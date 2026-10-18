@@ -140,7 +140,9 @@ class AdminListingUnaffectedTests(unittest.TestCase):
         fx.make_category(db, name="Helados", display_order=50)
         db.commit()
 
-        page = list_categories(page=1, size=20, active=None, search=None, db=db, _=None, user=None)
+        page = list_categories(
+            page=1, size=20, active=None, visible_en_qr=None, search=None, db=db, _=None, user=None,
+        )
         # `paginate()` devuelve un dict crudo (app/core/pagination.py) -- FastAPI
         # solo lo valida contra `Page[CategoryResponse]` en el ciclo HTTP real,
         # que este test no ejercita (llama al handler directo, research.md).

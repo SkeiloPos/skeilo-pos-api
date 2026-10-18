@@ -18,6 +18,11 @@ class Category(UUIDPrimaryKeyMixin,TimestampMixin,Base):
 
    active:Mapped[bool] = mapped_column(Boolean, default=True)
 
+   # spec 128 (FR-001/FR-002): visibilidad específica del menú QR, independiente
+   # de `active` -- una categoría solo aparece en el menú QR si ambas son
+   # verdaderas a la vez. No tiene relación con `display_order`.
+   visible_en_qr:Mapped[bool] = mapped_column(Boolean, default=True)
+
    display_order:Mapped[int] = mapped_column(Integer, nullable=False)
 
    products:Mapped[List["Product"]] = relationship(back_populates="category")

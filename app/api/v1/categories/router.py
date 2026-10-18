@@ -4,10 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 
-from app.core.db import get_db
+from app.core import events
+from app.core.db import get_db, get_tenant
 from app.core.dependencies import AccessTokenBearer, get_current_user
 from app.core.crud import get_or_404, ensure_unique
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.models.category import Category
 from app.models.category_presentation import CategoryPresentation
@@ -54,6 +55,10 @@ def list_categories(
     active: bool | None = Query(
         None, description="Filtra por estado activo (true) o inactivo (false)."
     ),
+    visible_en_qr: bool | None = Query(
+        None,
+        description="Filtra por visibilidad en el menú QR (true) u ocultas en QR (false). spec 128, FR-011.",
+    ),
     search: str | None = Query(None, description="Búsqueda por nombre (contiene, sin distinguir mayúsculas)."),
     db: Session = Depends(get_db),
     _: dict = Depends(acccess_token_bearer),
@@ -63,6 +68,8 @@ def list_categories(
     query = select(Category).order_by(Category.name)
     if active is not None:
         query = query.where(Category.active == active)
+    if visible_en_qr is not None:
+        query = query.where(Category.visible_en_qr == visible_en_qr)
     if search:
         query = query.where(Category.name.ilike(f"%{search.strip()}%"))
     return paginate(db, query, page, size)
@@ -140,7 +147,8 @@ def update_category(
     id: UUID,
     body: CategoryUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     category = get_or_404(db, Category, id, "Category not found")
 
@@ -154,6 +162,25 @@ def update_category(
     if body.active is not None:
         category.active = body.active
 
+    if body.visible_en_qr is not None:
+        # spec 128 (FR-005/FR-006): restricción de rol acotada SOLO a este
+        # campo -- el resto del endpoint sigue sin exigir ningún rol
+        # (research.md, Decisión 3; no agregar require_tenant_admin a todo
+        # el endpoint). Se evalúa `category.active` DESPUÉS de aplicar
+        # `body.active` arriba, para permitir activar y mostrar/ocultar en
+        # QR en la misma llamada.
+        if not user.role or user.role.name != "ADMIN":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Solo un Administrador puede cambiar la visibilidad en el menú QR",
+            )
+        if not category.active:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Activa la categoría para controlar su visibilidad en QR",
+            )
+        category.visible_en_qr = body.visible_en_qr
+
     if body.display_order is not None:
         category.display_order = body.display_order
 
@@ -162,6 +189,13 @@ def update_category(
 
     db.commit()
     db.refresh(category)
+    # spec 128 (US3, FR-009): publicar DESPUÉS del commit -- si la
+    # transacción hubiera fallado no puede haber salido un evento
+    # anunciando un cambio que no ocurrió (mismo principio que todo el
+    # catálogo de app/core/events.py). Solo cuando el campo venía en el
+    # payload: evitar un evento de "nada cambió" en cada PATCH de otro campo.
+    if body.visible_en_qr is not None:
+        events.menu_updated(tenant.id)
     return category
 
 

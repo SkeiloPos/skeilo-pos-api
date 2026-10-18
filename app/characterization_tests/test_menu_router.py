@@ -75,6 +75,82 @@ class TestBuildMenuA08(unittest.TestCase):
         self.assertLess(variant_resp.discounted_price, variant_resp.price)
 
 
+class TestBuildMenuVisibleEnQr(unittest.TestCase):
+    """spec 128 (FR-002/FR-004): con `only_visible_en_qr=True` (el único caller
+    real es `menu_by_signed_qr`, el flujo del comensal), `_build_menu` excluye
+    una categoría con `active=True, visible_en_qr=False` (y sus productos), y
+    la incluye de nuevo cuando `visible_en_qr=True` — sin que `display_order`
+    cambie en ningún momento.
+
+    Corrección post-implementación: la primera versión filtraba por
+    `visible_en_qr` siempre, sin distinguir caller -- eso también ocultaba la
+    categoría del catálogo de la Terminal de mesas (`GET /menu` ->
+    `MenuService` -> `pos-terminal.store.ts`), que según spec.md NUNCA debe
+    perder productos por esta bandera (solo por `active`). Ver
+    `TestBuildMenuDefaultIncludesHiddenInQr` para esa cobertura."""
+
+    def _seed(self, db, *, visible_en_qr: bool):
+        category = fx.make_category(db, display_order=7, visible_en_qr=visible_en_qr)
+        product = fx.make_product(db, category=category)
+        fx.make_variant(db, product=product, price=Decimal("8000"))
+        db.commit()
+        return category
+
+    def test_categoria_oculta_en_qr_no_aparece_en_el_menu_qr(self):
+        db = fx.new_session()
+        self._seed(db, visible_en_qr=False)
+
+        menu = _build_menu(db, only_visible_en_qr=True)
+
+        self.assertEqual(menu, [])
+
+    def test_categoria_visible_en_qr_si_aparece_en_el_menu_qr(self):
+        db = fx.new_session()
+        category = self._seed(db, visible_en_qr=True)
+
+        menu = _build_menu(db, only_visible_en_qr=True)
+
+        self.assertEqual(len(menu), 1)
+        self.assertEqual(menu[0].id, category.id)
+
+    def test_ocultar_y_mostrar_no_cambia_display_order(self):
+        db = fx.new_session()
+        category = self._seed(db, visible_en_qr=True)
+        original_order = category.display_order
+
+        category.visible_en_qr = False
+        db.commit()
+        self.assertEqual(_build_menu(db, only_visible_en_qr=True), [])
+        self.assertEqual(category.display_order, original_order)
+
+        category.visible_en_qr = True
+        db.commit()
+        menu = _build_menu(db, only_visible_en_qr=True)
+        self.assertEqual(menu[0].id, category.id)
+        self.assertEqual(category.display_order, original_order)
+
+
+class TestBuildMenuDefaultIncludesHiddenInQr(unittest.TestCase):
+    """spec 128 (notas técnicas): ocultar una categoría del menú QR NO la
+    quita del catálogo de productos ni de la creación de pedidos manuales
+    (cajero, mesero o admin). La Terminal de mesas llama a `_build_menu` sin
+    `only_visible_en_qr` (`GET /menu` -> `public_menu`), así que el valor por
+    defecto debe seguir devolviendo una categoría activa aunque esté oculta
+    en QR."""
+
+    def test_categoria_oculta_en_qr_sigue_en_el_catalogo_de_la_terminal(self):
+        db = fx.new_session()
+        category = fx.make_category(db, visible_en_qr=False)
+        product = fx.make_product(db, category=category)
+        fx.make_variant(db, product=product, price=Decimal("8000"))
+        db.commit()
+
+        menu = _build_menu(db)
+
+        self.assertEqual(len(menu), 1)
+        self.assertEqual(menu[0].id, category.id)
+
+
 class TestMenuPromotionsAnnouncementUS5(unittest.TestCase):
     """spec 063 — US4 / FR-022 / SC-007: el menú QR anuncia las promociones por
     **conjunto de variantes** vigentes en ese instante. Reescrita de la clase de

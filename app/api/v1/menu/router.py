@@ -80,7 +80,9 @@ def _option_availability(db: Session) -> dict[UUID, bool]:
     return out
 
 
-def _build_menu(db: Session, tenant: Tenant | None = None) -> list[MenuCategoryResponse]:
+def _build_menu(
+    db: Session, tenant: Tenant | None = None, *, only_visible_en_qr: bool = False,
+) -> list[MenuCategoryResponse]:
     avail = _option_availability(db)
     now = datetime.now(timezone.utc)
     # spec 063 (revisión 2026-09-01): reglas de promoción por conjunto de
@@ -94,8 +96,17 @@ def _build_menu(db: Session, tenant: Tenant | None = None) -> list[MenuCategoryR
         db, {v.product_variant_id for r in rules for v in r.variants}
     )
 
+    # spec 128 (FR-002/FR-003): `visible_en_qr` solo se exige en el flujo del
+    # comensal (`menu_by_signed_qr`, único caller con `only_visible_en_qr=True`).
+    # `_build_menu` también es el catálogo de la Terminal de mesas (vía `GET
+    # /menu` -> `MenuService`, `pos-terminal.store.ts`), que debe seguir viendo
+    # TODAS las categorías activas sin importar su visibilidad en QR.
+    category_filters = [Category.active.is_(True)]
+    if only_visible_en_qr:
+        category_filters.append(Category.visible_en_qr.is_(True))
     categories = db.execute(
-        select(Category).where(Category.active.is_(True))
+        select(Category)
+        .where(*category_filters)
         .order_by(Category.display_order.desc(), Category.name)
     ).scalars().all()
 
@@ -312,7 +323,7 @@ async def menu_by_signed_qr(token: str, request: Request):
         return {
             "table": MenuTableResponse.model_validate(table),
             "business": MenuBusinessResponse.model_validate(ctx.tenant),
-            "menu": _build_menu(ctx.db, ctx.tenant),
+            "menu": _build_menu(ctx.db, ctx.tenant, only_visible_en_qr=True),
             # spec 040 (FR-021): clave aditiva; el resto del dict no cambia.
             "promotions": _build_menu_promotions(ctx.db, datetime.now(timezone.utc), ctx.tenant),
         }
