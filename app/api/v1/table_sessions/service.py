@@ -389,6 +389,7 @@ def close_session(
                 customer_name=getattr(sale, "customer_name", None),
                 billing_mode=data.billing_mode.value,
                 invoice=invoice,
+                origin_client_id=data.origin_client_id,
             )
         events.session_closed(
             tenant_id,

@@ -51,6 +51,7 @@ from app.core.event_bus import Event, EventBus, Subscription
 from app.core.events import CH_STAFF
 from app.core.models import Base
 from app.core.notifications import dispatch
+from app.core.notifications.summary import summarize
 from app.models.notification_event import NotificationEvent
 from app.models.plan import Plan  # noqa: F401 - registra la tabla "plans" (FK de Tenant) en Base.metadata
 
@@ -261,6 +262,48 @@ class NotificacionesApiAislaEntreTenantsTests(unittest.TestCase):
         body = resp.json()
         self.assertIsNotNone(body["attended_at"])
         self.assertEqual(body["attended_by_user_id"], str(self.user_a))
+
+
+class SummarizePagoFormatoDeMonedaTests(unittest.TestCase):
+    """Spec 125 (FR-005): el resumen de un `payment.completed` debe respetar
+    el formato de moneda estándar ("$ 22.000"), no la interpolación cruda del
+    valor ("$22000") que mostraba antes. No requiere base de datos: `summarize()`
+    es una función pura sobre un `NotificationEvent` sin persistir."""
+
+    def _event(self, payload: dict) -> NotificationEvent:
+        return NotificationEvent(
+            event_type="payment.completed",
+            related_entity_type="sale",
+            related_entity_id=uuid.uuid4(),
+            payload=payload,
+        )
+
+    def test_formatea_el_total_con_punto_de_miles_y_espacio_tras_el_simbolo(self):
+        self.assertEqual(
+            summarize(self._event({"total": "22000"})),
+            "Pago recibido · $ 22.000",
+        )
+
+    def test_acepta_total_como_decimal_no_solo_string(self):
+        self.assertEqual(
+            summarize(self._event({"total": Decimal("22000")})),
+            "Pago recibido · $ 22.000",
+        )
+
+    def test_sin_total_cae_al_texto_generico(self):
+        self.assertEqual(summarize(self._event({})), "Pago recibido")
+
+    def test_order_created_no_se_toca_por_esta_spec_sigue_con_el_bug_conocido(self):
+        """Fuera de alcance (research.md R2): mismo bug en `order.created`, no
+        se corrige aquí — esta prueba deja constancia explícita de que sigue
+        intacto, para que un cambio futuro lo encuentre documentado."""
+        event = NotificationEvent(
+            event_type="order.created",
+            related_entity_type="customer_order",
+            related_entity_id=uuid.uuid4(),
+            payload={"table_number": 4, "items_count": 3, "total": "45000"},
+        )
+        self.assertEqual(summarize(event), "Mesa 4 · 3 ítems · $45000")
 
 
 if __name__ == "__main__":

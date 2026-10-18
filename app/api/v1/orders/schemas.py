@@ -407,6 +407,11 @@ class PayIn(BaseModel):
     # spec 112 (RN3/FR-004): hasta 3 líneas de pago por cobro — el mismo tope que
     # impone el panel "Cobrar pedido"; esto es la defensa en profundidad del servidor.
     payments: list[PaymentIn] = Field(..., min_length=1, max_length=3)
+    # spec 125 (FR-007): id de la pestaña/terminal que origina el cobro, para que
+    # esa misma terminal pueda silenciar su propio aviso de pago en tiempo real sin
+    # dejar de notificar a las demás. Opaco, opcional y retrocompatible — sin él,
+    # ninguna terminal se silencia (comportamiento actual).
+    origin_client_id: str | None = Field(None, max_length=64)
 
 
 class CheckoutAndSendIn(BaseModel):
@@ -432,6 +437,8 @@ class CheckoutAndSendIn(BaseModel):
         None, max_length=255,
         description="A nombre de quién va la factura. Si se omite, 'Consumidor Final'.",
     )
+    # spec 125 (FR-007): ver PayIn.origin_client_id.
+    origin_client_id: str | None = Field(None, max_length=64)
 
 
 class BillItemLine(BaseModel):

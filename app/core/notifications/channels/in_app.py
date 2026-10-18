@@ -30,5 +30,9 @@ class InAppChannel:
                 "related_entity_type": event.related_entity_type,
                 "related_entity_id": event.related_entity_id,
                 "summary": summarize(event),
+                # spec 125 (FR-007): presente solo si el emisor lo mandó (hoy,
+                # `payment.completed`) — la terminal de origen lo usa para
+                # silenciar su propio aviso sin afectar a las demás.
+                "origin_client_id": (event.payload or {}).get("origin_client_id"),
             },
         )
