@@ -17,6 +17,7 @@ from app.core import events
 from app.core.asset_refs import resolve_receipt_key
 from app.core.config import settings
 from app.core.crud import get_or_404
+from app.core.models import Tenant
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -302,11 +303,15 @@ def _cart_promo_lines(db: Session, cart: Cart) -> list[dict]:
     return promo_lines
 
 
-def serialize_cart(db: Session, cart: Cart, participant: SessionParticipant) -> CartResponse:
+def serialize_cart(
+    db: Session, cart: Cart, participant: SessionParticipant, tenant: Tenant | None = None
+) -> CartResponse:
     now = datetime.now(timezone.utc)
     # spec 063: motor por conjunto de variantes, evaluado UNA sola vez sobre las
     # líneas del carrito. No se persiste (FR-020); se recalcula en cada `GET /cart`.
-    result = promotions.evaluate_variant_sets(db, _cart_promo_lines(db, cart), now)
+    # spec 127: `tenant`, cuando el caller lo tiene resuelto (siempre,
+    # `SessionContext.tenant`), evalúa la vigencia en SU zona horaria real.
+    result = promotions.evaluate_variant_sets(db, _cart_promo_lines(db, cart), now, tenant)
 
     items: list[CartItemResponse] = []
     total = Decimal("0")
@@ -346,17 +351,19 @@ def serialize_cart(db: Session, cart: Cart, participant: SessionParticipant) -> 
     )
 
 
-def get_cart(db: Session, participant_id: UUID) -> CartResponse:
+def get_cart(db: Session, participant_id: UUID, tenant: Tenant | None = None) -> CartResponse:
     """Carrito abierto del comensal, con su nombre. El nombre va en la respuesta
     porque el token de sesión no lo lleva: al recargar el menú, `GET /cart` es lo
     único que permite al front repintar el saludo."""
     participant = get_or_404(db, SessionParticipant, participant_id, "Comensal no encontrado")
-    return serialize_cart(db, _get_or_create_open_cart(db, participant_id), participant)
+    return serialize_cart(db, _get_or_create_open_cart(db, participant_id), participant, tenant)
 
 
 # --------------------------------------------------------------- CRUD de líneas
 
-def add_item(db: Session, participant_id: UUID, data: CartItemIn) -> CartResponse:
+def add_item(
+    db: Session, participant_id: UUID, data: CartItemIn, tenant: Tenant | None = None
+) -> CartResponse:
     cart = _get_or_create_open_cart(db, participant_id)
 
     variant = get_or_404(db, ProductVariant, data.product_variant_id, "Variant not found")
@@ -397,7 +404,7 @@ def add_item(db: Session, participant_id: UUID, data: CartItemIn) -> CartRespons
         logger.exception("Error agregando ítem al carrito")
         raise
 
-    return get_cart(db, participant_id)
+    return get_cart(db, participant_id, tenant)
 
 
 def _auto_adjust_cantidad_options(
@@ -471,7 +478,11 @@ def _auto_adjust_cantidad_options(
 
 
 def update_item(
-    db: Session, participant_id: UUID, item_id: UUID, data: CartItemUpdate
+    db: Session,
+    participant_id: UUID,
+    item_id: UUID,
+    data: CartItemUpdate,
+    tenant: Tenant | None = None,
 ) -> CartResponse:
     cart = _load_open_cart(db, participant_id)
     item = next((i for i in cart.items if i.id == item_id), None)
@@ -532,7 +543,7 @@ def update_item(
         logger.exception("Error editando ítem del carrito")
         raise
 
-    response = get_cart(db, participant_id)
+    response = get_cart(db, participant_id, tenant)
     if adjusted_options:
         # Spec 117 (A-126, D5): solo en la respuesta de ESTE `PATCH` -- `GET /cart`
         # (vía `get_cart` arriba) y cualquier lectura posterior nunca lo repiten.
@@ -642,6 +653,7 @@ def submit_cart(
     tenant_id: int | None = None,
     request_id: str | None = None,
     tenant_schema: str | None = None,
+    tenant: Tenant | None = None,
 ) -> CustomerOrder:
     """Envía el carrito del comensal como pedido: crea una `CustomerOrder` en
     estado `recibida` con sus líneas **y** su primer `OrderPaymentAttempt`, en
@@ -667,7 +679,12 @@ def submit_cart(
     `tenant_schema` (spec 088, FR-008) es el esquema del negocio contra el que se
     valida el comprobante de un método que no es efectivo (prefijo del negocio +
     carpeta `comprobantes` + existencia en R2); en base de datos se guarda la
-    **key**. Obligatorio solo cuando llega un comprobante."""
+    **key**. Obligatorio solo cuando llega un comprobante.
+
+    `tenant` (spec 127) es el objeto `Tenant` completo (distinto de `tenant_id`,
+    que solo es su id para el log) — el router ya lo tiene resuelto
+    (`ctx.tenant`); se reenvía al motor de promociones para evaluar la
+    vigencia en la zona horaria real del tenant en vez del respaldo global."""
     cart = _load_open_cart_or_none(db, participant.id)
 
     # spec 024, FR-005: no permitir una segunda orden activa del mismo
@@ -789,7 +806,7 @@ def submit_cart(
         # descuento del pedido recién confirmado debe coincidir exactamente con
         # lo que el carrito mostraba justo antes.
         now = datetime.now(timezone.utc)
-        result = promotions.evaluate_variant_sets(db, _cart_promo_lines(db, cart), now)
+        result = promotions.evaluate_variant_sets(db, _cart_promo_lines(db, cart), now, tenant)
 
         for idx, ci in enumerate(cart.items):
             line_total = compute_line_total(ci.unit_price, ci.quantity, ci.addons_total)
@@ -894,14 +911,16 @@ def submit_cart(
     ).scalar_one()
 
 
-def remove_item(db: Session, participant_id: UUID, item_id: UUID) -> CartResponse:
+def remove_item(
+    db: Session, participant_id: UUID, item_id: UUID, tenant: Tenant | None = None
+) -> CartResponse:
     cart = _load_open_cart(db, participant_id)
     item = next((i for i in cart.items if i.id == item_id), None)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Línea de carrito no encontrada")
     db.delete(item)
     db.commit()
-    return get_cart(db, participant_id)
+    return get_cart(db, participant_id, tenant)
 
 
 # --------------------------------------------------------- Pagos del comensal (spec 024)

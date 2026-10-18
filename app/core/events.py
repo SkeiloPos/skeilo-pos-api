@@ -211,6 +211,26 @@ def item_kitchen_changed(
     )
 
 
+def item_addon_added(
+    tenant_id: int, *, order_id, table_session_id, item_id, option_name, quantity,
+) -> str | None:
+    """Una adición se agregó a una línea ya persistida (spec 123) -- distinto
+    de `item_kitchen_changed`: no cambia `estado_cocina`, así que no se
+    reutiliza ese tipo."""
+    channels = [CH_STAFF]
+    if table_session_id is not None:
+        channels.append(session_channel(table_session_id))
+    return publish(
+        tenant_id,
+        type="order.item_addon_added",
+        channels=channels,
+        payload={
+            "order_id": order_id, "table_session_id": table_session_id,
+            "item_id": item_id, "option_name": option_name, "quantity": quantity,
+        },
+    )
+
+
 def item_voided(
     tenant_id: int, *, order_id, table_session_id, item_id, motivo,
     replacement_item_id=None,

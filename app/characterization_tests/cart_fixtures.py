@@ -488,7 +488,11 @@ def build_session_context(
     llamar la función Python directamente, así que no hace falta ningún
     parche para estas (research.md §1). `tenant_schema` (spec 024) lo usa
     `presign_receipt` (`cart/service.py`) para construir la key de R2."""
-    tenant = SimpleNamespace(id=tenant_id, schema=tenant_schema)
+    # `timezone` (spec 127): `cart/service.py` ahora reenvía `ctx.tenant` al
+    # motor de promociones (`resolve_timezone`), que lee este atributo -- sin
+    # él, cualquier test que ejercite una promoción vigente via este harness
+    # levanta `AttributeError`.
+    tenant = SimpleNamespace(id=tenant_id, schema=tenant_schema, timezone="America/Bogota")
     return SessionContext(
         db=db,
         tenant=tenant,

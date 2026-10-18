@@ -38,6 +38,7 @@ from sqlalchemy import select
 
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.catalog.schemas import OptionSelectionIn
+from app.core.models import Tenant
 from app.api.v1.orders import checkout, consolidation
 from app.api.v1.orders.schemas import (
     BlockIn, CancelIn, CheckoutAndSendIn, DraftPreviewIn, OrderItemIn, PayIn,
@@ -1321,6 +1322,27 @@ class TestVigenciaCongelada(unittest.TestCase):
         )
         sale = checkout.checkout_and_send(db, order.id, data, self._user())  # sin error
         self.assertEqual(sale.discount, Decimal("0"))
+
+    def test_mismo_instante_congelado_distinto_tenant_distinto_descuento(self):
+        """spec 127 (FR-002/FR-003): el instante congelado (`promotion_evaluated_at`)
+        es el mismo valor absoluto para cualquier tenant -- lo que cambia es la
+        zona horaria con la que `compute_checkout_preview` lo interpreta.
+        Pedido tomado a las 22:30 hora de Bogotá (dentro de 22:00-23:00
+        local), que son las 21:30 en Ciudad de México (fuera de esa misma
+        ventana) -- antes de esta spec, ningún tenant salvo el respaldo
+        global (Bogotá) se evaluaba nunca."""
+        s = self._seed(
+            promo_evaluated_at=_utc_para_hora_local(2026, 9, 2, 22, 30),
+            start_time=time(22, 0), end_time=time(23, 0),
+        )
+        preview_bogota = checkout.compute_checkout_preview(
+            s["db"], s["order"].id, Tenant(timezone="America/Bogota"),
+        )
+        preview_mexico = checkout.compute_checkout_preview(
+            s["db"], s["order"].id, Tenant(timezone="America/Mexico_City"),
+        )
+        self.assertEqual(preview_bogota.discount, Decimal("8000"))  # 50% de 2 x 8000
+        self.assertEqual(preview_mexico.discount, Decimal("0"))
 
 
 class TestPromotionEvaluationInstant(unittest.TestCase):

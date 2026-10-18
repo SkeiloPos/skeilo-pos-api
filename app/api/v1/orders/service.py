@@ -104,6 +104,32 @@ def order_has_sale(db: Session, order_id: UUID) -> bool:
     ).scalar() is not None
 
 
+def order_pending_balance(db: Session, order_id: UUID) -> Decimal:
+    """Saldo pendiente del pedido (spec 123): suma de las adiciones agregadas
+    después de que el pedido ya tenía una `Sale` emitida y que todavía no se
+    cobraron con un pago complementario.
+
+    Es un valor CALCULADO, no una columna — mismo patrón que `has_billable_orders`
+    (`table_sessions/service.py`), que tampoco persiste nada. Se excluyen las
+    líneas `anuladas` (si se anula una línea con una adición pendiente, esa
+    porción del saldo deja de existir — nunca llegó a descontar inventario,
+    research.md D9) y las adiciones ya cubiertas por un pago complementario
+    (`complementary_sale_id IS NOT NULL`)."""
+    total = db.execute(
+        select(func.coalesce(func.sum(Option.extra_price * OrderItemOption.quantity), 0))
+        .select_from(OrderItemOption)
+        .join(OrderItem, OrderItem.id == OrderItemOption.order_item_id)
+        .join(Option, Option.id == OrderItemOption.option_id)
+        .where(
+            OrderItem.order_id == order_id,
+            OrderItem.estado_cocina != "anulado",
+            OrderItemOption.added_after_sale.is_(True),
+            OrderItemOption.complementary_sale_id.is_(None),
+        )
+    ).scalar()
+    return Decimal(total or 0)
+
+
 # ------------------------------------------- Desglose de facturación (spec 094)
 
 #: Valor de `estado_cocina` que excluye una línea de toda suma (FR-019). Es el

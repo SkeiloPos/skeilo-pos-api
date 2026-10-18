@@ -213,6 +213,16 @@ class OptionSelectionIn(BaseModel):
     quantity: int = Field(1, ge=1)
 
 
+class UpdateAdditionQuantityIn(BaseModel):
+    """Cuerpo de `PATCH /orders/items/{item_id}/additions/{option_id}`: la cantidad
+    absoluta nueva de una adición ya agregada a la línea (spec 123), igual convención
+    que `CartItemUpdate.quantity` -- no un delta. Puede subirla o bajarla, nunca a la
+    misma que ya tiene (`orders/additions.py` rechaza ese caso); `ge=1` ya impide
+    bajarla a 0 -- quitarla del todo sigue yendo por anular la línea."""
+
+    quantity: int = Field(..., ge=1)
+
+
 class OptionGroupCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, examples=["Sabores de helado"])
     min_select: int = Field(0, ge=0)

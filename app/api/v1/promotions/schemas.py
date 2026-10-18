@@ -64,7 +64,10 @@ class _VigenciaMixin(BaseModel):
 
     @model_validator(mode="after")
     def _date_range(self):
-        # `PromotionUpdate` no lleva `starts_at` (no editable tras crear).
+        # spec 127: `PromotionUpdate` SÍ lleva `starts_at` ahora (editable,
+        # solo en `draft` -- la guarda de estado vive en `service.update()`),
+        # para poder corregir una fecha de inicio que quedó mal calculada por
+        # el defecto de zona horaria que esta spec corrige (FR-005).
         starts_at = getattr(self, "starts_at", None)
         if starts_at and self.ends_at and self.ends_at.date() < starts_at.date():
             raise ValueError("ends_at no puede ser anterior a starts_at")
@@ -168,11 +171,19 @@ class PromotionUpdate(_VigenciaMixin):
     `variant_ids` ya no existen aquí — viven en cada `PromotionRule` y solo se
     editan por `PATCH /{id}/shape`, y solo en `draft` (el bloque completo de
     reglas queda de solo lectura fuera de `draft`, no campo por campo).
-    `starts_at` no editable tras crear.
-    """
+
+    `starts_at` (spec 127, FR-005): editable, pero solo mientras la
+    promoción sigue en `draft` (guarda de estado en `service.update()`, más
+    estricta que el resto de estos campos, que también se pueden editar en
+    `paused`) — una vez que una promoción llegó a estar `active` alguna vez,
+    su fecha de inicio ya no se toca. Existe para que una promoción guardada
+    con el defecto de zona horaria que esta spec corrige (día UTC en vez de
+    local) pueda corregirse manualmente desde el formulario de edición, sin
+    necesidad de una migración de datos (ver `spec.md`, Assumptions)."""
 
     name: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = Field(None, max_length=2000)
+    starts_at: datetime | None = None
     ends_at: datetime | None = None
     days_of_week: str | None = Field(None, max_length=20)
     start_time: time | None = None

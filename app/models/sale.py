@@ -101,6 +101,15 @@ class Sale(UUIDPrimaryKeyMixin, Base):
 
     status: Mapped[str] = mapped_column(String(10), nullable=False, server_default="issued")
 
+    # spec 123: distingue la venta del cobro normal del pedido ('original') de
+    # la que liquida un saldo pendiente generado por adiciones agregadas
+    # después de facturar ('complementario'). Toda venta anterior a esta spec
+    # nace/queda 'original' por el default -- es exactamente lo que era, la
+    # única clase de venta que existía hasta ahora (Principio VII).
+    kind: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="original"
+    )
+
     sold_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -123,6 +132,9 @@ class Sale(UUIDPrimaryKeyMixin, Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('issued', 'paid', 'void')", name="ck_sale_status"
+        ),
+        CheckConstraint(
+            "kind IN ('original', 'complementario')", name="ck_sale_kind"
         ),
         {"schema": "tenant"},
     )

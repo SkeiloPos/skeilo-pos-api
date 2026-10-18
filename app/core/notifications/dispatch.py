@@ -130,8 +130,15 @@ def notify_payment_completed(
     customer_name: str | None,
     billing_mode: str,
     invoice: Mapping[str, Any] | None = None,
+    origin_client_id: str | None = None,
 ) -> NotificationEvent:
-    """Una venta emitida (mismo disparador que `events.payment_completed`)."""
+    """Una venta emitida (mismo disparador que `events.payment_completed`).
+
+    `origin_client_id` (spec 125, FR-007): id de la pestaña/terminal que originó el
+    cobro, si lo mandó. Viaja en el payload persistido y se reenvía en el evento
+    `notification.created` (`InAppChannel.send()`) para que esa misma terminal pueda
+    silenciar su propio aviso sin afectar la entrega a las demás.
+    """
     return _dispatch(
         db, tenant_id,
         event_type="payment.completed",
@@ -143,5 +150,6 @@ def notify_payment_completed(
             "customer_name": customer_name,
             "billing_mode": billing_mode,
             "invoice": invoice,
+            "origin_client_id": origin_client_id,
         },
     )

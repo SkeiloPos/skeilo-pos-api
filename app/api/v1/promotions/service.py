@@ -57,13 +57,14 @@ def _tz(tenant: Tenant | None = None) -> ZoneInfo:
     return ZoneInfo(settings.TENANT_TIMEZONE)
 
 
-def local_now(now: datetime | None = None) -> datetime:
+def local_now(now: datetime | None = None, tenant: Tenant | None = None) -> datetime:
     """`now` como hora local **naive** del tenant. Acepta aware (convierte) o
-    naive (asume ya local)."""
+    naive (asume ya local). `tenant` (spec 127): si el caller ya lo resolvió,
+    se evalúa en SU zona horaria en vez del respaldo global de instancia."""
     if now is None:
-        return datetime.now(_tz()).replace(tzinfo=None)
+        return datetime.now(_tz(tenant)).replace(tzinfo=None)
     if now.tzinfo is not None:
-        return now.astimezone(_tz()).replace(tzinfo=None)
+        return now.astimezone(_tz(tenant)).replace(tzinfo=None)
     return now
 
 
@@ -80,10 +81,12 @@ def _in_time_window(current: time, start: time | None, end: time | None) -> bool
     return current >= start or current <= end
 
 
-def _valid_now(promo: Promotion, now: datetime) -> bool:
+def _valid_now(promo: Promotion, now: datetime, tenant: Tenant | None = None) -> bool:
     """`now` puede venir en UTC o local; se normaliza a hora local del tenant.
-    A-57 (atribución de día al cruzar medianoche) intacto."""
-    now = local_now(now)
+    A-57 (atribución de día al cruzar medianoche) intacto. `tenant` (spec
+    127): la zona horaria real del dueño de `promo`, si el caller la tiene
+    resuelta."""
+    now = local_now(now, tenant)
     if promo.status != "active":
         return False
     if promo.starts_at is not None and now < promo.starts_at:
@@ -141,13 +144,18 @@ class SetDiscountResult:
         return self.applied[0].promotion_id if len(self.applied) == 1 else None
 
 
-def active_variant_set_rules(db: Session, now: datetime) -> list[PromotionRule]:
+def active_variant_set_rules(
+    db: Session, now: datetime, tenant: Tenant | None = None
+) -> list[PromotionRule]:
     """spec 063 (revisión 2026-09-01): reglas `percent` / `package_price` de
     promociones **activas y vigentes ahora** (`_valid_now`, hora local del
     tenant, evaluado sobre la `Promotion` dueña). Reemplaza a
     `active_variant_set_promotions` (motor-y-persistencia.md §2); usa el
-    índice `ix_promotions_status_ends_at`."""
-    today: date = local_now(now).date()
+    índice `ix_promotions_status_ends_at`. `tenant` (spec 127): el tenant
+    propietario de las promociones que se están evaluando — si el caller lo
+    tiene resuelto (siempre debería, ver `research.md` de spec 127), se usa
+    su zona horaria real en vez del respaldo global de instancia."""
+    today: date = local_now(now, tenant).date()
     stmt = (
         select(PromotionRule)
         .join(PromotionRule.promotion)
@@ -162,7 +170,9 @@ def active_variant_set_rules(db: Session, now: datetime) -> list[PromotionRule]:
         )
     )
     return [
-        r for r in db.execute(stmt).scalars().all() if _valid_now(r.promotion, now)
+        r
+        for r in db.execute(stmt).scalars().all()
+        if _valid_now(r.promotion, now, tenant)
     ]
 
 
@@ -222,11 +232,15 @@ def _distribute_group_discount(group_units: list, discount: Decimal) -> dict:
     return {li: aporte[li] - cobrado[li] for li in aporte if aporte[li] != cobrado[li]}
 
 
-def evaluate_variant_sets(db: Session, promo_lines: list, now: datetime) -> SetDiscountResult:
+def evaluate_variant_sets(
+    db: Session, promo_lines: list, now: datetime, tenant: Tenant | None = None
+) -> SetDiscountResult:
     """Algoritmo normativo de contracts/motor-y-persistencia.md §3. spec 063
     (revisión 2026-09-01): agrupa por **regla** (antes: por promoción) — la
     vigencia se resuelve una vez por promoción (`active_variant_set_rules`) y
     se aplica a todas sus reglas; el cálculo por bloque no cambia de fórmula.
+    `tenant` (spec 127): reenviado a `active_variant_set_rules` para evaluar
+    vigencia en la zona horaria real del tenant.
 
     FR-027 (spec 083, sesión 2026-09-17): para `type == "percent"`, el `%` se
     aplica solo sobre `base_unit_price` (precio de la variante sin toppings),
@@ -240,7 +254,7 @@ def evaluate_variant_sets(db: Session, promo_lines: list, now: datetime) -> SetD
     toppings) trae `base_unit_price == unit_price`, así que esta rama no
     cambia nada para ese caso."""
     result = SetDiscountResult()
-    rules = active_variant_set_rules(db, now)
+    rules = active_variant_set_rules(db, now, tenant)
     if not rules:
         return result
 
@@ -854,7 +868,16 @@ def update(db: Session, promo: Promotion, data) -> Promotion:
             "Pausa la promoción antes de modificarla",
         )
     provided = data.model_fields_set
-    for field_name in ("name", "description", "ends_at",
+    # spec 127 (FR-005): `starts_at` es más estricto que el resto -- solo se
+    # puede corregir mientras la promoción sigue en `draft` (nunca llegó a
+    # estar vigente), para no alterar retroactivamente la fecha de inicio de
+    # una promoción que ya corrió alguna vez.
+    if "starts_at" in provided and promo.status != "draft":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "La fecha de inicio solo se puede corregir mientras la promoción sigue en Borrador",
+        )
+    for field_name in ("name", "description", "starts_at", "ends_at",
                        "days_of_week", "start_time", "end_time"):
         if field_name in provided:
             setattr(promo, field_name, getattr(data, field_name))

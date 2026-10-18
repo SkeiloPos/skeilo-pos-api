@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.audit import record_audit
 from app.core.crud import get_or_404
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -338,14 +338,15 @@ def promo_lines_for(db: Session, lines: list[SaleLine]) -> list[dict]:
 
 
 def auto_discount(
-    db: Session, lines: list[SaleLine], now: datetime,
+    db: Session, lines: list[SaleLine], now: datetime, tenant: Tenant | None = None,
 ) -> tuple[Decimal, UUID | None, list[dict]]:
     """`(descuento_automático_total, promotion_id, applied)` — motor por conjunto
     de variantes (spec 063). `promotion_id = applied[0].promotion_id` si una sola
     promoción explica el descuento, si no `None` (`applied_promotions` lo cubre —
     A-29 resuelto). `applied` es el snapshot serializable para
-    `Sale/Invoice/CustomerOrder.applied_promotions` (FR-021)."""
-    r = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), now)
+    `Sale/Invoice/CustomerOrder.applied_promotions` (FR-021). `tenant` (spec
+    127): si el caller lo tiene resuelto, evalúa vigencia en SU zona horaria."""
+    r = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), now, tenant)
     return r.total, r.single_promotion_id, promotions.applied_to_dicts(r.applied)
 
 
@@ -406,7 +407,9 @@ def line_discount_snapshot(
     return discounted_unit_price, discounted_line_total
 
 
-def refresh_order_item_discounts(db: Session, order: CustomerOrder) -> None:
+def refresh_order_item_discounts(
+    db: Session, order: CustomerOrder, tenant: Tenant | None = None
+) -> None:
     """spec 118 (research.md D1-D3, contracts/order-item-discount-snapshot.md):
     recalcula y sobrescribe `discounted_unit_price`/`discounted_line_total` de
     **todas** las líneas vigentes (`estado_cocina != "anulado"`) de `order`, no
@@ -424,7 +427,7 @@ def refresh_order_item_discounts(db: Session, order: CustomerOrder) -> None:
     (FR-002)."""
     lines = order_sale_lines(db, order.id)
     instant = promotion_evaluation_instant([order], now=datetime.now(timezone.utc))
-    result = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), instant)
+    result = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), instant, tenant)
     for idx, line in enumerate(lines):
         discounted_unit_price, discounted_line_total = line_discount_snapshot(
             result, idx, line.line_total, line.quantity, line.addons_total,
@@ -434,7 +437,9 @@ def refresh_order_item_discounts(db: Session, order: CustomerOrder) -> None:
         item.discounted_line_total = discounted_line_total
 
 
-def compute_checkout_preview(db: Session, order_id: UUID) -> CheckoutPreviewResponse:
+def compute_checkout_preview(
+    db: Session, order_id: UUID, tenant: Tenant | None = None
+) -> CheckoutPreviewResponse:
     """spec 073 (FR-001…FR-007a): desglose autoritativo de un pedido **ya
     persistido** y aún no cobrado — mesa individual atendida por la Terminal,
     para llevar o domicilio. Solo lectura: sin `db.commit()`, sin `build_sale`,
@@ -456,7 +461,7 @@ def compute_checkout_preview(db: Session, order_id: UUID) -> CheckoutPreviewResp
     raw_subtotal = sum((line.line_total for line in lines), start=Decimal("0"))
 
     instant = promotion_evaluation_instant([order], now=datetime.now(timezone.utc))
-    promo_discount, _, _ = auto_discount(db, lines, instant)
+    promo_discount, _, _ = auto_discount(db, lines, instant, tenant)
 
     delivery_fee = order.delivery_fee or Decimal("0")
     total = max(
@@ -473,7 +478,9 @@ def compute_checkout_preview(db: Session, order_id: UUID) -> CheckoutPreviewResp
     )
 
 
-def compute_draft_preview(db: Session, data: DraftPreviewIn) -> CheckoutPreviewResponse:
+def compute_draft_preview(
+    db: Session, data: DraftPreviewIn, tenant: Tenant | None = None
+) -> CheckoutPreviewResponse:
     """spec 073 (FR-013 a FR-015a): desglose de un pedido **hipotético** —
     todavía sin `CustomerOrder` — mientras el cajero arma una orden manual.
     Reusa el mismo motor que el cobro real (`auto_discount` + `compute_total`),
@@ -515,7 +522,7 @@ def compute_draft_preview(db: Session, data: DraftPreviewIn) -> CheckoutPreviewR
 
     raw_subtotal = sum((line.line_total for line in lines), start=Decimal("0"))
     now = datetime.now(timezone.utc)  # sin congelar (FR-008)
-    promo_discount, _, _ = auto_discount(db, lines, now)
+    promo_discount, _, _ = auto_discount(db, lines, now, tenant)
     delivery_fee = data.delivery_fee or Decimal("0")
     total = max(
         Decimal("0"),
@@ -531,7 +538,9 @@ def compute_draft_preview(db: Session, data: DraftPreviewIn) -> CheckoutPreviewR
     )
 
 
-def pay_order(db: Session, order_id: UUID, data: PayIn, cashier: User) -> Sale:
+def pay_order(
+    db: Session, order_id: UUID, data: PayIn, cashier: User, tenant: Tenant | None = None
+) -> Sale:
     order = get_or_404(db, CustomerOrder, order_id, "Order not found")
     if order.status != "bloqueada":
         raise HTTPException(
@@ -548,7 +557,7 @@ def pay_order(db: Session, order_id: UUID, data: PayIn, cashier: User) -> Sale:
         lines = order_sale_lines(db, order.id)
 
         # Descuento automático (RF-012): motor por conjunto de variantes (spec 063).
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
 
         sale = build_sale(
             db,
@@ -709,6 +718,7 @@ def checkout_and_send(
     data: CheckoutAndSendIn,
     cashier: User,
     request_id: str | None = None,
+    tenant: Tenant | None = None,
 ) -> Sale:
     """Cobra y envía a cocina, en una sola transacción, una comanda creada con
     `hold_for_payment=True` (spec 028, T012/T013): el mostrador/mesero cobra
@@ -756,7 +766,7 @@ def checkout_and_send(
 
         # Descuento automático (RF-012), igual que `pay_order`: motor por
         # conjunto de variantes (spec 063).
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
 
         sale = build_sale(
             db,

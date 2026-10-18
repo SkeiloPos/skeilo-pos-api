@@ -105,6 +105,10 @@ class SessionBillResponse(BaseModel):
     total: Decimal
     order_ids: list[UUID] = Field(default_factory=list)
     split: list[SessionBillLine] = Field(default_factory=list)
+    # spec 123: saldo pendiente acumulado de todas las órdenes no canceladas
+    # de la sesión (adiciones agregadas después de facturar, aún sin cobrar).
+    # Campo aditivo: 0 cuando no hay saldo pendiente.
+    pending_balance: Decimal = Decimal("0")
 
 
 class SplitPaymentIn(BaseModel):
@@ -146,6 +150,13 @@ class CloseSessionIn(BaseModel):
         description="Solo en billing_mode='split': un bloque de pago por comensal. "
                     "Debe cubrir a todos los que tengan consumo.",
     )
+
+    # spec 125 (FR-007): id de la pestaña/terminal que origina el cierre, para que
+    # esa misma terminal pueda silenciar su propio aviso de pago en tiempo real sin
+    # dejar de notificar a las demás. Opaco, opcional y retrocompatible — sin él,
+    # ninguna terminal se silencia (comportamiento actual). Aplica a todas las
+    # ventas emitidas por este cierre (unificado o una por comensal en dividido).
+    origin_client_id: str | None = Field(None, max_length=64)
 
 
 class CloseSessionResponse(BaseModel):
