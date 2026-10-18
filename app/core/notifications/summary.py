@@ -3,7 +3,18 @@ lo necesitan (`in_app`, `browser_push`) — mantiene el frontend/push desacoplad
 de la forma del `payload` de cada `event_type` (research.md §4)."""
 from __future__ import annotations
 
+from decimal import Decimal
+
 from app.models.notification_event import NotificationEvent
+
+
+def _formato_pesos_espacio(valor) -> str:
+    """`$ 22.000`: punto de miles, espacio tras el "$", sin decimales — mismo
+    criterio que `formatMoney()` del frontend (spec 035). Distinto del
+    `format_pesos()` de `cash/denominations.py` (sin espacio, con decimales),
+    que sirve a otra pantalla y no se toca (spec 125, research.md R2)."""
+    entero = int(Decimal(str(valor)))
+    return "$ " + f"{entero:,}".replace(",", ".")
 
 
 def summarize(event: NotificationEvent) -> str:
@@ -22,5 +33,8 @@ def summarize(event: NotificationEvent) -> str:
         return " · ".join(partes) if partes else "Pedido nuevo"
     if event.event_type == "payment.completed":
         total = payload.get("total")
-        return f"Pago recibido · ${total}" if total is not None else "Pago recibido"
+        return (
+            f"Pago recibido · {_formato_pesos_espacio(total)}"
+            if total is not None else "Pago recibido"
+        )
     return event.event_type

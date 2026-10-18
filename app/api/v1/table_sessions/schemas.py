@@ -151,6 +151,13 @@ class CloseSessionIn(BaseModel):
                     "Debe cubrir a todos los que tengan consumo.",
     )
 
+    # spec 125 (FR-007): id de la pestaña/terminal que origina el cierre, para que
+    # esa misma terminal pueda silenciar su propio aviso de pago en tiempo real sin
+    # dejar de notificar a las demás. Opaco, opcional y retrocompatible — sin él,
+    # ninguna terminal se silencia (comportamiento actual). Aplica a todas las
+    # ventas emitidas por este cierre (unificado o una por comensal en dividido).
+    origin_client_id: str | None = Field(None, max_length=64)
+
 
 class CloseSessionResponse(BaseModel):
     table_session: TableSessionResponse

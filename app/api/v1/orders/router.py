@@ -621,6 +621,7 @@ def pay_order(
         total=sale.total,
         customer_name=order.customer_name if order else None,
         billing_mode="counter",
+        origin_client_id=body.origin_client_id,
     )
     return sale
 
@@ -658,6 +659,7 @@ def checkout_and_send(
         total=sale.total,
         customer_name=order.customer_name if order else None,
         billing_mode="counter",
+        origin_client_id=body.origin_client_id,
     )
     if order is not None:
         events.order_confirmed(
