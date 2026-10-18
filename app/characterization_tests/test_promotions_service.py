@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from app.characterization_tests import cart_fixtures as fx
 from app.api.v1.promotions import service as promotions
+from app.core.models import Tenant
 
 NOW = datetime(2026, 8, 5, 18, 0, tzinfo=timezone.utc)  # miércoles, 13:00 Bogotá
 
@@ -315,6 +316,72 @@ class TestEvaluateVariantSets(unittest.TestCase):
         r = promotions.evaluate_variant_sets(self.db, [linea], NOW)
         # Descuento = base(6000) - promo(5000) = 1000 -- nunca sobre 9500 (total final 8500).
         self.assertEqual(r.total, Decimal("1000.00"))
+
+
+class TestEvaluateVariantSetsTenantTimezone(unittest.TestCase):
+    """spec 127 (FR-002): la vigencia se evalúa en la zona horaria REAL del
+    tenant propietario de la promoción, no en el respaldo global de
+    instancia (`settings.TENANT_TIMEZONE` = America/Bogota, UTC-5) — antes
+    de esta spec, ningún llamador pasaba nunca un `tenant`, así que todos
+    coincidían por casualidad con ese respaldo global."""
+
+    def setUp(self):
+        self.db = fx.new_session()
+        self.prod = fx.make_product(self.db)
+        self.variant = fx.make_variant(
+            self.db, product=self.prod, price=Decimal("8000"), name=f"v-{uuid4()}",
+        )
+        # Ventana angosta (22:00-23:00, todos los días) elegida para que un
+        # único instante UTC caiga DENTRO de la ventana en una zona horaria y
+        # FUERA en otra.
+        self.promo = fx.make_promotion(
+            self.db, status="active", start_time=time(22, 0), end_time=time(23, 0),
+        )
+        fx.add_rule_to_promotion(
+            self.db, self.promo, type="package_price", value=Decimal("5000"),
+            min_qty=1, variants=[self.variant],
+        )
+        self.db.commit()
+
+    def _lines(self):
+        return [_line(self.variant, 1)]
+
+    def test_mismo_instante_vigente_en_bogota_no_vigente_en_mexico(self):
+        # 2026-08-06T03:30:00Z: 22:30 en Bogotá (UTC-5, DENTRO de 22:00-23:00)
+        # pero 21:30 en Ciudad de México (UTC-6, FUERA de 22:00-23:00).
+        instant = datetime(2026, 8, 6, 3, 30, tzinfo=timezone.utc)
+        bogota = Tenant(timezone="America/Bogota")
+        mexico = Tenant(timezone="America/Mexico_City")
+
+        r_bogota = promotions.evaluate_variant_sets(self.db, self._lines(), instant, bogota)
+        r_mexico = promotions.evaluate_variant_sets(self.db, self._lines(), instant, mexico)
+
+        self.assertEqual(r_bogota.total, Decimal("3000.00"))  # 8000 - 5000, vigente
+        self.assertEqual(r_mexico.total, Decimal("0"))        # fuera de ventana, sin descuento
+
+    def test_sin_tenant_cae_al_respaldo_global_equivalente_a_bogota(self):
+        instant = datetime(2026, 8, 6, 3, 30, tzinfo=timezone.utc)
+
+        r_sin_tenant = promotions.evaluate_variant_sets(self.db, self._lines(), instant)
+        r_bogota = promotions.evaluate_variant_sets(
+            self.db, self._lines(), instant, Tenant(timezone="America/Bogota"),
+        )
+
+        self.assertEqual(r_sin_tenant.total, r_bogota.total)
+        self.assertEqual(r_sin_tenant.total, Decimal("3000.00"))
+
+    def test_active_variant_set_rules_tambien_distingue_por_tenant(self):
+        """Mismo caso, a nivel de `active_variant_set_rules` (lo que consume
+        el menú público) -- no solo `evaluate_variant_sets` (carrito/cobro)."""
+        instant = datetime(2026, 8, 6, 3, 30, tzinfo=timezone.utc)
+        bogota = Tenant(timezone="America/Bogota")
+        mexico = Tenant(timezone="America/Mexico_City")
+
+        reglas_bogota = promotions.active_variant_set_rules(self.db, instant, bogota)
+        reglas_mexico = promotions.active_variant_set_rules(self.db, instant, mexico)
+
+        self.assertEqual(len(reglas_bogota), 1)
+        self.assertEqual(len(reglas_mexico), 0)
 
 
 if __name__ == "__main__":

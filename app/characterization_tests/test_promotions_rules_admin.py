@@ -340,6 +340,36 @@ class TestUS5DuplicarEditarEstados(unittest.TestCase):
         self.db.commit()
         self.assertEqual(self.activa.name, "pausada renombrada")
 
+    def test_ca1c_starts_at_editable_en_draft_bloqueada_en_pausada_spec_127(self):
+        """spec 127 (FR-005): `starts_at` ahora viaja en `PromotionUpdate`,
+        pero es más estricta que el resto de los campos -- solo se acepta
+        mientras la promoción sigue en `draft` (nunca llegó a estar
+        vigente); en `paused` (que ya pasó por `active` alguna vez) se
+        rechaza con 409, aunque el resto de los campos escalares sí se
+        puedan seguir editando ahí (test_ca1b)."""
+        draft = service.create(self.db, _create_payload(
+            name="en borrador", type="percent", value=Decimal("10"), min_qty=1,
+            variant_ids=[self.v_otro_producto.id],
+        ))
+        self.db.commit()
+        nueva_fecha = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+        service.update(self.db, draft, PromotionUpdate(starts_at=nueva_fecha))
+        self.db.commit()
+        # SQLite no preserva tzinfo (Postgres sí) -- se compara el instante naive.
+        self.assertEqual(draft.starts_at, nueva_fecha.replace(tzinfo=None))
+
+        service.change_status(self.db, draft, "active")
+        service.change_status(self.db, draft, "paused")
+        self.db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.update(self.db, draft, PromotionUpdate(
+                starts_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            ))
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.db.rollback()
+
     def test_ca2_cambiar_reglas_de_una_activa_bloquea(self):
         """spec 063 (revisión 2026-09-01, FR-018): `PromotionUpdate` ya no
         tiene `value`/`min_qty`/conjunto — el único camino para tocar una

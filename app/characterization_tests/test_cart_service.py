@@ -25,6 +25,7 @@ from sqlalchemy.exc import MultipleResultsFound
 
 from app.characterization_tests import cart_fixtures
 from app.api.v1.cart import service
+from app.core.models import Tenant
 from app.api.v1.cart.schemas import (
     CartItemIn, CartItemUpdate, CartResponse, SessionOpenResponse,
 )
@@ -193,6 +194,38 @@ class TestCartService(unittest.TestCase):
 
         self.assertIsNotNone(resp.discounted_total)
         self.assertLess(resp.discounted_total, resp.total)
+
+    def test_serialize_cart_mismo_instante_distinto_tenant_distinto_descuento(self):
+        """spec 127 (FR-002/FR-003): mismo instante real, resultado de
+        vigencia distinto según la zona horaria del `tenant` -- antes de esta
+        spec `serialize_cart` nunca recibía ningún `tenant`, así que todos los
+        tenants caían al mismo respaldo global (`America/Bogota`)."""
+        db, table, ts, participant = self._seed_session()
+        variant, product, category = self._seed_variant(db)
+        promo = cart_fixtures.make_promotion(
+            db, status="active", start_time=time(22, 0), end_time=time(23, 0),
+        )
+        cart_fixtures.add_rule_to_promotion(
+            db, promo, type="percent", value=Decimal("20"), min_qty=1,
+            variants=[variant],
+        )
+
+        # 2026-08-06T03:30:00Z: 22:30 en Bogotá (UTC-5, DENTRO de 22:00-23:00)
+        # pero 21:30 en Ciudad de México (UTC-6, FUERA de 22:00-23:00).
+        instant = datetime(2026, 8, 6, 3, 30, tzinfo=timezone.utc)
+        with cart_fixtures.frozen_now(instant):
+            service.add_item(
+                db, participant.id,
+                CartItemIn(product_variant_id=variant.id, quantity=1),
+            )
+            resp_bogota = service.get_cart(db, participant.id, Tenant(timezone="America/Bogota"))
+            resp_mexico = service.get_cart(
+                db, participant.id, Tenant(timezone="America/Mexico_City")
+            )
+
+        self.assertIsNotNone(resp_bogota.discounted_total)
+        self.assertLess(resp_bogota.discounted_total, resp_bogota.total)
+        self.assertIsNone(resp_mexico.discounted_total)
 
     # ------------------------------------------------------------------ get_cart (T013)
 

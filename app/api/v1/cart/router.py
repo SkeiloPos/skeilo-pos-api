@@ -74,7 +74,7 @@ async def open_session(body: SessionOpenIn, request: Request):
 
 @router.get("", response_model=CartResponse, summary="Ver carrito de la sesión")
 def get_cart(ctx: SessionContext = Depends(get_session_context)):
-    return service.get_cart(ctx.db, ctx.participant.id)
+    return service.get_cart(ctx.db, ctx.participant.id, ctx.tenant)
 
 
 @router.post(
@@ -88,7 +88,7 @@ async def add_item(
     ctx: SessionContext = Depends(get_session_context),
 ):
     await rate_limit(request, "cart_items", table_id=ctx.table_id)
-    return service.add_item(ctx.db, ctx.participant.id, body)
+    return service.add_item(ctx.db, ctx.participant.id, body, ctx.tenant)
 
 
 @router.patch(
@@ -98,14 +98,14 @@ def update_item(
     item_id: UUID, body: CartItemUpdate,
     ctx: SessionContext = Depends(get_session_context),
 ):
-    return service.update_item(ctx.db, ctx.participant.id, item_id, body)
+    return service.update_item(ctx.db, ctx.participant.id, item_id, body, ctx.tenant)
 
 
 @router.delete(
     "/items/{item_id}", response_model=CartResponse, summary="Quitar línea del carrito"
 )
 def remove_item(item_id: UUID, ctx: SessionContext = Depends(get_session_context)):
-    return service.remove_item(ctx.db, ctx.participant.id, item_id)
+    return service.remove_item(ctx.db, ctx.participant.id, item_id, ctx.tenant)
 
 
 @router.post(
@@ -154,7 +154,7 @@ async def submit_cart(
     order = service.submit_cart(
         ctx.db, ctx.participant, body.payment_method_id, body.receipt_file_url,
         tenant_id=ctx.tenant.id, request_id=current_request_id(request),
-        tenant_schema=ctx.tenant.schema,
+        tenant_schema=ctx.tenant.schema, tenant=ctx.tenant,
     )
     # Después del COMMIT del servicio, nunca dentro: si la transacción fallara no
     # puede haber salido un evento anunciando un pedido que no existe.
