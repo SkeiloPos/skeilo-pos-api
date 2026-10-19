@@ -92,6 +92,23 @@ class MenuVariantResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MenuToppingResponse(BaseModel):
+    """spec 129 (FR-009, research.md D5): una adición disponible para personalizar
+    este producto. `id` es el del producto-adición (`ProductTopping.topping_product_id`),
+    no el de su variante -- el comensal/cajero no elige variante de la adición, solo
+    cuántas unidades (FR-018)."""
+
+    id: UUID
+    name: str
+    # Precio de catálogo de la variante principal de la adición (FR-017: siempre el
+    # mismo, nunca un recargo propio del producto que la ofrece).
+    unit_price: Decimal
+    # `False` si la adición está inactiva/agotada o su variante principal no tiene
+    # stock suficiente -- mismo criterio de disponibilidad que cualquier producto/
+    # opción del menú.
+    available: bool = True
+
+
 class MenuProductResponse(BaseModel):
     id: UUID
     name: str
@@ -101,6 +118,9 @@ class MenuProductResponse(BaseModel):
     # aún no migrada incluida (FR-009b).
     image_url: AssetUrl = None
     variants: list[MenuVariantResponse] = Field(default_factory=list)
+    # spec 129 (FR-009): adiciones disponibles para personalizar este producto,
+    # resueltas desde `ProductTopping`. Sin relación con `option_groups` (sabores).
+    toppings: list[MenuToppingResponse] = Field(default_factory=list)
     # Unión de los grupos de todas las presentaciones. **Solo sirve para resolver
     # nombres y precios de una opción** (tickets, comandas, carrito): su `min/max_select`
     # es el de la primera presentación que lo ofrece y no significa nada. Para saber

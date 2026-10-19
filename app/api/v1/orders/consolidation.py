@@ -6,7 +6,9 @@ Es la vía del mesero, alternativa a que el comensal envíe su propio pedido des
 el QR (`POST /cart/submit` → `POST /orders/{id}/confirm`). A diferencia de esa,
 aquí la línea nace ya confirmada: el staff la mete y el stock se descuenta."""
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -14,7 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.crud import get_or_404
-from app.core.models import User
+from app.core.models import Tenant, User
+from app.core.plan_limits import has_module_access
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
 from app.models.session_participant import SessionParticipant
@@ -25,8 +28,10 @@ from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_
 from app.models.product_variant import ProductVariant
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem, OrderItemOption
+from app.api.v1.orders import topping_lines
 from app.api.v1.orders.consumption import deduct_order_items, deduct_order_items_naming_product
 from app.api.v1.catalog.line_pricing import (
+    check_availability,
     ensure_product_available,
     load_valid_options,
 )
@@ -198,12 +203,17 @@ def consolidate_table(db: Session, table_id: UUID, user: User) -> CustomerOrder:
 def _reload_order(db: Session, order_id: UUID) -> CustomerOrder:
     return db.execute(
         select(CustomerOrder)
-        .options(selectinload(CustomerOrder.items).selectinload(OrderItem.options))
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
         .where(CustomerOrder.id == order_id)
     ).scalar_one()
 
 
-def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> CustomerOrder:
+def add_item_to_order(
+    db: Session, order_id: UUID, data, user: User, tenant: Tenant | None = None,
+) -> CustomerOrder:
     """Inserta uno o varios order_items en un pedido específico ya identificado
     por `order_id` (add directo del mesero). Mismo descuento de inventario por
     ítem que la consolidación.
@@ -213,7 +223,12 @@ def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> Customer
     la mesa" que resolver de forma implícita; el llamador siempre identifica el
     pedido exacto al que anexa. Un pedido `pagada`/`cancelada` rechaza el anexo.
 
-    spec 063 (FR-024): el mecanismo de combo se retira; `combo_id` ya no llega."""
+    spec 063 (FR-024): el mecanismo de combo se retira; `combo_id` ya no llega.
+
+    `tenant` (spec 129) gobierna si `data.toppings` descuenta inventario -- mismo
+    criterio que `orders.service.create_order` y
+    `orders.toppings.add_topping_to_order_item`; resuelto en esta MISMA transacción
+    en vez de con una llamada aparte por adición (N+1 evitable)."""
     order = get_or_404(db, CustomerOrder, order_id, "Order not found")
     if order.status in ("pagada", "cancelada"):
         raise HTTPException(
@@ -230,16 +245,25 @@ def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> Customer
     options = mark_per_line(db, options, qr_addons_per_line=False)
     lines = [(variant.id, data.quantity, options, None)]
 
+    inventario_activo = tenant is not None and has_module_access(db, tenant, "inventario")
+
     try:
         entries: list[tuple[OrderItem, list[ChosenOption]]] = []
+        topping_rows: list[tuple[OrderItem, list[topping_lines.ResolvedTopping]]] = []
+        topping_consumption: dict[UUID, Decimal] = defaultdict(Decimal)
         for product_variant_id, quantity, options, combo_id in lines:
+            resolved_toppings, toppings_total = topping_lines.resolve_toppings(
+                db, variant.product_id, data.toppings,
+            )
             item = OrderItem(
                 order_id=order.id,
                 participant_id=None,  # ítem agregado por el mesero, sin comensal asignado
                 product_variant_id=product_variant_id,
                 quantity=quantity,
                 unit_price=compute_unit_price(variant, options),
-                addons_total=compute_addons_total(options),
+                # spec 129 (FR-017/FR-007): precio de catálogo de cada adición, una vez
+                # por línea -- nunca multiplicado por `quantity`.
+                addons_total=compute_addons_total(options) + toppings_total,
                 notes=data.notes,
                 combo_id=combo_id,
                 estado_cocina="pendiente",
@@ -252,9 +276,21 @@ def add_item_to_order(db: Session, order_id: UUID, data, user: User) -> Customer
                     per_line=chosen.per_line,
                 ))
             entries.append((item, options))
+            if resolved_toppings:
+                topping_rows.append((item, resolved_toppings))
+                if inventario_activo:
+                    topping_lines.accumulate_consumption(db, resolved_toppings, topping_consumption)
+
+        for item, resolved_toppings in topping_rows:
+            topping_lines.persist_toppings(db, item, resolved_toppings)
 
         # spec 089 (A-96): un insumo agotado nombra el PRODUCTO, no solo el insumo.
         deduct_order_items_naming_product(db, entries, user.id, reference_id=order.id)
+
+        if inventario_activo and topping_consumption:
+            check_availability(db, topping_consumption, extra_context="agregar producto")
+            for item, resolved_toppings in topping_rows:
+                topping_lines.deduct_toppings(db, resolved_toppings, user.id, order.id)
 
         # spec 118 (research.md D3): caso central de la Historia 2 -- una
         # segunda unidad agregada en otro momento recalcula el descuento de

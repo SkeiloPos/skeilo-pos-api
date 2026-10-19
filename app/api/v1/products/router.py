@@ -43,10 +43,17 @@ def list_products(
         None, description="Filtra por disponibilidad (spec 093: Disponibles/Agotados)."
     ),
     search: str | None = Query(None, description="Búsqueda por nombre."),
+    is_topping: bool | None = Query(
+        None,
+        description=(
+            "spec 129: filtra por si el producto está marcado como adición "
+            "(topping) -- usado por el selector de 'Adiciones disponibles'."
+        ),
+    ),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    return paginate(db, service.list_query(active, search, available), page, size)
+    return paginate(db, service.list_query(active, search, available, is_topping), page, size)
 
 
 @router.get(

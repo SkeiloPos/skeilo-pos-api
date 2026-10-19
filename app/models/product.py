@@ -8,6 +8,7 @@ from datetime import datetime
 if TYPE_CHECKING:
     from .category import Category
     from .product_variant import ProductVariant
+    from .product_topping import ProductTopping
 
 
 class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -69,6 +70,23 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(150), nullable=True
     )
 
+    # spec 129: marca este producto como una adición (topping) ofrecible dentro de
+    # otros productos, además de poder venderse como línea independiente. No excluye
+    # ninguna capacidad normal de producto (precio, receta, variantes, categoría).
+    is_topping: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    # spec 129 (FR-010/FR-011, research.md D6): visibilidad específica del menú QR,
+    # independiente de `active`/`available` -- mismo patrón que `Category.visible_en_qr`
+    # (spec 128). El `server_default` aquí protege cualquier INSERT que no pase por
+    # `ProductService` (fixtures, scripts): default `true`. El default de negocio real
+    # (`false` cuando `is_topping=true`) se calcula en `ProductService.create_product`,
+    # no aquí -- mismo criterio que `OptionGroupCreate.selection_mode` (spec 065).
+    visible_en_qr: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
     # Los grupos de opciones cuelgan de la VARIANTE (`variant_option_groups`), no de
     # aquí: cuántos sabores se eligen y cuánto descuenta cada uno cambian con el tamaño.
     # order_by (spec 042): quien recorra `product.variants` (p. ej. el Menú QR,
@@ -78,6 +96,15 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="product",
         cascade="all, delete-orphan",
         order_by="ProductVariant.display_order",
+    )
+
+    # spec 129: adiciones que este producto ofrece (no las que este producto ES como
+    # adición de otro -- ver `ProductTopping.topping_product_id` para eso, sin
+    # relación inversa necesaria todavía).
+    toppings: Mapped[List["ProductTopping"]] = relationship(
+        foreign_keys="ProductTopping.product_id",
+        back_populates="product",
+        cascade="all, delete-orphan",
     )
 
     __table_args__ = (
