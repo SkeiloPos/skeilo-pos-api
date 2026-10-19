@@ -4,6 +4,7 @@ from .category import Category
 from .unit_measure import UnitMeasure
 from .product import Product
 from .product_variant import ProductVariant
+from .product_topping import ProductTopping
 from .option_group import OptionGroup
 from .option import Option
 from .variant_option_group import VariantOptionGroup
@@ -34,9 +35,9 @@ from .dining_table import DiningTable
 from .table_session import TableSession
 from .session_participant import SessionParticipant
 from .cart import Cart
-from .cart_item import CartItem, CartItemOption
+from .cart_item import CartItem, CartItemOption, CartItemTopping
 from .customer_order import CustomerOrder
-from .order_item import OrderItem, OrderItemOption
+from .order_item import OrderItem, OrderItemOption, OrderItemTopping
 from .order_cancel_log import OrderCancelLog
 from .order_item_void_log import OrderItemVoidLog
 from .order_payment_attempt import OrderPaymentAttempt

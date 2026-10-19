@@ -64,7 +64,10 @@ def mark_order_ready(db: Session, order_id: UUID) -> tuple[CustomerOrder, list[O
     ítems que cambiaron, porque el router emite un evento por cada uno."""
     order = db.execute(
         select(CustomerOrder)
-        .options(selectinload(CustomerOrder.items).selectinload(OrderItem.options))
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
         .where(CustomerOrder.id == order_id)
     ).scalar_one_or_none()
     if order is None:
@@ -188,6 +191,9 @@ def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> Custo
 
     return db.execute(
         select(CustomerOrder)
-        .options(selectinload(CustomerOrder.items).selectinload(OrderItem.options))
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
         .where(CustomerOrder.id == order_id)
     ).scalar_one()

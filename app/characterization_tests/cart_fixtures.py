@@ -79,6 +79,7 @@ from app.models.cash_shift import CashShift
 _CATALOG_TABLE_NAMES = [
     "categories",
     "products",
+    "product_toppings",
     "product_variants",
     "presentations",  # spec 084 (A-79): la variante depende de su presentación
     "option_groups",
@@ -97,9 +98,11 @@ _CART_TABLE_NAMES = [
     "carts",
     "cart_items",
     "cart_item_options",
+    "cart_item_toppings",
     "customer_orders",
     "order_items",
     "order_item_options",
+    "order_item_toppings",
     "promotions",
     # spec 063 (revisión 2026-09-01): una promoción agrupa una o más reglas.
     "promotion_rules",

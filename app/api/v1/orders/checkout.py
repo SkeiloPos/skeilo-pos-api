@@ -138,6 +138,7 @@ def _reload_order(db: Session, order_id: UUID) -> CustomerOrder:
         select(CustomerOrder)
         .options(
             selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
             selectinload(CustomerOrder.payment_attempts)
             .selectinload(OrderPaymentAttempt.payment_method),
         )
@@ -644,7 +645,10 @@ def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrde
     `confirm_cash_payment_attempt`) no cambia."""
     order = db.execute(
         select(CustomerOrder)
-        .options(selectinload(CustomerOrder.items).selectinload(OrderItem.options))
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
         .where(CustomerOrder.id == order_id)
         .with_for_update(of=CustomerOrder)
     ).scalar_one_or_none()
@@ -740,7 +744,10 @@ def checkout_and_send(
     try:
         order = db.execute(
             select(CustomerOrder)
-            .options(selectinload(CustomerOrder.items).selectinload(OrderItem.options))
+            .options(
+                selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+                selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+            )
             .where(CustomerOrder.id == order_id)
             .with_for_update(of=CustomerOrder)
         ).scalar_one_or_none()
@@ -883,7 +890,10 @@ def cancel_order(
     """
     order = db.execute(
         select(CustomerOrder)
-        .options(selectinload(CustomerOrder.items).selectinload(OrderItem.options))
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
         .where(CustomerOrder.id == order_id)
     ).scalar_one_or_none()
     if order is None:

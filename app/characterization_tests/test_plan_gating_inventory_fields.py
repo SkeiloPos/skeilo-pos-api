@@ -32,7 +32,7 @@ _TABLE_NAMES = [
     "tenants", "plans", "roles", "users", "user_invitations",
     "dining_tables", "cash_registers", "payment_methods",
     # fixtures.py (catalog)
-    "categories", "products", "product_variants",
+    "categories", "products", "product_toppings", "product_variants",
     "option_groups", "options", "variant_option_groups",
     "recipe_items", "inventory_items", "inventory_movements", "unit_measures",
     # spec 083: create_product consulta estas dos tablas incluso cuando la

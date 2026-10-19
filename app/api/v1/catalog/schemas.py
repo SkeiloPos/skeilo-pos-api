@@ -213,6 +213,25 @@ class OptionSelectionIn(BaseModel):
     quantity: int = Field(1, ge=1)
 
 
+class ToppingSelectionIn(BaseModel):
+    """Una adición (producto-topping) elegida junto con cuántas unidades de ella
+    (spec 129, FR-018). Igual forma que `OptionSelectionIn`, pero referenciando un
+    producto marcado `is_topping=true` en vez de una `Option` -- las adiciones ya no
+    viven en grupos de opciones (research.md D4 de spec 129). Compartida por
+    `CartItemIn`/`CartItemUpdate` y `POST /orders/items/{item_id}/toppings`."""
+
+    topping_product_id: UUID
+    quantity: int = Field(1, ge=1)
+
+
+class UpdateToppingQuantityIn(BaseModel):
+    """Cuerpo de `PATCH /orders/items/{item_id}/toppings/{topping_product_id}`: la
+    cantidad absoluta nueva de una adición ya agregada a la línea (spec 129), mismo
+    criterio que `UpdateAdditionQuantityIn` -- no un delta."""
+
+    quantity: int = Field(..., ge=1)
+
+
 class UpdateAdditionQuantityIn(BaseModel):
     """Cuerpo de `PATCH /orders/items/{item_id}/additions/{option_id}`: la cantidad
     absoluta nueva de una adición ya agregada a la línea (spec 123), igual convención

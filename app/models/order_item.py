@@ -84,6 +84,12 @@ class OrderItem(UUIDPrimaryKeyMixin, Base):
         back_populates="order_item", cascade="all, delete-orphan"
     )
 
+    # spec 129: adiciones (productos-topping) adjuntas a esta línea -- ver
+    # `OrderItemTopping` abajo. Distinto de `options` (sabores).
+    toppings: Mapped[List["OrderItemTopping"]] = relationship(
+        back_populates="order_item", cascade="all, delete-orphan"
+    )
+
     @property
     def line_total(self) -> Decimal:
         """spec 089: la única fórmula del total de una línea, sin descuento:
@@ -150,6 +156,54 @@ class OrderItemOption(UUIDPrimaryKeyMixin, Base):
     )
 
 
+class OrderItemTopping(UUIDPrimaryKeyMixin, Base):
+    """Adición (producto-topping) adjunta a una línea de pedido (spec 129). Espejo de
+    `OrderItemOption`, incluido el mecanismo de spec 123 (`added_after_sale`/
+    `complementary_sale_id`) para una adición agregada después de emitida la venta --
+    pero referenciando la variante de un producto-adición en vez de una `Option`."""
+
+    __tablename__ = "order_item_toppings"
+
+    order_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("order_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    order_item: Mapped["OrderItem"] = relationship(back_populates="toppings")
+
+    topping_product_variant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("product_variants.id"), nullable=False, index=True
+    )
+
+    # spec 129 (FR-018): cantidad libre, igual criterio que `OrderItemOption.quantity`.
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+
+    # Snapshot copiado del carrito al confirmar (o fijado directamente si se agrega
+    # después de confirmado el pedido) -- nunca recalculado, mismo criterio que el
+    # resto de `order_items` (FR-017: siempre el precio de catálogo de la adición).
+    unit_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=0, server_default="0"
+    )
+
+    # spec 123 (ver `OrderItemOption.added_after_sale`): `true` si, al insertarse esta
+    # fila, el pedido ya tenía una `Sale` emitida.
+    added_after_sale: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+
+    # spec 123 (ver `OrderItemOption.complementary_sale_id`).
+    complementary_sale_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("sales.id"), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "order_item_id", "topping_product_variant_id",
+            name="uq__order_item_toppings__order_item_id__topping_variant_id",
+        ),
+        CheckConstraint("quantity > 0", name="ck_order_item_toppings_quantity_positive"),
+        {"schema": "tenant"},
+    )
+
+
 # spec 087 (FR-015, A-89, research.md D12): nombre de la opción y de su grupo,
 # derivados en lectura con subconsultas escalares correlacionadas. Viajan en el
 # mismo SELECT que la fila (sin N+1 y sin tocar los `selectinload(OrderItem.options)`
@@ -158,6 +212,8 @@ class OrderItemOption(UUIDPrimaryKeyMixin, Base):
 # Se definen después de la clase para poder referenciar `Option`/`OptionGroup`.
 from app.models.option import Option  # noqa: E402
 from app.models.option_group import OptionGroup  # noqa: E402
+from app.models.product_variant import ProductVariant  # noqa: E402
+from app.models.product import Product  # noqa: E402
 
 OrderItemOption.name = column_property(
     select(Option.name)
@@ -170,5 +226,27 @@ OrderItemOption.group_name = column_property(
     .join(Option, Option.option_group_id == OptionGroup.id)
     .where(Option.id == OrderItemOption.option_id)
     .correlate_except(Option, OptionGroup)
+    .scalar_subquery()
+)
+
+# spec 129: nombre de la adición, denormalizado igual que `OrderItemOption.name` --
+# `order_item_toppings.topping_product_variant_id` es FK sin `ON DELETE`, así que una
+# adición referenciada por un pedido no puede borrarse: no hace falta snapshot aparte.
+OrderItemTopping.name = column_property(
+    select(Product.name)
+    .join(ProductVariant, ProductVariant.product_id == Product.id)
+    .where(ProductVariant.id == OrderItemTopping.topping_product_variant_id)
+    .correlate_except(Product, ProductVariant)
+    .scalar_subquery()
+)
+
+# spec 129: id del producto-adición, derivado de su variante principal -- el
+# cliente trabaja con `topping_product_id` (el de `ProductTopping`/`CartItemTopping`,
+# no el de la variante, que nunca elige) para editar/quitar la adición; mismo
+# patrón que `CartItemTopping.topping_product_id` (`cart_item.py`).
+OrderItemTopping.topping_product_id = column_property(
+    select(ProductVariant.product_id)
+    .where(ProductVariant.id == OrderItemTopping.topping_product_variant_id)
+    .correlate_except(ProductVariant)
     .scalar_subquery()
 )

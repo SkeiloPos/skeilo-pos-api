@@ -68,6 +68,7 @@ make_unit = _catalog_fx.make_unit
 _TENANT_TABLE_NAMES = [
     "categories",
     "products",
+    "product_toppings",
     "product_variants",
     "option_groups",
     "options",

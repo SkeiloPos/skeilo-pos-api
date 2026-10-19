@@ -58,6 +58,7 @@ _TABLE_NAMES = [
     "dining_tables",
     "cash_registers",
     "products",
+    "product_toppings",
     "payment_methods",
 ]
 

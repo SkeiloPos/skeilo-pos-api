@@ -27,6 +27,7 @@ from app.core.asset_refs import (
 from app.core.storage import FOLDER_PRODUCTS, deletable_key, delete_object, normalize_asset_ref
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
+from app.models.product_topping import ProductTopping
 from app.models.category import Category
 from app.models.category_presentation import CategoryPresentation
 from app.models.presentation import Presentation
@@ -46,6 +47,7 @@ from app.api.v1.products.schemas import (
     VariantSaveOut,
     RecipeItemResponse,
     VariantOptionGroupResponse,
+    ToppingSummaryResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ class ProductService:
         active: bool | None = None,
         search: str | None = None,
         available: bool | None = None,
+        is_topping: bool | None = None,
     ) -> Select:
         # spec 097 (research.md D1): JOIN contra Category en la propia consulta, para que
         # `category_name` (ver Product.category_name) no dependa de la paginación de
@@ -78,6 +81,9 @@ class ProductService:
             stmt = stmt.where(Product.available == available)
         if search:
             stmt = stmt.where(Product.name.ilike(f"%{search.strip()}%"))
+        if is_topping is not None:
+            # spec 129: selector de "Adiciones disponibles" en el formulario de producto.
+            stmt = stmt.where(Product.is_topping == is_topping)
         return stmt
 
     def get_or_404(self, db: Session, id: UUID) -> Product:
@@ -97,6 +103,9 @@ class ProductService:
             .options(
                 selectinload(Product.variants).selectinload(ProductVariant.recipe_items),
                 selectinload(Product.variants).selectinload(ProductVariant.option_groups),
+                # spec 129: `topping_ids` del detalle se arma desde esta relación, sin
+                # disparar una consulta perezosa por producto.
+                selectinload(Product.toppings),
             )
         )
         product = db.execute(stmt).scalar_one_or_none()
@@ -139,6 +148,11 @@ class ProductService:
             ],
             deactivated=[
                 VariantResponse.model_validate(v) for v in product.variants if not v.active
+            ],
+            topping_ids=[t.topping_product_id for t in product.toppings],
+            toppings=[
+                ToppingSummaryResponse(id=t.topping_product_id, name=t.topping_name)
+                for t in product.toppings
             ],
         )
 
@@ -197,9 +211,18 @@ class ProductService:
                 image_url=data.image_url,
                 available=data.available,
                 tracks_inventory=data.tracks_inventory,
+                is_topping=data.is_topping,
+                # spec 129 (research.md D6): default calculado -- oculto en QR si es
+                # una adición, visible en caso contrario, a menos que se envíe explícito.
+                visible_en_qr=(
+                    data.visible_en_qr
+                    if data.visible_en_qr is not None
+                    else not data.is_topping
+                ),
             )
             db.add(product)
             db.flush()
+            self._reconcile_toppings(db, product, data.topping_ids, is_topping=product.is_topping)
             if data.variants:
                 # spec 043 (FR-001): árbol completo en la misma transacción --
                 # `ensure_default_variant` no aplica, ya hay al menos una presentación explícita.
@@ -269,8 +292,18 @@ class ProductService:
             if data.tracks_inventory and not product.tracks_inventory:
                 ensure_module_access(db, tenant, "inventario")
             product.tracks_inventory = data.tracks_inventory
+        if data.is_topping is not None:
+            product.is_topping = data.is_topping
+        if data.visible_en_qr is not None:
+            product.visible_en_qr = data.visible_en_qr
 
         try:
+            # spec 129 (FR-002/FR-016): `topping_ids` ausente = no tocar la asociación
+            # existente; presente (incluida `[]`) = reemplazo total.
+            if "topping_ids" in data.model_fields_set and data.topping_ids is not None:
+                self._reconcile_toppings(
+                    db, product, data.topping_ids, is_topping=product.is_topping
+                )
             # spec 043 (FR-002): `variants` ausente del body = no tocar ninguna presentación
             # (back-compat); presente (incluida `[]`) = reconciliación completa. Todo esto entra
             # en el mismo `db.commit()` de abajo que ya persistía los campos del producto --
@@ -327,6 +360,64 @@ class ProductService:
             self._save_variant_tree(db, product, entradas)
         else:
             ensure_default_variant(db, product)
+
+    def _reconcile_toppings(
+        self, db: Session, product: Product, topping_ids: list[UUID], *, is_topping: bool
+    ) -> None:
+        """Spec 129 (FR-002/FR-016): reemplazo total de las adiciones asociadas a
+        `product` -- mismo criterio que `category.presentations` (spec 083): no hay
+        columnas propias en la tabla puente que preservar entre un guardado y el
+        siguiente. Valida (422) que ningún id sea el propio producto (auto-asociación),
+        que cada id referencie un producto existente marcado `is_topping=true`, y que
+        una adición (`is_topping=true`) no tenga a su vez adiciones propias (fuera de
+        alcance, spec.md Assumptions). No hace `commit()` -- lo controla el llamador."""
+        if not topping_ids:
+            if product.toppings:
+                for row in list(product.toppings):
+                    db.delete(row)
+            return
+
+        if is_topping:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "Una adición no puede tener sus propias adiciones asociadas"},
+            )
+        if product.id in topping_ids:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "Un producto no puede asociarse a sí mismo como su propia adición"},
+            )
+
+        unique_ids = list(dict.fromkeys(topping_ids))
+        found = db.execute(
+            select(Product.id, Product.is_topping).where(Product.id.in_(unique_ids))
+        ).all()
+        found_by_id = {row.id: row.is_topping for row in found}
+        missing = [str(i) for i in unique_ids if i not in found_by_id]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": f"Adición(es) no encontrada(s): {', '.join(missing)}"},
+            )
+        not_toppings = [str(i) for i in unique_ids if not found_by_id[i]]
+        if not_toppings:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": (
+                        "Solo productos marcados como adición pueden asociarse: "
+                        f"{', '.join(not_toppings)}"
+                    )
+                },
+            )
+
+        existing_by_topping = {row.topping_product_id: row for row in product.toppings}
+        for existing_id, row in list(existing_by_topping.items()):
+            if existing_id not in unique_ids:
+                db.delete(row)
+        for topping_id in unique_ids:
+            if topping_id not in existing_by_topping:
+                db.add(ProductTopping(product_id=product.id, topping_product_id=topping_id))
 
     def _save_variant_tree(
         self, db: Session, product: Product, entries: list[VariantSaveIn]
@@ -393,5 +484,10 @@ class ProductService:
                 )
                 for v in product.variants
                 if v.active
+            ],
+            topping_ids=[t.topping_product_id for t in product.toppings],
+            toppings=[
+                ToppingSummaryResponse(id=t.topping_product_id, name=t.topping_name)
+                for t in product.toppings
             ],
         )

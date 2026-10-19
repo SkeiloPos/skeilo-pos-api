@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.api.v1.catalog.schemas import OptionSelectionIn
+from app.api.v1.catalog.schemas import OptionSelectionIn, ToppingSelectionIn
 from app.api.v1.sales.schemas import PaymentIn
 from app.core.schema_types import AssetUrl
 from app.core.timezone import UtcDatetime
@@ -119,6 +119,13 @@ class OrderItemIn(BaseModel):
     # spec 065: reemplaza `option_ids: list[UUID]` -- cada entrada trae su propia
     # cantidad elegida (default 1, el mismo significado que tenía "incluir este id").
     options: list[OptionSelectionIn] = Field(default_factory=list)
+    # spec 129: adiciones (productos-topping) elegidas para esta línea, resueltas en la
+    # misma transacción que crea el pedido -- hermano de `options`, igual criterio que
+    # `CartItemIn.toppings` (`app/api/v1/cart/schemas.py`). Antes el cliente las agregaba
+    # con una llamada aparte por adición después de crear el pedido (`POST
+    # /orders/items/{item_id}/toppings`), un N+1 de escrituras evitable porque la
+    # selección ya se conoce al armar el pedido.
+    toppings: list[ToppingSelectionIn] = Field(default_factory=list)
     notes: str | None = Field(None, max_length=500)
 
 
@@ -151,6 +158,21 @@ class OrderCreate(BaseModel):
     #: Opcional y retrocompatible — sin él, cada solicitud sigue creando un pedido nuevo como
     #: hasta ahora (ver contracts/post-orders.md de esa spec).
     client_request_id: str | None = Field(None, max_length=64)
+
+
+class OrderItemToppingResponse(BaseModel):
+    """spec 129: adición (producto-topping) adjunta a la línea -- hermano de
+    `OrderItemOptionResponse`, para sabores. `id` es el del producto-adición, no el
+    de la fila ni el de su variante -- es lo que el cliente usa para editar/quitarla
+    (`PATCH`/`DELETE /orders/items/{item_id}/toppings/{topping_product_id}`)."""
+
+    id: UUID = Field(validation_alias="topping_product_id")
+    name: str | None = None
+    quantity: int
+    unit_price: Decimal
+    added_after_sale: bool = False
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class OrderItemOptionResponse(BaseModel):
@@ -193,6 +215,8 @@ class OrderItemResponse(BaseModel):
     notes: str | None = None
     combo_id: UUID | None = None
     options: list[OrderItemOptionResponse] = Field(default_factory=list)
+    # spec 129: adiciones (productos-topping) adjuntas a esta línea.
+    toppings: list[OrderItemToppingResponse] = Field(default_factory=list)
     #: Versión del evento de tiempo real que emitió esta escritura. Solo lo
     #: rellena `PATCH /orders/items/{id}/kitchen`; el KDS lo usa para descartar
     #: eventos en vuelo que revertirían su parche optimista. `None` si el evento

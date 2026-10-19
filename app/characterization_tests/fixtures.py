@@ -68,6 +68,7 @@ from app.models.category_presentation import CategoryPresentation
 _TABLE_NAMES = [
     "categories",
     "products",
+    "product_toppings",
     "product_variants",
     "option_groups",
     "options",

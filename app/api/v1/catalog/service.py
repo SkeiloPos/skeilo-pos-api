@@ -131,6 +131,27 @@ def ensure_default_variant(db: Session, product: Product, *, price=0) -> Product
     return variant
 
 
+def resolve_principal_variant(db: Session, topping_product_id: UUID) -> ProductVariant:
+    """Spec 129 (research.md D5): la variante "principal" de un producto-adición --
+    la de menor `display_order` -- es la que se usa para resolver precio y receta
+    cuando esa adición se ofrece adjunta a otra línea (menú QR o pedido manual). No
+    valida `is_topping` aquí (lo hace el llamador, p.ej. `ProductService` o la
+    validación de `ProductTopping`); se limita a resolver "la" variante de un
+    producto, igual que `ensure_default_variant` resuelve o crea la suya."""
+    variant = db.execute(
+        select(ProductVariant)
+        .where(ProductVariant.product_id == topping_product_id, ProductVariant.active.is_(True))
+        .order_by(ProductVariant.display_order)
+        .limit(1)
+    ).scalar_one_or_none()
+    if variant is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "La adición no tiene ninguna presentación activa"},
+        )
+    return variant
+
+
 # ===================== Guardado consolidado de producto (spec 043) =====================
 #
 # `reorder_variants`/`VariantReorderError` (el endpoint dedicado de reordenamiento, spec 042)

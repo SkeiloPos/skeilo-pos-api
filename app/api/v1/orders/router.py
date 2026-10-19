@@ -22,13 +22,16 @@ from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem
 from app.models.order_payment_attempt import OrderPaymentAttempt
 from app.api.v1.orders import additions
+from app.api.v1.orders import toppings
 from app.api.v1.orders import service
 from app.api.v1.orders.consolidation import consolidate_table, add_item_to_order
 from app.api.v1.orders import kitchen
 from app.api.v1.orders import checkout
 from app.api.v1.orders import tables_advanced
 from app.api.v1.table_sessions.service import notify_sessions_closed
-from app.api.v1.catalog.schemas import OptionSelectionIn, UpdateAdditionQuantityIn
+from app.api.v1.catalog.schemas import (
+    OptionSelectionIn, UpdateAdditionQuantityIn, ToppingSelectionIn, UpdateToppingQuantityIn,
+)
 from app.api.v1.sales import complementary
 from app.api.v1.sales.schemas import ComplementaryPaymentIn, SaleResponse
 from app.api.v1.orders.schemas import (
@@ -54,6 +57,7 @@ def _load_order(db: Session, order_id: UUID) -> CustomerOrder:
         select(CustomerOrder)
         .options(
             selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
             selectinload(CustomerOrder.payment_attempts)
             .selectinload(OrderPaymentAttempt.payment_method),
         )
@@ -237,8 +241,9 @@ def add_order_item(
     body: OrderItemIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
-    order = add_item_to_order(db, order_id, body, user)
+    order = add_item_to_order(db, order_id, body, user, tenant=tenant)
     return _load_order(db, order.id)
 
 
@@ -510,6 +515,94 @@ def remove_addition(
     return _load_order(db, order.id)
 
 
+@router.post(
+    "/items/{item_id}/toppings",
+    response_model=OrderResponse,
+    summary="Agregar una adición (producto-topping) a una línea de pedido ya creada (spec 129)",
+)
+def add_topping(
+    item_id: UUID, body: ToppingSelectionIn,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    order = toppings.add_topping_to_order_item(db, item_id, body, user, tenant)
+    item = next((i for i in order.items if i.id == item_id), None)
+    topping_name = None
+    if item is not None:
+        fila = next((t for t in item.toppings if t.topping_product_id == body.topping_product_id), None)
+        topping_name = fila.name if fila is not None else None
+    # Mismo evento que agregar una adición de sabor -- el frontend solo lo usa como
+    # señal de recarga (`pos-terminal.store.ts`), no lee el payload.
+    events.item_addon_added(
+        tenant.id,
+        order_id=order.id,
+        table_session_id=order.table_session_id,
+        item_id=item_id,
+        option_name=topping_name,
+        quantity=body.quantity,
+    )
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+    return _load_order(db, order.id)
+
+
+@router.patch(
+    "/items/{item_id}/toppings/{topping_product_id}",
+    response_model=OrderResponse,
+    summary="Editar la cantidad de una adición que ya está en la línea (spec 129)",
+)
+def update_topping(
+    item_id: UUID, topping_product_id: UUID, body: UpdateToppingQuantityIn,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    order = toppings.update_topping_quantity(
+        db, item_id, topping_product_id, body, user, tenant
+    )
+    item = next((i for i in order.items if i.id == item_id), None)
+    topping_name = None
+    new_quantity = body.quantity
+    if item is not None:
+        fila = next(
+            (t for t in item.toppings if t.topping_product_id == topping_product_id), None
+        )
+        if fila is not None:
+            topping_name = fila.name
+            new_quantity = fila.quantity
+    events.item_addon_added(
+        tenant.id,
+        order_id=order.id,
+        table_session_id=order.table_session_id,
+        item_id=item_id,
+        option_name=topping_name,
+        quantity=new_quantity,
+    )
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+    return _load_order(db, order.id)
+
+
+@router.delete(
+    "/items/{item_id}/toppings/{topping_product_id}",
+    response_model=OrderResponse,
+    summary="Quitar del todo una adición que ya está en la línea (spec 129)",
+)
+def remove_topping(
+    item_id: UUID, topping_product_id: UUID,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    order = toppings.remove_topping(db, item_id, topping_product_id, user, tenant)
+    events.item_addon_added(
+        tenant.id,
+        order_id=order.id,
+        table_session_id=order.table_session_id,
+        item_id=item_id,
+        option_name=None,
+        quantity=0,
+    )
+    events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+    return _load_order(db, order.id)
+
+
 # ============================ Cobro / cierre (Fase 7) ============================
 @router.get(
     "/tables/{table_id}/bill",
@@ -736,6 +829,7 @@ def create_order(
     request: Request = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     """Alta de comanda por staff (mostrador/mesero). **No es una ruta pública**:
     el pedido anónimo por QR entra por el carrito del comensal, no por aquí.
@@ -744,7 +838,7 @@ def create_order(
     descontaba inventario, así que una comanda creada aquí y cobrada con
     `pay_order` nunca descontaba stock."""
     order = service.create_order(
-        db, body, user_id=user.id, user=user, request_id=current_request_id(request)
+        db, body, user_id=user.id, user=user, tenant=tenant, request_id=current_request_id(request)
     )
     return _load_order(db, order.id)
 
