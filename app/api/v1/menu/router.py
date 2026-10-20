@@ -23,6 +23,7 @@ from app.models.product_variant import ProductVariant
 from app.models.option_group import OptionGroup
 from app.models.variant_option_group import VariantOptionGroup
 from app.models.dining_table import DiningTable
+from app.models.product_topping import ProductTopping
 from app.api.v1.promotions.service import (
     active_variant_set_rules, menu_unit_discount, menu_variant_promotion,
     variant_display_names, variant_set_condition_text,
@@ -31,6 +32,7 @@ from app.api.v1.menu.schemas import (
     MenuCategoryResponse, MenuProductResponse, MenuVariantResponse,
     MenuOptionGroupResponse, MenuOptionResponse, MenuTableResponse,
     MenuBusinessResponse, MenuPromotionAnnouncement, MenuPromotionRule,
+    MenuToppingResponse,
 )
 
 router = APIRouter(prefix="/menu", tags=["menu"])
@@ -80,6 +82,50 @@ def _option_availability(db: Session) -> dict[UUID, bool]:
     return out
 
 
+def _toppings_by_product(
+    db: Session, product_ids: list[UUID]
+) -> dict[UUID, list[MenuToppingResponse]]:
+    """spec 129 (FR-009, research.md D5): `{product_id: [adiciones disponibles]}`,
+    en dos queries (sin N+1 por producto). El precio es siempre el de catálogo de
+    la variante principal de la adición (FR-017); la disponibilidad reusa el mismo
+    criterio manual que `MenuProductResponse.sold_out` (`Product.active`/
+    `Product.available`), no un chequeo de stock en vivo -- consistente con que
+    `ProductTopping` tampoco guarda ningún dato de inventario propio."""
+    if not product_ids:
+        return {}
+
+    links = db.execute(
+        select(ProductTopping).where(ProductTopping.product_id.in_(product_ids))
+    ).scalars().all()
+    if not links:
+        return {}
+
+    topping_product_ids = {link.topping_product_id for link in links}
+    variants = db.execute(
+        select(ProductVariant)
+        .where(
+            ProductVariant.product_id.in_(topping_product_ids),
+            ProductVariant.active.is_(True),
+        )
+        .order_by(ProductVariant.product_id, ProductVariant.display_order)
+    ).scalars().all()
+    principal_variant_by_product: dict[UUID, ProductVariant] = {}
+    for v in variants:
+        principal_variant_by_product.setdefault(v.product_id, v)
+
+    out: dict[UUID, list[MenuToppingResponse]] = {}
+    for link in links:
+        variant = principal_variant_by_product.get(link.topping_product_id)
+        if variant is None:
+            continue  # adición sin ninguna presentación activa: no se puede ofrecer.
+        topping_product = link.topping_product
+        out.setdefault(link.product_id, []).append(MenuToppingResponse(
+            id=topping_product.id, name=topping_product.name, unit_price=variant.price,
+            available=topping_product.active and topping_product.available,
+        ))
+    return out
+
+
 def _build_menu(
     db: Session, tenant: Tenant | None = None, *, only_visible_en_qr: bool = False,
 ) -> list[MenuCategoryResponse]:
@@ -110,6 +156,15 @@ def _build_menu(
         .order_by(Category.display_order.desc(), Category.name)
     ).scalars().all()
 
+    # spec 129 (FR-008/FR-010/FR-012): `visible_en_qr` solo se exige en el flujo
+    # firmado del comensal -- mismo criterio que `category_filters` arriba. Una
+    # adición (is_topping=true) nace con `visible_en_qr=False` (research.md D6),
+    # así que este único filtro ya la excluye del menú QR como ítem propio sin
+    # necesitar ninguna condición sobre `is_topping` aquí. El catálogo sin firmar
+    # (pedido manual) sigue viendo todo, adiciones incluidas (spec 129, US2).
+    product_filters = [Product.active.is_(True)]
+    if only_visible_en_qr:
+        product_filters.append(Product.visible_en_qr.is_(True))
     products = db.execute(
         select(Product)
         # spec 093 (FR-019, research.md D6, A-104): un producto agotado
@@ -117,7 +172,7 @@ def _build_menu(
         # `sold_out=True` más abajo, para que el menú lo muestre atenuado en vez de
         # hacerlo desaparecer. Sigue excluyéndose por `active` sin cambios: eso es
         # alta/baja de catálogo, no disponibilidad temporal.
-        .where(Product.active.is_(True))
+        .where(*product_filters)
         .options(
             selectinload(Product.variants)
             .selectinload(ProductVariant.option_groups)
@@ -130,6 +185,12 @@ def _build_menu(
     by_cat: dict[UUID, list[Product]] = {}
     for p in products:
         by_cat.setdefault(p.category_id, []).append(p)
+
+    # spec 129 (FR-009): adiciones disponibles por producto -- resueltas en bloque
+    # (dos queries, nada de N+1 por producto), nunca filtradas por `visible_en_qr`
+    # (una adición se ofrece como adjunta sin importar su propia visibilidad como
+    # ítem suelto, FR-009/FR-010).
+    toppings_by_product = _toppings_by_product(db, [p.id for p in products])
 
     result: list[MenuCategoryResponse] = []
     for cat in categories:
@@ -215,6 +276,7 @@ def _build_menu(
             cat_products.append(MenuProductResponse(
                 id=p.id, name=p.name, description=p.description, image_url=p.image_url,
                 variants=variants, option_groups=list(union.values()), available=pedible,
+                toppings=toppings_by_product.get(p.id, []),
                 # spec 093 (FR-019/FR-020, research.md D6): flag manual e independiente
                 # de `available` (arriba, "pedible por stock") -- `not p.available` es
                 # el interruptor "Agotado" que marcan Cajero/Admin desde la Carta del

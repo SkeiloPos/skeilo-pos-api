@@ -19,6 +19,17 @@ class PreparationType(str, Enum):
     PACKAGED = "packaged"
 
 
+class ToppingSummaryResponse(BaseModel):
+    """spec 129: nombre de una adición asociada, denormalizado (igual criterio que
+    `category_name` en `Product`) -- evita que el selector de "Adiciones disponibles"
+    tenga que resolver cada id por separado contra `GET /products/{id}`."""
+
+    id: UUID
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ProductCreate(BaseModel):
     category_id: UUID = Field(..., description="Categoría del producto.")
     name: str = Field(..., min_length=1, max_length=255, examples=["Helado en copa"])
@@ -34,6 +45,27 @@ class ProductCreate(BaseModel):
     available: bool = True
     tracks_inventory: bool = Field(
         False, description="Si el producto exige y aplica descuento de inventario en sus presentaciones."
+    )
+    # spec 129 (FR-001): marca este producto como una adición (topping) ofrecible
+    # dentro de otros productos, además de poder venderse como línea independiente.
+    is_topping: bool = Field(
+        False, description="Si este producto funciona como adición (topping) de otros productos."
+    )
+    # spec 129 (research.md D6): `None` = usar el default calculado en servicio
+    # (`false` si `is_topping=true`, `true` en caso contrario); un valor explícito
+    # siempre gana sobre ese default.
+    visible_en_qr: bool | None = Field(
+        None,
+        description=(
+            "Visibilidad como ítem propio en el menú QR. Si se omite, se calcula: "
+            "oculto si es una adición, visible en caso contrario."
+        ),
+    )
+    # spec 129 (FR-002): adiciones que este producto ofrece, a nivel de producto
+    # (no de variante) -- aplica automáticamente a todas sus variantes.
+    topping_ids: list[UUID] = Field(
+        default_factory=list,
+        description="Ids de productos marcados `is_topping=true` que este producto ofrece.",
     )
     variants: list[VariantSaveIn] = Field(
         default_factory=list,
@@ -61,6 +93,15 @@ class ProductUpdate(BaseModel):
     active: bool | None = None
     available: bool | None = None
     tracks_inventory: bool | None = None
+    # spec 129: `None` = no tocar (igual criterio que el resto de campos opcionales
+    # de este esquema). A diferencia de `ProductCreate`, aquí `None` nunca significa
+    # "recalcular el default" -- ese default solo tiene sentido al crear.
+    is_topping: bool | None = None
+    visible_en_qr: bool | None = None
+    # spec 129 (FR-002): `None` = no tocar la asociación de adiciones existente;
+    # presente (incluida lista vacía) = reemplazo total, mismo criterio que
+    # `variants` abajo y que `category.presentations` (spec 083).
+    topping_ids: list[UUID] | None = None
     variants: list[VariantSaveIn] | None = Field(
         None,
         description=(
@@ -101,6 +142,10 @@ class ProductResponse(BaseModel):
     available_changed_at: datetime | None = None
     available_changed_by_name: str | None = None
     tracks_inventory: bool
+    # spec 129: valores ya resueltos (nunca `null`) -- el default calculado de
+    # `visible_en_qr` se aplica en servicio antes de llegar a esta respuesta.
+    is_topping: bool = False
+    visible_en_qr: bool = True
     created_at: datetime
     updated_at: datetime | None = None
 
@@ -139,6 +184,14 @@ class ProductDetailResponse(ProductResponse):
 
     variants: list[VariantDetailResponse] = Field(default_factory=list)
     deactivated: list[VariantResponse] = Field(default_factory=list)
+    # spec 129 (FR-002): adiciones asociadas a este producto. No se puede poblar por
+    # `from_attributes` (el modelo ORM expone `toppings: list[ProductTopping]`, no
+    # una lista de ids) -- el servicio lo arma explícitamente, mismo criterio que
+    # `recipe`/`option_groups` en `VariantDetailResponse`.
+    topping_ids: list[UUID] = Field(default_factory=list)
+    # spec 129: nombres denormalizados de las mismas adiciones de `topping_ids`, para
+    # que el selector de "Adiciones disponibles" no tenga que resolverlas por id.
+    toppings: list[ToppingSummaryResponse] = Field(default_factory=list)
 
 
 class VariantSaveOut(VariantResponse):
@@ -160,3 +213,5 @@ class ProductSaveResponse(ProductResponse):
     del producto guardado, para que el formulario no necesite una lectura adicional."""
 
     variants: list[VariantSaveOut] = Field(default_factory=list)
+    topping_ids: list[UUID] = Field(default_factory=list)
+    toppings: list[ToppingSummaryResponse] = Field(default_factory=list)

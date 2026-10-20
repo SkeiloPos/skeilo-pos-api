@@ -15,6 +15,7 @@ camino — mismo criterio de "un único punto de descuento", solo que movido.
 El pedido anónimo por QR **no** entra por aquí: llega como `recibida` vía
 `/cart/submit` y lo descuenta el staff al confirmarlo."""
 import logging
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from math import ceil
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
+from app.core.plan_limits import has_module_access
 from app.core.timezone import local_day_bounds_utc, resolve_timezone
 from app.core.order_audit import (
     ActorType,
@@ -40,17 +42,19 @@ from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_
 from app.models.session_participant import SessionParticipant
 from app.models.dining_table import DiningTable
 from app.models.customer_order import CustomerOrder
-from app.models.order_item import OrderItem, OrderItemOption
+from app.models.order_item import OrderItem, OrderItemOption, OrderItemTopping
 from app.models.order_payment_attempt import OrderPaymentAttempt
 from app.models.payment import Payment, PaymentMethod
 from app.models.sale import Sale
 from app.models.table_session import TableSession
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.api.v1.catalog.line_pricing import (
+    check_availability,
     ensure_products_available,
     load_valid_options,
 )
 from app.api.v1.cash.service import resolve_dine_in_table_order
+from app.api.v1.orders import topping_lines
 from app.api.v1.orders.consolidation import get_or_create_table_session_id
 from app.api.v1.orders.consumption import deduct_order_items_naming_product
 from app.api.v1.orders.schemas import (
@@ -115,7 +119,7 @@ def order_pending_balance(db: Session, order_id: UUID) -> Decimal:
     porción del saldo deja de existir — nunca llegó a descontar inventario,
     research.md D9) y las adiciones ya cubiertas por un pago complementario
     (`complementary_sale_id IS NOT NULL`)."""
-    total = db.execute(
+    options_total = db.execute(
         select(func.coalesce(func.sum(Option.extra_price * OrderItemOption.quantity), 0))
         .select_from(OrderItemOption)
         .join(OrderItem, OrderItem.id == OrderItemOption.order_item_id)
@@ -127,7 +131,21 @@ def order_pending_balance(db: Session, order_id: UUID) -> Decimal:
             OrderItemOption.complementary_sale_id.is_(None),
         )
     ).scalar()
-    return Decimal(total or 0)
+    # spec 129: mismo saldo pendiente, ahora también sumando adiciones
+    # (productos-topping) agregadas después de la `Sale` -- `unit_price` ya es el
+    # snapshot del precio de catálogo (FR-017), no hace falta otro JOIN.
+    toppings_total = db.execute(
+        select(func.coalesce(func.sum(OrderItemTopping.unit_price * OrderItemTopping.quantity), 0))
+        .select_from(OrderItemTopping)
+        .join(OrderItem, OrderItem.id == OrderItemTopping.order_item_id)
+        .where(
+            OrderItem.order_id == order_id,
+            OrderItem.estado_cocina != "anulado",
+            OrderItemTopping.added_after_sale.is_(True),
+            OrderItemTopping.complementary_sale_id.is_(None),
+        )
+    ).scalar()
+    return Decimal(options_total or 0) + Decimal(toppings_total or 0)
 
 
 # ------------------------------------------- Desglose de facturación (spec 094)
@@ -464,6 +482,7 @@ def list_orders(
     mesa) tampoco se toca."""
     q = select(CustomerOrder).options(
         selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+        selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
         selectinload(CustomerOrder.payment_attempts)
         .selectinload(OrderPaymentAttempt.payment_method),
     ).order_by(CustomerOrder.created_at.desc())
@@ -527,6 +546,7 @@ def list_orders_query(
         select(CustomerOrder)
         .options(
             selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
             selectinload(CustomerOrder.payment_attempts)
             .selectinload(OrderPaymentAttempt.payment_method),
         )
@@ -600,12 +620,21 @@ def create_order(
     data: OrderCreate,
     user_id: UUID | None,
     user=None,
+    tenant: Tenant | None = None,
     request_id: str | None = None,
 ) -> CustomerOrder:
     """`user` (spec 074) es solo para el log de auditoría: el `User` completo
     del cajero, del que salen su rol y su tenant — datos que `user_id` por sí
     solo no lleva. Opcional para no cambiar el contrato de ningún llamador
     existente; el router sí lo pasa siempre.
+
+    `tenant` (spec 129) gobierna si las adiciones (productos-topping) de cada línea
+    descuentan inventario -- mismo criterio (`has_module_access(db, tenant,
+    "inventario")`) que ya usa `orders.toppings.add_topping_to_order_item` para una
+    adición agregada después. Opcional por el mismo motivo que `user`: ningún
+    llamador existente (los characterization tests) lo pasaba antes de esta spec, y
+    sin él simplemente no se descuenta inventario de las adiciones (se asume que el
+    tenant no tiene el módulo activo).
 
     `request_id` (spec 074, extensión de logging operativo — FR-021) es igual
     de opcional y por el mismo motivo: correlaciona el evento de auditoría con
@@ -772,7 +801,21 @@ def create_order(
         # de obligar a reintentar uno por uno.
         ensure_products_available(variants_by_line)
 
+        # spec 129: si el tenant no tiene el módulo "inventario" activo, las
+        # adiciones (productos-topping) se guardan igual pero no descuentan
+        # stock -- mismo criterio que `orders.toppings.add_topping_to_order_item`.
+        inventario_activo = tenant is not None and has_module_access(db, tenant, "inventario")
+        # Insumo -> cantidad requerida, agregado de TODAS las adiciones de TODAS
+        # las líneas -- un solo `check_availability` para todo el pedido, igual
+        # que `ensure_products_available` nombra todos los productos agotados de
+        # una vez en vez de reventar línea por línea (spec 093).
+        topping_consumption: dict[UUID, Decimal] = defaultdict(Decimal)
+
         entries: list[tuple[OrderItem, list[ChosenOption]]] = []
+        # (item, [(topping_variant, quantity), ...]) -- se guardan y, si aplica,
+        # se descuentan después del `refresh_order_item_discounts` de abajo, igual
+        # que `entries` para las opciones normales.
+        topping_rows: list[tuple[OrderItem, list[topping_lines.ResolvedTopping]]] = []
         for line, variant in zip(data.items, variants_by_line):
             # Deduplica, exige que estén activas y valida la selección contra los
             # grupos del producto. Antes este bucle cargaba las opciones a mano y se
@@ -797,9 +840,31 @@ def create_order(
                     per_line=chosen.per_line,
                 ))
 
+            # spec 129 (FR-009): adiciones (productos-topping) de la línea, resueltas
+            # en la MISMA transacción que crea el pedido -- antes el cliente las
+            # adjuntaba con una llamada aparte por adición después de crear el
+            # pedido (`POST /orders/items/{item_id}/toppings`), un N+1 evitable
+            # porque la selección ya se conoce aquí.
+            resolved_toppings, toppings_total = topping_lines.resolve_toppings(
+                db, variant.product_id, line.toppings,
+            )
+            if inventario_activo:
+                topping_lines.accumulate_consumption(db, resolved_toppings, topping_consumption)
+
             item.unit_price = compute_unit_price(variant, options)
-            item.addons_total = compute_addons_total(options)
+            # FR-017/FR-007 (spec 129): precio de catálogo de cada adición, cobrado una
+            # vez por línea -- nunca multiplicado por `line.quantity`, igual que las
+            # opciones "cantidad" ya separadas en `compute_addons_total(options)`.
+            item.addons_total = compute_addons_total(options) + toppings_total
             entries.append((item, options))
+            if resolved_toppings:
+                topping_rows.append((item, resolved_toppings))
+
+        # Las filas `OrderItemTopping` se guardan siempre (aunque hold_for_payment
+        # difiera el descuento) -- misma separación que ya hace `OrderItemOption`
+        # arriba entre "persistir la selección" y "descontar inventario".
+        for item, resolved_toppings in topping_rows:
+            topping_lines.persist_toppings(db, item, resolved_toppings)
 
         # spec 118 (research.md D3): persiste el descuento por línea de las
         # promociones por volumen/porcentuales vigentes -- import diferido para
@@ -819,6 +884,15 @@ def create_order(
             # descuento que usa el flujo QR (`_confirm_order_impl`), por la
             # otra puerta.
             deduct_order_items_naming_product(db, entries, user_id, reference_id=order.id)
+
+            if inventario_activo and topping_consumption:
+                # Mismo chequeo preventivo (409, sin lock) que ya usa la adición
+                # posterior a un pedido (`orders.toppings`) -- el agotado de
+                # adiciones nunca bloquea la línea del producto principal, que ya
+                # se descontó arriba.
+                check_availability(db, topping_consumption, extra_context="crear pedido")
+                for item, resolved_toppings in topping_rows:
+                    topping_lines.deduct_toppings(db, resolved_toppings, user_id, order.id)
 
         db.commit()
     except HTTPException:

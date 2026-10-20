@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.api.v1.catalog.schemas import OptionSelectionIn
+from app.api.v1.catalog.schemas import OptionSelectionIn, ToppingSelectionIn
 from app.core.schema_types import AssetUrl
 from app.core.storage import asset_display_url
 
@@ -48,12 +48,19 @@ class CartItemIn(BaseModel):
     # spec 065: reemplaza `option_ids: list[UUID]` -- cada entrada trae su propia
     # cantidad elegida (default 1, el mismo significado que tenía "incluir este id").
     options: list[OptionSelectionIn] = Field(default_factory=list)
+    # spec 129 (FR-009): adiciones (productos-topping) elegidas para esta línea --
+    # hermano de `options`, pero para productos marcados `is_topping=true` en vez
+    # de sabores de un `OptionGroup`.
+    toppings: list[ToppingSelectionIn] = Field(default_factory=list)
     notes: str | None = Field(None, max_length=500)
 
 
 class CartItemUpdate(BaseModel):
     quantity: int | None = Field(None, ge=1)
     options: list[OptionSelectionIn] | None = None
+    # spec 129: `None` = no tocar las adiciones ya elegidas; presente (incluida
+    # `[]`) = reemplazo total, mismo criterio que `options`.
+    toppings: list[ToppingSelectionIn] | None = None
     notes: str | None = Field(None, max_length=500)
 
 
@@ -65,6 +72,21 @@ class CartItemOptionResponse(BaseModel):
     per_line: bool = False
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class CartItemToppingResponse(BaseModel):
+    """spec 129: adición (producto-topping) adjunta a la línea de carrito -- hermano
+    de `CartItemOptionResponse`. `id` es el del producto-adición (denormalizado,
+    `CartItemTopping.topping_product_id`), no el de su variante -- es lo que el
+    comensal usa para elegirla/editarla, igual que `topping_product_id` en
+    `ToppingSelectionIn`. Sin `name` (mismo criterio que `CartItemOptionResponse`):
+    el comensal ya lo conoce desde `MenuProductResponse.toppings`."""
+
+    id: UUID = Field(validation_alias="topping_product_id")
+    quantity: int
+    unit_price: Decimal
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class AdjustedOptionOut(BaseModel):
@@ -95,6 +117,8 @@ class CartItemResponse(BaseModel):
     notes: str | None = None
     combo_id: UUID | None = None
     options: list[CartItemOptionResponse] = Field(default_factory=list)
+    # spec 129: adiciones (productos-topping) adjuntas a esta línea.
+    toppings: list[CartItemToppingResponse] = Field(default_factory=list)
     # Spec 117 (A-126, D5): poblado SOLO en la respuesta del `PATCH` que disparó el
     # ajuste automático (contracts/cart-item-auto-adjust.md) -- `[]` en toda otra
     # lectura/escritura, incluido `GET /cart`, que nunca lo repite. Aditivo: no rompe a

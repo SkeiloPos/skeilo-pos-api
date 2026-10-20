@@ -1,7 +1,8 @@
 from app.core.models import Base, UUIDPrimaryKeyMixin
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Boolean, String, Integer, Numeric, ForeignKey, CheckConstraint, UniqueConstraint, false
-from sqlalchemy.orm import mapped_column, Mapped, relationship
+from sqlalchemy.orm import mapped_column, Mapped, relationship, column_property
+from sqlalchemy import select
 from typing import Optional, List, TYPE_CHECKING
 from decimal import Decimal
 
@@ -50,6 +51,12 @@ class CartItem(UUIDPrimaryKeyMixin, Base):
         back_populates="cart_item", cascade="all, delete-orphan"
     )
 
+    # spec 129: adiciones (productos-topping) adjuntas a esta línea -- distinto de
+    # `options` (sabores de un `OptionGroup`). Ver `CartItemTopping` abajo.
+    toppings: Mapped[List["CartItemTopping"]] = relationship(
+        back_populates="cart_item", cascade="all, delete-orphan"
+    )
+
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_cart_item_quantity_positive"),
         CheckConstraint("addons_total >= 0", name="ck_cart_item_addons_total_nonneg"),
@@ -92,3 +99,57 @@ class CartItemOption(UUIDPrimaryKeyMixin, Base):
         CheckConstraint("quantity > 0", name="ck_cart_item_options_quantity_positive"),
         {"schema": "tenant"},
     )
+
+
+class CartItemTopping(UUIDPrimaryKeyMixin, Base):
+    """Adición (producto-topping) adjunta a una línea de carrito (spec 129). Espejo de
+    `CartItemOption`, pero referenciando la variante de un producto marcado
+    `is_topping=true` en vez de una `Option` -- las adiciones ya no viven en grupos de
+    opciones (research.md D4 de spec 129). Espejo de `OrderItemTopping`."""
+
+    __tablename__ = "cart_item_toppings"
+
+    cart_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("cart_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cart_item: Mapped["CartItem"] = relationship(back_populates="toppings")
+
+    # Variante "principal" (menor display_order) del producto-adición (research.md D5
+    # de spec 129) -- no de un producto cualquiera.
+    topping_product_variant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("product_variants.id"), nullable=False, index=True
+    )
+
+    # spec 129 (FR-018): unidades elegidas de esta adición, cantidad libre -- mismo
+    # criterio que `CartItemOption.quantity` en modo "cantidad" (spec 065).
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+
+    # Snapshot del precio de catálogo de la adición al agregarla (FR-017: siempre su
+    # precio de catálogo, nunca un recargo propio del producto que la ofrece); igual
+    # criterio que `CartItem.unit_price` -- se recalcula si el precio de catálogo
+    # cambia mientras el carrito sigue abierto, no se congela hasta consolidar.
+    unit_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=0, server_default="0"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "cart_item_id", "topping_product_variant_id",
+            name="uq__cart_item_toppings__cart_item_id__topping_variant_id",
+        ),
+        CheckConstraint("quantity > 0", name="ck_cart_item_toppings_quantity_positive"),
+        {"schema": "tenant"},
+    )
+
+
+# spec 129: id del producto-adición, derivado de su variante principal -- el
+# cliente (menú QR) trabaja con `topping_product_id`, no con el id de la
+# variante (que nunca elige); mismo patrón que `OrderItemOption.name` (spec 087).
+from app.models.product_variant import ProductVariant  # noqa: E402
+
+CartItemTopping.topping_product_id = column_property(
+    select(ProductVariant.product_id)
+    .where(ProductVariant.id == CartItemTopping.topping_product_variant_id)
+    .correlate_except(ProductVariant)
+    .scalar_subquery()
+)

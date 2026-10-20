@@ -38,12 +38,13 @@ from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
 from app.models.session_participant import SessionParticipant
 from app.models.cart import Cart
-from app.models.cart_item import CartItem, CartItemOption
+from app.models.cart_item import CartItem, CartItemOption, CartItemTopping
 from app.models.customer_order import CustomerOrder
-from app.models.order_item import OrderItem, OrderItemOption
+from app.models.order_item import OrderItem, OrderItemOption, OrderItemTopping
 from app.models.order_payment_attempt import OrderPaymentAttempt
 from app.models.option import Option
 from app.models.option_group import OptionGroup
+from app.models.product_topping import ProductTopping
 from app.catalog_engine import (
     ChosenOption,
     compute_addons_total,
@@ -60,6 +61,7 @@ from app.api.v1.catalog.line_pricing import (
     load_valid_options,
     required_consumption,
 )
+from app.api.v1.catalog.service import resolve_principal_variant
 from app.api.v1.cash.service import resolve_dine_in_table_order
 from app.api.v1.orders.checkout import line_discount_snapshot
 from app.api.v1.orders.schemas import CancelIn
@@ -69,6 +71,7 @@ from app.api.v1.cart.schemas import (
     CartItemIn,
     CartItemUpdate,
     CartItemOptionResponse,
+    CartItemToppingResponse,
     CartItemResponse,
     CartResponse,
     ReceiptPresignOut,
@@ -254,7 +257,50 @@ def _cart_consumption(
             db, item.product_variant_id, item.quantity, chosen
         ).items():
             total[iid] += need
+        # spec 129 (research.md D5): el consumo de una adición adjunta es el de
+        # SU PROPIA variante (receta completa, sin opciones), escalado por su
+        # propia cantidad -- nunca la de `item.quantity`.
+        for topping_row in item.toppings:
+            for iid, need in required_consumption(
+                db, topping_row.topping_product_variant_id, topping_row.quantity, []
+            ).items():
+                total[iid] += need
     return total
+
+
+def _resolve_cart_toppings(
+    db: Session, product_id: UUID, selections: list[ToppingSelectionIn]
+) -> list[tuple["ProductVariant", int]]:
+    """spec 129 (FR-009): valida que cada adición elegida esté asociada al producto
+    de la línea (`ProductTopping`) y resuelve su variante principal (research.md D5).
+    `422` si alguna no está asociada -- mismo criterio que rechazar hoy una opción
+    que no pertenece al grupo de la variante."""
+    resolved: list[tuple[ProductVariant, int]] = []
+    for sel in selections:
+        associated = db.execute(
+            select(ProductTopping.id).where(
+                ProductTopping.product_id == product_id,
+                ProductTopping.topping_product_id == sel.topping_product_id,
+            )
+        ).scalar()
+        if associated is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Esa adición no está asociada a este producto: {sel.topping_product_id}",
+            )
+        variant = resolve_principal_variant(db, sel.topping_product_id)
+        resolved.append((variant, sel.quantity))
+    return resolved
+
+
+def _toppings_total(resolved_toppings: list[tuple["ProductVariant", int]]) -> Decimal:
+    """FR-017: siempre el precio de catálogo de la variante principal, cobrado una
+    vez por línea (como cualquier adición `per_line`, nunca multiplicado por la
+    cantidad de producto de la línea)."""
+    return sum(
+        (Decimal(variant.price) * quantity for variant, quantity in resolved_toppings),
+        Decimal("0"),
+    )
 
 
 def _cart_promo_lines(db: Session, cart: Cart) -> list[dict]:
@@ -338,6 +384,7 @@ def serialize_cart(
             notes=it.notes,
             combo_id=it.combo_id,
             options=[CartItemOptionResponse.model_validate(o) for o in it.options],
+            toppings=[CartItemToppingResponse.model_validate(t) for t in it.toppings],
         ))
 
     discounted_total = total - result.total
@@ -374,11 +421,16 @@ def add_item(
     options = _mark_addons(
         db, load_valid_options(db, data.options, variant=variant, quantity=data.quantity)
     )
+    # spec 129 (FR-009): adiciones (productos-topping) elegidas para esta línea.
+    resolved_toppings = _resolve_cart_toppings(db, variant.product_id, data.toppings)
 
-    # Disponibilidad: consumo del carrito actual + la línea nueva.
+    # Disponibilidad: consumo del carrito actual + la línea nueva (producto + adiciones).
     required = _cart_consumption(db, cart)
     for iid, need in required_consumption(db, variant.id, data.quantity, options).items():
         required[iid] += need
+    for topping_variant, topping_qty in resolved_toppings:
+        for iid, need in required_consumption(db, topping_variant.id, topping_qty, []).items():
+            required[iid] += need
     check_availability(db, required, extra_context="carrito")
 
     try:
@@ -388,7 +440,9 @@ def add_item(
             quantity=data.quantity,
             # spec 089 (A-94): precio de UNA unidad + adicionales cobrados una vez por línea.
             unit_price=compute_unit_price(variant, options),
-            addons_total=compute_addons_total(options),
+            # spec 129 (FR-017): precio de catálogo de cada adición, sumado una vez por
+            # línea -- mismo total que `compute_addons_total` ya hace para sabores.
+            addons_total=compute_addons_total(options) + _toppings_total(resolved_toppings),
             notes=data.notes,
         )
         db.add(item)
@@ -397,6 +451,11 @@ def add_item(
             db.add(CartItemOption(
                 cart_item_id=item.id, option_id=chosen.option.id, quantity=chosen.quantity,
                 per_line=chosen.per_line,
+            ))
+        for topping_variant, topping_qty in resolved_toppings:
+            db.add(CartItemTopping(
+                cart_item_id=item.id, topping_product_variant_id=topping_variant.id,
+                quantity=topping_qty, unit_price=topping_variant.price,
             ))
         db.commit()
     except Exception:
@@ -510,16 +569,33 @@ def update_item(
             # cantidad de una línea ya creada con adiciones "cantidad" ya elegidas.
             options, adjusted_options = _auto_adjust_cantidad_options(db, options, new_qty)
 
-    # Disponibilidad: resto del carrito (sin esta línea) + la línea editada.
+    # spec 129 (FR-009): igual criterio que `options` arriba -- `None` conserva las
+    # adiciones ya elegidas, presente (incluida `[]`) reemplaza del todo.
+    if data.toppings is not None:
+        resolved_toppings = _resolve_cart_toppings(db, variant.product_id, data.toppings)
+    else:
+        resolved_toppings = [
+            (
+                get_or_404(db, ProductVariant, t.topping_product_variant_id, "Variant not found"),
+                t.quantity,
+            )
+            for t in item.toppings
+        ]
+
+    # Disponibilidad: resto del carrito (sin esta línea) + la línea editada
+    # (producto + adiciones).
     required = _cart_consumption(db, cart, exclude_item_id=item_id)
     for iid, need in required_consumption(db, variant.id, new_qty, options).items():
         required[iid] += need
+    for topping_variant, topping_qty in resolved_toppings:
+        for iid, need in required_consumption(db, topping_variant.id, topping_qty, []).items():
+            required[iid] += need
     check_availability(db, required, extra_context="carrito")
 
     try:
         item.quantity = new_qty
         item.unit_price = compute_unit_price(variant, options)
-        item.addons_total = compute_addons_total(options)
+        item.addons_total = compute_addons_total(options) + _toppings_total(resolved_toppings)
         if data.notes is not None:
             item.notes = data.notes
         if data.options is not None:
@@ -537,6 +613,16 @@ def update_item(
             rows_by_option = {o.option_id: o for o in item.options}
             for a in adjusted_options:
                 rows_by_option[a.option_id].quantity = a.new_quantity
+        if data.toppings is not None:
+            # spec 129 (FR-009): reemplazo total, independiente de `options` arriba.
+            for t in list(item.toppings):
+                db.delete(t)
+            db.flush()
+            for topping_variant, topping_qty in resolved_toppings:
+                db.add(CartItemTopping(
+                    cart_item_id=item.id, topping_product_variant_id=topping_variant.id,
+                    quantity=topping_qty, unit_price=topping_variant.price,
+                ))
         db.commit()
     except Exception:
         db.rollback()
@@ -563,6 +649,7 @@ def list_my_orders(db: Session, participant_id: UUID) -> list[CustomerOrder]:
         select(CustomerOrder)
         .options(
             selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
             selectinload(CustomerOrder.payment_attempts)
             .selectinload(OrderPaymentAttempt.payment_method),
         )
@@ -801,6 +888,42 @@ def submit_cart(
             },
         )
 
+    # spec 129 (FR-014, Edge Case): si la adición adjunta a una línea ya no está
+    # asociada a ese producto (el administrador la desasoció después de que el
+    # comensal la agregó), se rechaza el envío y se quita solo esa adición de la
+    # línea -- no la línea completa (a diferencia de FR-012 arriba: el producto
+    # principal sigue siendo válido, solo deja de llevar esa adición).
+    variant_product_by_id = {v.id: v.product_id for v in variants}
+    stale_toppings: dict[str, tuple[CartItemTopping, CartItem]] = {}
+    for item in cart.items:
+        if not item.toppings:
+            continue
+        product_id = variant_product_by_id.get(item.product_variant_id)
+        for topping_row in item.toppings:
+            topping_variant = get_or_404(
+                db, ProductVariant, topping_row.topping_product_variant_id, "Variant not found"
+            )
+            associated = db.execute(
+                select(ProductTopping.id).where(
+                    ProductTopping.product_id == product_id,
+                    ProductTopping.topping_product_id == topping_variant.product_id,
+                )
+            ).scalar()
+            if associated is None:
+                stale_toppings[topping_variant.product.name] = (topping_row, item)
+    if stale_toppings:
+        for topping_row, item in stale_toppings.values():
+            item.addons_total = item.addons_total - topping_row.unit_price * topping_row.quantity
+            db.delete(topping_row)
+        db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "error": "Algunas adiciones ya no están disponibles y se quitaron de tu carrito",
+                "productos_no_disponibles": sorted(stale_toppings.keys()),
+            },
+        )
+
     check_availability(db, _cart_consumption(db, cart), extra_context="envío de pedido")
 
     # spec 087 (FR-006, A-86): segundo punto de creación de CustomerOrder que
@@ -861,6 +984,16 @@ def submit_cart(
                 db.add(OrderItemOption(
                     order_item_id=item.id, option_id=o.option_id, quantity=o.quantity,
                     per_line=o.per_line,
+                ))
+            # spec 129: mismo copiado (snapshot, nunca recalculado) que `options`
+            # arriba -- `added_after_sale`/`complementary_sale_id` quedan en su
+            # default (`False`/`None`): un pedido recién confirmado nunca tiene
+            # todavía una `Sale` emitida.
+            for t in ci.toppings:
+                db.add(OrderItemTopping(
+                    order_item_id=item.id,
+                    topping_product_variant_id=t.topping_product_variant_id,
+                    quantity=t.quantity, unit_price=t.unit_price,
                 ))
 
         db.add(OrderPaymentAttempt(
@@ -933,6 +1066,7 @@ def submit_cart(
         select(CustomerOrder)
         .options(
             selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
             selectinload(CustomerOrder.payment_attempts)
             .selectinload(OrderPaymentAttempt.payment_method),
         )
