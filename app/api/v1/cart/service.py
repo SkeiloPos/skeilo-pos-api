@@ -61,6 +61,7 @@ from app.api.v1.catalog.line_pricing import (
     load_valid_options,
     required_consumption,
 )
+from app.api.v1.catalog.schemas import ToppingSelectionIn
 from app.api.v1.catalog.service import resolve_principal_variant
 from app.api.v1.cash.service import resolve_dine_in_table_order
 from app.api.v1.orders.checkout import line_discount_snapshot
