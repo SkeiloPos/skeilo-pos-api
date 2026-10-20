@@ -26,6 +26,9 @@ class PaymentMethodType(str, Enum):
     CARD = "card"
     TRANSFER = "transfer"
     OTHER = "other"
+    # Spec 130 (FR-004): "Pago mixto" (efectivo + transferencia) como entrada
+    # de catálogo propia, igual tratamiento que los demás tipos.
+    MIXED = "mixed"
 
 
 class PaymentMethodCreate(BaseModel):

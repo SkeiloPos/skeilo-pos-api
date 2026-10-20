@@ -202,6 +202,11 @@ class DinerPaymentAttempt(BaseModel):
     # serializar (una fila histórica con URL absoluta se sigue viendo, tolerancia de lectura).
     receipt_file_url: AssetUrl = None
     created_at: datetime
+    # Pago mixto (spec 130, FR-008): `None` en cualquier intento no mixto —
+    # alimenta el desglose de "Mis pedidos" y de la confirmación.
+    cash_amount: Decimal | None = None
+    transfer_amount: Decimal | None = None
+    cash_confirmed_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -227,6 +232,11 @@ class SubmitCartIn(BaseModel):
     intento de pago (contracts/submit-cart-with-payment.md)."""
     payment_method_id: UUID
     receipt_file_url: str | None = Field(None, max_length=500)
+    # Pago mixto (spec 130, FR-005/FR-006): solo tienen efecto si
+    # `payment_method_id` apunta a un método `type == 'mixed'`; para efectivo/
+    # transferencia puros deben venir `null` (comportamiento sin cambios).
+    cash_amount: Decimal | None = None
+    transfer_method_id: UUID | None = None
 
 
 class PaymentReceiptPresignIn(ReceiptPresignIn):

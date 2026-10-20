@@ -816,5 +816,112 @@ class TestConfirmCashConAdicionesSucesivasPorCanalesDistintos118(unittest.TestCa
         self.assertEqual(sale.discount, Decimal("2000"))
 
 
+class TestPagoMixtoGate130(unittest.TestCase):
+    """Spec 130, research.md Decisión 4: un intento mixto solo envía la orden
+    a cocina cuando AMBAS confirmaciones (`status='confirmado'` de la
+    transferencia y `cash_confirmed_at` del efectivo) existen, en cualquier
+    orden. No son characterization tests: el pago mixto es comportamiento
+    enteramente nuevo."""
+
+    def _user(self):
+        return fx.make_user_double()
+
+    def _shift(self, db):
+        return fx.make_cash_shift(db)
+
+    def _seed_mixed_order(self, *, cash_amount=Decimal("6000")):
+        db = fx.new_session()
+        table = fx.make_dining_table(db)
+        ts = fx.make_table_session(db, table=table)
+        participant = fx.make_participant(db, table_session=ts)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        fx.make_order_item(db, order, variant, estado_cocina="pendiente")
+        mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
+        nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        attempt = fx.make_payment_attempt(
+            db, order, mixto, status="pendiente",
+            receipt_file_url="https://example.invalid/a.jpg",
+            cash_amount=cash_amount, transfer_amount=PRECIO - cash_amount,
+            transfer_method_id=nequi.id,
+        )
+        db.commit()
+        return db, order, attempt
+
+    def test_approve_antes_de_confirm_cash_no_envia_a_cocina_todavia(self):
+        db, order, attempt = self._seed_mixed_order()
+
+        result = checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
+        self.assertEqual(result.status, "confirmado")
+        self.assertIsNone(result.cash_confirmed_at)
+        db.refresh(order)
+        self.assertEqual(order.status, "recibida")
+        self.assertEqual(
+            db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalars().all(),
+            [],
+        )
+
+        # Confirmar el efectivo, segunda confirmación → ahora sí avanza.
+        result2 = checkout.confirm_cash_payment_attempt(
+            db, attempt.id, Decimal("0"), self._shift(db).id, self._user(),
+        )
+        self.assertIsNotNone(result2.cash_confirmed_at)
+        db.refresh(order)
+        self.assertEqual(order.status, "pagada")
+        sale = db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalar_one()
+        self.assertEqual(sale.total, PRECIO)
+
+    def test_confirm_cash_antes_de_approve_no_envia_a_cocina_todavia(self):
+        db, order, attempt = self._seed_mixed_order()
+
+        result = checkout.confirm_cash_payment_attempt(
+            db, attempt.id, Decimal("0"), self._shift(db).id, self._user(),
+        )
+        self.assertIsNotNone(result.cash_confirmed_at)
+        self.assertEqual(result.status, "pendiente")
+        db.refresh(order)
+        self.assertEqual(order.status, "recibida")
+        self.assertEqual(
+            db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalars().all(),
+            [],
+        )
+
+        # Aprobar la transferencia, segunda confirmación → ahora sí avanza.
+        result2 = checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
+        self.assertEqual(result2.status, "confirmado")
+        db.refresh(order)
+        self.assertEqual(order.status, "pagada")
+        sale = db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalar_one()
+        self.assertEqual(sale.total, PRECIO)
+
+    def test_confirm_cash_dos_veces_sobre_el_mismo_intento_falla_409(self):
+        """FR-018/SC-007 equivalente para la porción en efectivo: una segunda
+        confirmación no tiene efecto."""
+        db, order, attempt = self._seed_mixed_order()
+        checkout.confirm_cash_payment_attempt(
+            db, attempt.id, Decimal("0"), self._shift(db).id, self._user(),
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            checkout.confirm_cash_payment_attempt(
+                db, attempt.id, Decimal("0"), self._shift(db).id, self._user(),
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_approve_dos_veces_sobre_el_mismo_intento_sigue_fallando_409(self):
+        """Sin cambios respecto al comportamiento no mixto — `status` sigue
+        siendo el campo de bloqueo de `approve`."""
+        db, order, attempt = self._seed_mixed_order()
+        checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
+
+        with self.assertRaises(HTTPException) as ctx:
+            checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
+        self.assertEqual(ctx.exception.status_code, 409)
+
+
 if __name__ == "__main__":
     unittest.main()

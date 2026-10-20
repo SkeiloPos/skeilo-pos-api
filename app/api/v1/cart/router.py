@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app.core import events
 from app.core.error_middleware import current_request_id
+from app.core.exceptions import PendingPaymentExit
 from app.core.notifications.dispatch import notify_order_created
 from app.core.http_cache import json_or_304
 from app.core.qr_context import (
@@ -123,12 +124,21 @@ def leave(x_session_token: str | None = Header(None, alias="x-session-token")):
 
     Si era el último de la mesa y no dejó ningún pedido que cobrar, la mesa vuelve
     a `libre` en el acto en vez de esperar al barrido.
+
+    Spec 130 (A-139): deja de ser infalible en un caso — un pago propio
+    pendiente responde `409` (`PendingPaymentExit`) y la sesión sigue activa.
+    Se captura primero y se deja propagar (hereda de `HTTPException`, así que
+    el `except HTTPException: pass` genérico de abajo también la atraparía y
+    la silenciaría si no se la saca antes) — ese `pass` sigue existiendo solo
+    para token inválido/expirado.
     """
     if not x_session_token:
         return None
     try:
         with open_session_context(x_session_token) as ctx:
             service.leave_session(ctx.db, ctx.participant, tenant_id=ctx.tenant.id)
+    except PendingPaymentExit:
+        raise
     except HTTPException:
         pass  # token inválido/expirado: ya no ocupa la mesa, nada que hacer
     return None
@@ -155,6 +165,7 @@ async def submit_cart(
         ctx.db, ctx.participant, body.payment_method_id, body.receipt_file_url,
         tenant_id=ctx.tenant.id, request_id=current_request_id(request),
         tenant_schema=ctx.tenant.schema, tenant=ctx.tenant,
+        cash_amount=body.cash_amount, transfer_method_id=body.transfer_method_id,
     )
     # Después del COMMIT del servicio, nunca dentro: si la transacción fallara no
     # puede haber salido un evento anunciando un pedido que no existe.

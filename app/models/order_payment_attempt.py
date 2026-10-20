@@ -33,7 +33,10 @@ class OrderPaymentAttempt(UUIDPrimaryKeyMixin, Base):
     payment_method_id: Mapped[UUID] = mapped_column(
         ForeignKey("payment_methods.id"), nullable=False, index=True
     )
-    payment_method: Mapped["PaymentMethod"] = relationship()
+    # `foreign_keys=` explícito: desde que existe `transfer_method_id` (spec 130) hay dos FK
+    # de esta tabla a `payment_methods`, y SQLAlchemy ya no puede inferir sola cuál usa cada
+    # relación.
+    payment_method: Mapped["PaymentMethod"] = relationship(foreign_keys=[payment_method_id])
 
     status: Mapped[str] = mapped_column(String(12), nullable=False, server_default="pendiente")
 
@@ -43,6 +46,28 @@ class OrderPaymentAttempt(UUIDPrimaryKeyMixin, Base):
 
     # Solo transferencia: un único archivo por intento (research.md Decisión 3).
     receipt_file_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # Pago mixto (spec 130, FR-005 a FR-008). `cash_amount IS NOT NULL` es el
+    # discriminador de "este intento es mixto" en todo el backend (gate de
+    # `_confirm_order_impl`, `confirm_cash_payment_attempt`, `approve_payment_attempt`,
+    # bloqueo de salida A-139). `None` en todos los intentos no mixtos existentes y
+    # nuevos — sin backfill (Principio VII).
+    cash_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+    transfer_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+    transfer_method_id: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("payment_methods.id"), nullable=True
+    )
+    # `foreign_keys=` explícito: distingue esta relación de la ya existente
+    # `payment_method` (también FK a `payment_methods`) — sin esto SQLAlchemy no
+    # puede decidir sola cuál columna usar para cada relación.
+    transfer_method: Mapped[Optional["PaymentMethod"]] = relationship(
+        foreign_keys=[transfer_method_id]
+    )
+    # Confirmación de la porción en efectivo de un pago mixto (research.md Decisión 4).
+    # `status == 'confirmado'` sigue siendo la confirmación de la porción por
+    # transferencia (comprobante verificado); un intento mixto solo avanza a cocina
+    # cuando AMBAS tienen valor.
+    cash_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # Visible solo para cajero/back-office (Clarification 3, FR-014) — el
     # router del comensal nunca serializa esta columna.

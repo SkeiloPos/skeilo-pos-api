@@ -31,6 +31,27 @@ class InsufficientStockError(HTTPException):
         self.item_name = item_name
 
 
+class PendingPaymentExit(HTTPException):
+    """Un comensal intenta salir del Menú QR con un pago propio sin confirmar (spec 130, A-139).
+
+    `leave_session`/`POST /cart/leave` deja de ser infalible: si el participante tiene al menos
+    un pedido propio no cancelado con el pago pendiente, la salida se bloquea con `409` en vez de
+    cerrar la sesión.
+    """
+
+    def __init__(self):
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "pago_pendiente",
+                "message": (
+                    "Tienes un pago pendiente. Para salir, dirígete a la caja. Si no deseas "
+                    "llevar tu pedido, indícalo allí."
+                ),
+            },
+        )
+
+
 class InvalidToken(Exception):
     """User has provided an invalid or expired token"""
 

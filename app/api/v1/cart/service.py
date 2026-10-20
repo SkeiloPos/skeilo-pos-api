@@ -17,6 +17,7 @@ from app.core import events
 from app.core.asset_refs import resolve_receipt_key
 from app.core.config import settings
 from app.core.crud import get_or_404
+from app.core.exceptions import PendingPaymentExit
 from app.core.models import Tenant
 from app.core.order_audit import (
     ActorType,
@@ -64,7 +65,7 @@ from app.api.v1.catalog.line_pricing import (
 from app.api.v1.catalog.schemas import ToppingSelectionIn
 from app.api.v1.catalog.service import resolve_principal_variant
 from app.api.v1.cash.service import resolve_dine_in_table_order
-from app.api.v1.orders.checkout import line_discount_snapshot
+from app.api.v1.orders.checkout import compute_checkout_preview, line_discount_snapshot
 from app.api.v1.orders.schemas import CancelIn
 from app.api.v1.promotions import service as promotions
 from app.api.v1.cart.schemas import (
@@ -717,15 +718,57 @@ def cancel_my_order(
     return result
 
 
+def _has_pending_payment(db: Session, participant_id: UUID) -> bool:
+    """FR-009/FR-011 (spec 130, A-139, contracts/bloqueo-salida.md): ¿el
+    participante tiene al menos un pedido propio, no cancelado, cuyo intento de
+    pago vigente (el más reciente) no está completamente confirmado? Solo mira
+    pedidos propios de este participante — un pedido pendiente de otro comensal
+    de la misma mesa no cuenta (Clarificación Q2)."""
+    orders = db.execute(
+        select(CustomerOrder.id).where(
+            CustomerOrder.participant_id == participant_id,
+            CustomerOrder.status != "cancelada",
+        )
+    ).scalars().all()
+    if not orders:
+        return False
+    for order_id in orders:
+        attempt = db.execute(
+            select(OrderPaymentAttempt)
+            .where(OrderPaymentAttempt.order_id == order_id)
+            .order_by(OrderPaymentAttempt.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if attempt is None:
+            continue
+        if attempt.cash_amount is None:
+            # Efectivo o transferencia puros: confirmado ⇔ `status='confirmado'`.
+            if attempt.status != "confirmado":
+                return True
+        else:
+            # Mixto: completamente confirmado ⇔ ambas partes tienen valor
+            # (research.md Decisión 4, data-model.md).
+            if attempt.status != "confirmado" or attempt.cash_confirmed_at is None:
+                return True
+    return False
+
+
 def leave_session(
     db: Session, participant: SessionParticipant, tenant_id: int | None = None
 ) -> None:
     """El comensal se va de la mesa.
 
     Cierra su carrito y, si era el último y no quedó nada que cobrar, libera la
-    mesa en el acto. No falla nunca: salir es idempotente y el comensal ya se está
-    marchando — un error aquí no le sirve de nada a nadie.
+    mesa en el acto.
+
+    Spec 130 (A-139): deja de ser infalible — si el participante tiene un
+    pedido propio con el pago pendiente (FR-009), se bloquea con
+    `PendingPaymentExit` (409) antes de tocar nada; la sesión permanece activa
+    (FR-010). Sin pedidos pendientes, sigue siendo idempotente y sin efectos
+    secundarios que le sirvan de algo a un comensal que ya se está yendo.
     """
+    if _has_pending_payment(db, participant.id):
+        raise PendingPaymentExit()
     close_participant(db, participant)
     closed = try_release_if_empty(db, participant.table_session_id)
     db.commit()
@@ -742,6 +785,8 @@ def submit_cart(
     request_id: str | None = None,
     tenant_schema: str | None = None,
     tenant: Tenant | None = None,
+    cash_amount: Decimal | None = None,
+    transfer_method_id: UUID | None = None,
 ) -> CustomerOrder:
     """Envía el carrito del comensal como pedido: crea una `CustomerOrder` en
     estado `recibida` con sus líneas **y** su primer `OrderPaymentAttempt`, en
@@ -836,7 +881,47 @@ def submit_cart(
     method = get_or_404(db, PaymentMethod, payment_method_id, "Método de pago no encontrado")
     if not method.active:
         raise HTTPException(status.HTTP_409_CONFLICT, "El método de pago ya no está disponible")
-    if method.is_cash:
+
+    resolved_transfer_method_id: UUID | None = None
+    if method.type == "mixed":
+        # FR-006 (spec 130): el monto en efectivo es obligatorio y debe quedar
+        # estrictamente entre $0 y el total — ambos límites orientan a elegir
+        # "Efectivo" (si cubre todo) en vez de "Pago mixto".
+        if cash_amount is None or cash_amount <= 0:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Ingresa cuánto vas a pagar en efectivo (mayor a $0); si vas a pagar todo "
+                "en efectivo, elige 'Efectivo' en vez de 'Pago mixto'",
+            )
+        if not receipt_file_url:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Este método de pago exige cargar un comprobante",
+            )
+        receipt_file_url = resolve_receipt_key(receipt_file_url, _require_receipt_schema(tenant_schema))
+
+        # FR-005: se resuelve automáticamente si el tenant tiene exactamente un
+        # método de transferencia activo; con más de uno, el comensal debe elegir.
+        transfer_methods = db.execute(
+            select(PaymentMethod.id).where(
+                PaymentMethod.type == "transfer", PaymentMethod.active.is_(True),
+            )
+        ).scalars().all()
+        if transfer_method_id is not None:
+            if transfer_method_id not in transfer_methods:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "El método de transferencia elegido no está disponible",
+                )
+            resolved_transfer_method_id = transfer_method_id
+        elif len(transfer_methods) == 1:
+            resolved_transfer_method_id = transfer_methods[0]
+        else:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Elige a cuál método de transferencia va el resto del pago mixto",
+            )
+    elif method.is_cash:
         if receipt_file_url is not None:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -997,10 +1082,27 @@ def submit_cart(
                     quantity=t.quantity, unit_price=t.unit_price,
                 ))
 
+        transfer_amount: Decimal | None = None
+        if method.type == "mixed":
+            # FR-006: el límite superior exacto solo se conoce una vez calculado
+            # el total autoritativo del pedido (descuentos de promoción + domicilio
+            # ya aplicados) — no antes de crear la orden.
+            total = compute_checkout_preview(db, order.id, tenant).total
+            if cash_amount >= total:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"El monto en efectivo ({cash_amount}) debe ser menor al total "
+                    f"({total}); si cubre todo, elige 'Efectivo' en vez de 'Pago mixto'",
+                )
+            transfer_amount = total - cash_amount
+
         db.add(OrderPaymentAttempt(
             order_id=order.id,
             payment_method_id=payment_method_id,
             receipt_file_url=receipt_file_url,
+            cash_amount=cash_amount if method.type == "mixed" else None,
+            transfer_amount=transfer_amount,
+            transfer_method_id=resolved_transfer_method_id,
         ))
 
         # spec 038, FR-003/FR-004: el carrito se elimina físicamente (no se

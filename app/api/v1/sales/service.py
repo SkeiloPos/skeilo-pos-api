@@ -179,6 +179,28 @@ def create_payment_method(
             "use PATCH para editarla o reactivarla.",
         )
 
+    if catalog.type == "mixed":
+        # FR-004 (spec 130): "Pago mixto" solo puede activarse si el tenant ya
+        # tiene, entre sus métodos activos, al menos uno de efectivo y al menos
+        # uno de transferencia — no se reevalúa después de activado (data-model.md).
+        active_types = set(
+            db.execute(
+                select(PaymentMethod.type).where(PaymentMethod.active.is_(True))
+            ).scalars().all()
+        )
+        faltantes = []
+        if "cash" not in active_types:
+            faltantes.append("efectivo")
+        if "transfer" not in active_types:
+            faltantes.append("transferencia")
+        if faltantes:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Para activar 'Pago mixto' el tenant debe tener activos al menos un "
+                "método de efectivo y uno de transferencia. Falta: "
+                + " y ".join(faltantes) + ".",
+            )
+
     is_complete = _validate_payment_info(catalog.fields, data.payment_info)
     _verify_new_payment_images(db, tenant_schema, catalog, data.payment_info)
     method = PaymentMethod(

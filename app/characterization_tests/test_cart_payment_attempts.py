@@ -390,6 +390,114 @@ class TestCartPaymentAttempts(unittest.TestCase):
         )
         self.assertEqual(order.current_payment_attempt.receipt_file_url, presign.key)
 
+    # ------------------------------------------------- spec 130: pago mixto del comensal
+
+    def test_submit_cart_mixto_resuelve_un_unico_metodo_de_transferencia(self):
+        """FR-005/FR-006/FR-007: con un único método de transferencia activo se
+        resuelve solo; el desglose (`cash_amount`/`transfer_amount`/
+        `transfer_method_id`) queda persistido en el intento."""
+        db, participant, variant = self._seed_session_con_carrito()  # total = $8.000
+        mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
+        nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        db.commit()
+        presign = service.presign_payment_receipt(db, "tenant_test", participant.id, "image/jpeg")
+
+        order = service.submit_cart(
+            db, participant, mixto.id, receipt_file_url=presign.public_url, tenant_schema=SCHEMA,
+            cash_amount=Decimal("3000"),
+        )
+
+        attempt = order.current_payment_attempt
+        self.assertEqual(attempt.cash_amount, Decimal("3000"))
+        self.assertEqual(attempt.transfer_amount, Decimal("5000"))
+        self.assertEqual(attempt.transfer_method_id, nequi.id)
+        self.assertEqual(attempt.receipt_file_url, presign.key)
+        self.assertIsNone(attempt.cash_confirmed_at)
+        self.assertEqual(attempt.status, "pendiente")
+
+    def test_submit_cart_mixto_con_dos_transferencias_exige_elegir(self):
+        """FR-005: con más de un método de transferencia activo, omitir
+        `transfer_method_id` falla con 422."""
+        db, participant, variant = self._seed_session_con_carrito()
+        mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
+        fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        bancolombia = fx.make_payment_method(db, name="Bancolombia", is_cash=False, type="transfer")
+        db.commit()
+        presign = service.presign_payment_receipt(db, "tenant_test", participant.id, "image/jpeg")
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.submit_cart(
+                db, participant, mixto.id, receipt_file_url=presign.public_url, tenant_schema=SCHEMA,
+                cash_amount=Decimal("3000"),
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+        # Elegido explícitamente, sí funciona.
+        order = service.submit_cart(
+            db, participant, mixto.id, receipt_file_url=presign.public_url, tenant_schema=SCHEMA,
+            cash_amount=Decimal("3000"), transfer_method_id=bancolombia.id,
+        )
+        self.assertEqual(order.current_payment_attempt.transfer_method_id, bancolombia.id)
+
+    def test_submit_cart_mixto_cash_amount_nulo_o_cero_falla_422(self):
+        """FR-006: `cash_amount` es obligatorio y debe ser mayor a $0."""
+        db, participant, variant = self._seed_session_con_carrito()
+        mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
+        fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        db.commit()
+        presign = service.presign_payment_receipt(db, "tenant_test", participant.id, "image/jpeg")
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.submit_cart(
+                db, participant, mixto.id, receipt_file_url=presign.public_url, tenant_schema=SCHEMA,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.submit_cart(
+                db, participant, mixto.id, receipt_file_url=presign.public_url, tenant_schema=SCHEMA,
+                cash_amount=Decimal("0"),
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_submit_cart_mixto_cash_amount_igual_o_mayor_al_total_falla_422(self):
+        """FR-006: el monto en efectivo debe ser estrictamente menor al total
+        ($8.000) — orienta a elegir 'Efectivo' si lo cubre todo."""
+        db, participant, variant = self._seed_session_con_carrito()
+        mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
+        fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        db.commit()
+        presign = service.presign_payment_receipt(db, "tenant_test", participant.id, "image/jpeg")
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.submit_cart(
+                db, participant, mixto.id, receipt_file_url=presign.public_url, tenant_schema=SCHEMA,
+                cash_amount=Decimal("8000"),
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+        # Ninguna orden ni intento quedó a medias tras el 422 (mismo criterio
+        # que el resto de `submit_cart`, FR-012 de spec 025).
+        self.assertEqual(
+            db.execute(
+                select(func.count(CustomerOrder.id)).where(
+                    CustomerOrder.participant_id == participant.id
+                )
+            ).scalar_one(),
+            0,
+        )
+
+    def test_submit_cart_mixto_sin_comprobante_falla_422(self):
+        """FR-007: el comprobante de la porción por transferencia es obligatorio."""
+        db, participant, variant = self._seed_session_con_carrito()
+        mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
+        fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.submit_cart(db, participant, mixto.id, cash_amount=Decimal("3000"))
+        self.assertEqual(ctx.exception.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

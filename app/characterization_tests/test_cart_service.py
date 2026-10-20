@@ -25,6 +25,7 @@ from sqlalchemy.exc import MultipleResultsFound
 
 from app.characterization_tests import cart_fixtures
 from app.api.v1.cart import service
+from app.core.exceptions import PendingPaymentExit
 from app.core.models import Tenant
 from app.api.v1.cart.schemas import (
     CartItemIn, CartItemUpdate, CartResponse, SessionOpenResponse,
@@ -510,6 +511,124 @@ class TestCartService(unittest.TestCase):
         self.assertEqual(participant.status, "closed")
         self.assertIsNone(db.get(Cart, resp.cart_id))
         self.assertEqual(table.status, "libre")
+
+    # ------------------------------------------- leave_session: bloqueo de salida (spec 130, A-139)
+
+    def test_leave_session_bloquea_con_pedido_propio_en_efectivo_sin_cobrar(self):
+        """FR-009: un pedido propio en efectivo sin confirmar bloquea la
+        salida — la sesión sigue activa, nada se cierra."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db)
+        efectivo = self._seed_efectivo(db)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        service.submit_cart(db, participant, efectivo.id)
+
+        with self.assertRaises(PendingPaymentExit) as ctx:
+            service.leave_session(db, participant)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(participant.status, "open")
+
+    def test_leave_session_bloquea_con_pedido_propio_por_transferencia_sin_verificar(self):
+        """FR-009/Clarificación Q1: también bloquea un pedido 100% por
+        transferencia mientras el comprobante siga sin aprobar."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db)
+        nequi = cart_fixtures.make_payment_method(
+            db, name=f"nequi-{uuid4()}", is_cash=False, type="transfer"
+        )
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        with mock.patch("app.core.asset_refs.object_exists", return_value=True):
+            service.submit_cart(
+                db, participant, nequi.id, receipt_file_url="tenant_test/comprobantes/a.jpg",
+                tenant_schema="tenant_test",
+            )
+
+        with self.assertRaises(PendingPaymentExit):
+            service.leave_session(db, participant)
+        self.assertEqual(participant.status, "open")
+
+    def test_leave_session_bloquea_con_pedido_propio_mixto_con_una_sola_confirmacion(self):
+        """FR-009: un pago mixto bloquea mientras falte cualquiera de las dos
+        confirmaciones."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db, price=Decimal("8000"))
+        mixto = cart_fixtures.make_payment_method(
+            db, name=f"mixto-{uuid4()}", is_cash=False, type="mixed"
+        )
+        cart_fixtures.make_payment_method(db, name=f"nequi-{uuid4()}", is_cash=False, type="transfer")
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        with mock.patch("app.core.asset_refs.object_exists", return_value=True):
+            order = service.submit_cart(
+                db, participant, mixto.id, receipt_file_url="tenant_test/comprobantes/a.jpg",
+                tenant_schema="tenant_test", cash_amount=Decimal("3000"),
+            )
+
+        with self.assertRaises(PendingPaymentExit):
+            service.leave_session(db, participant)
+
+        # Se confirma solo una de las dos partes (directo en el modelo, sin
+        # pasar por `orders/checkout.py` — alcance de este test es solo el
+        # criterio de bloqueo de `leave_session`, no el gate de cocina).
+        attempt = order.current_payment_attempt
+        attempt.status = "confirmado"
+        db.commit()
+
+        with self.assertRaises(PendingPaymentExit):
+            service.leave_session(db, participant)
+        self.assertEqual(participant.status, "open")
+
+    def test_leave_session_permite_salir_con_pedido_propio_completamente_confirmado(self):
+        """FR-009: un pedido ya cobrado/confirmado no bloquea la salida."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db)
+        efectivo = self._seed_efectivo(db)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        order = service.submit_cart(db, participant, efectivo.id)
+        order.current_payment_attempt.status = "confirmado"
+        db.commit()
+
+        service.leave_session(db, participant)
+        self.assertEqual(participant.status, "closed")
+
+    def test_leave_session_sin_pedidos_propios_permite_salir(self):
+        """FR-009: solo carrito, sin ningún pedido enviado — sale con
+        normalidad (mismo camino que el test ya existente arriba)."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        db.commit()
+
+        service.leave_session(db, participant)
+        self.assertEqual(participant.status, "closed")
+
+    def test_leave_session_no_bloquea_por_pedido_pendiente_de_otro_comensal(self):
+        """Clarificación Q2: el pedido pendiente de OTRO comensal de la misma
+        mesa no bloquea la salida de quien no tiene pedidos propios."""
+        db, table, ts, participant_ana = self._seed_session()
+        participant_luis = cart_fixtures.make_participant(db, table_session=ts, display_name="Luis")
+        variant, _, _ = self._seed_variant(db)
+        efectivo = self._seed_efectivo(db)
+        service.add_item(db, participant_luis.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        service.submit_cart(db, participant_luis, efectivo.id)  # Luis: pago pendiente
+
+        service.leave_session(db, participant_ana)  # Ana no tiene pedidos propios
+        self.assertEqual(participant_ana.status, "closed")
+
+        with self.assertRaises(PendingPaymentExit):
+            service.leave_session(db, participant_luis)
+
+    def test_leave_session_ignora_pedido_cancelado(self):
+        """FR-009: un pedido propio ya CANCELADO no cuenta como pendiente."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db)
+        efectivo = self._seed_efectivo(db)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        order = service.submit_cart(db, participant, efectivo.id)
+        order.status = "cancelada"
+        db.commit()
+
+        service.leave_session(db, participant)
+        self.assertEqual(participant.status, "closed")
 
     # ----------------------------------------------------------------- submit_cart (T021)
 

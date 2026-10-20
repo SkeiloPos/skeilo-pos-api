@@ -28,7 +28,7 @@ class PaymentMethodCatalog(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __table_args__ = (
         CheckConstraint(
-            "type IN ('cash', 'card', 'transfer', 'other')",
+            "type IN ('cash', 'card', 'transfer', 'other', 'mixed')",
             name="ck_payment_method_catalog_type",
         ),
         {"schema": "shared"},
