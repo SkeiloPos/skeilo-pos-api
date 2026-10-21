@@ -15,6 +15,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
 
@@ -125,12 +126,24 @@ def resolve_or_create_by_code(
     if item is not None:
         for key, value in fields.items():
             setattr(item, key, value)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise ValueError(
+                f"Ya existe un insumo con el nombre '{fields.get('name')}'"
+            ) from exc
         return item, False
 
     item = InventoryItem(code=code or generate_next_code(db), **fields)
     db.add(item)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ValueError(
+            f"Ya existe un insumo con el nombre '{fields.get('name')}'"
+        ) from exc
     return item, True
 
 

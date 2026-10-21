@@ -336,6 +336,40 @@ def test_codigos_duplicados_en_el_archivo_fallan_ambas(db, unit):
     print("OK: codigos_duplicados_en_el_archivo_fallan_ambas")
 
 
+def test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item):
+    """Regresión: un `code` nuevo con un `name` que ya existe en otro insumo
+    (unique constraint `ix_tenant_inventory_items_name`) no debe tumbar el
+    job entero -- debe fallar solo esa fila, dejando el resto del archivo
+    aplicado y el job en `finalizado`."""
+    code_nuevo = f"T{uuid4().hex[:6]}"
+    code_ok = f"T{uuid4().hex[:6]}"
+    filas = [
+        [code_nuevo, item.name, "Materia prima", unit.abbreviation,
+         "0", "0", "0", "", "", "", ""],
+        [code_ok, f"Insumo-normal-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation,
+         "0", "0", "0", "", "", "", ""],
+    ]
+    job = _job(db, uuid4(), len(filas))
+    db.commit()
+    procesar_archivo_importacion(db, job, filas)
+    db.refresh(job)
+    assert job.status == "finalizado", job.status
+    assert job.failed_count == 1, job.errors
+    assert job.created_count == 1, job.errors
+    assert "ya existe" in job.errors[0]["motivo"].lower(), job.errors
+
+    _codigos_extra.append(code_ok)
+    sin_crear = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code_nuevo)
+    ).scalar_one_or_none()
+    assert sin_crear is None, "la fila con nombre duplicado no debía crear nada"
+    creado = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code_ok)
+    ).scalar_one_or_none()
+    assert creado is not None, "la fila siguiente debía aplicarse con normalidad"
+    print("OK: nombre_duplicado_contra_insumo_existente_falla_la_fila")
+
+
 def test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit):
     """research.md D5/FR-015 (quickstart.md §1 punto 9): si el proceso se
     detiene a mitad de un archivo (simulado invocando directamente las
@@ -379,6 +413,7 @@ def main() -> None:
             lambda: test_filas_con_errores_distintos_fallan_individualmente(db, unit),
             test_estructura_alterada_no_crea_job,
             lambda: test_codigos_duplicados_en_el_archivo_fallan_ambas(db, unit),
+            lambda: test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item),
             lambda: test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit),
             lambda: test_unidad_inexistente_se_consolida_creandola_en_mayuscula(db),
             lambda: test_unidad_existente_se_reconoce_sin_distinguir_mayusculas(db, unit),
