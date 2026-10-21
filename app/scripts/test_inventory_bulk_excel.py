@@ -15,12 +15,13 @@ from uuid import uuid4
 from sqlalchemy import select, delete, func, text
 
 from app.core.db import with_db
+from app.core.timezone import utc_now
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
 from app.models.inventory_import_job import InventoryImportJob
-from app.api.v1.inventory import supplier_items
+from app.api.v1.inventory import service, supplier_items
 from app.api.v1.inventory.export import build_inventory_excel
 from app.api.v1.inventory.import_ import validar_estructura, procesar_archivo_importacion
 from app.api.v1.inventory.schemas import INVENTORY_TEMPLATE_HEADERS
@@ -370,6 +371,52 @@ def test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item):
     print("OK: nombre_duplicado_contra_insumo_existente_falla_la_fila")
 
 
+def test_job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes(db, unit, schema):
+    """Cancelación cooperativa (botón "Cancelar" del front, sin tocar la
+    base de datos a mano): si otra sesión marca el job como ya no
+    `procesando` mientras el worker sigue en el loop de
+    `procesar_archivo_importacion`, debe cortar antes de la siguiente fila
+    y no sobrescribir el status que dejó quien canceló."""
+    code_1 = f"T{uuid4().hex[:6]}"
+    code_2 = f"T{uuid4().hex[:6]}"
+    filas = [
+        [code_1, f"Antes-de-cancelar-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation,
+         "0", "0", "0", "", "", "", ""],
+        [code_2, f"Despues-de-cancelar-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation,
+         "0", "0", "0", "", "", "", ""],
+    ]
+    job = _job(db, uuid4(), len(filas))
+    db.commit()
+
+    original_resolve = service.resolve_or_create_by_code
+
+    def _resolver_y_cancelar(*args, **kwargs):
+        resultado = original_resolve(*args, **kwargs)
+        with with_db(schema) as otra_sesion:
+            otro_job = otra_sesion.get(InventoryImportJob, job.id)
+            otro_job.status = "interrumpido"
+            otro_job.finished_at = utc_now().replace(tzinfo=None)
+            otra_sesion.commit()
+        return resultado
+
+    service.resolve_or_create_by_code = _resolver_y_cancelar
+    try:
+        procesar_archivo_importacion(db, job, filas)
+    finally:
+        service.resolve_or_create_by_code = original_resolve
+
+    db.refresh(job)
+    assert job.status == "interrumpido", job.status
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code_1)
+
+    existe_segunda = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code_2)
+    ).scalar_one_or_none()
+    assert existe_segunda is None, "la fila posterior a la cancelación no debía aplicarse"
+    print("OK: job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes")
+
+
 def test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit):
     """research.md D5/FR-015 (quickstart.md §1 punto 9): si el proceso se
     detiene a mitad de un archivo (simulado invocando directamente las
@@ -414,6 +461,7 @@ def main() -> None:
             test_estructura_alterada_no_crea_job,
             lambda: test_codigos_duplicados_en_el_archivo_fallan_ambas(db, unit),
             lambda: test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item),
+            lambda: test_job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes(db, unit, schema),
             lambda: test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit),
             lambda: test_unidad_inexistente_se_consolida_creandola_en_mayuscula(db),
             lambda: test_unidad_existente_se_reconoce_sin_distinguir_mayusculas(db, unit),

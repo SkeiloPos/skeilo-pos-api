@@ -234,7 +234,15 @@ def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> No
     Pre-escanea los códigos del archivo para detectar duplicados *dentro del
     mismo archivo* (Edge case del spec: ambas filas fallan, ninguna se aplica) --
     una vez committeada la primera, `resolve_or_create_by_code` ya no vería un
-    duplicado como tal, sino como una actualización legítima."""
+    duplicado como tal, sino como una actualización legítima.
+
+    Cancelación cooperativa: cada fila hace su propio commit, lo que expira
+    `job` en la sesión (expire_on_commit por defecto) -- así, al releer
+    `job.status` al principio de la siguiente vuelta, se ve el valor que haya
+    dejado otra sesión (p. ej. el endpoint de cancelar). Si alguien marcó el
+    job como ya no `procesando`, el loop corta aquí mismo y nunca llega al
+    bloque final que lo pondría en `finalizado`, dejando el status que haya
+    puesto quien canceló."""
     codigos_vistos: dict[str, int] = {}
     for numero, fila in enumerate(filas, start=1):
         code = str(fila[_CODE]).strip() if fila[_CODE] else None
@@ -243,6 +251,8 @@ def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> No
     duplicados = {code for code, veces in codigos_vistos.items() if veces > 1}
 
     for numero, fila in enumerate(filas, start=1):
+        if job.status != "procesando":
+            return
         code = str(fila[_CODE]).strip() if fila[_CODE] else None
         if code and code in duplicados:
             resultado = {
