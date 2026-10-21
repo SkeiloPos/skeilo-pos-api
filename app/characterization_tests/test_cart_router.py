@@ -211,6 +211,25 @@ class TestCartRouter(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(participant.status, "closed")
 
+    def test_leave_endpoint_con_pago_pendiente_responde_409_sesion_sigue_activa(self):
+        """Spec 130 (A-139): `POST /cart/leave` deja de tragarse el error con
+        un participante que tiene un pedido propio sin cobrar — responde
+        `409` (no se traga vía el `except HTTPException: pass` genérico) y la
+        sesión del participante sigue activa."""
+        db, table, ts, participant = self._seed_session()
+        variant = self._seed_variant(db)
+        efectivo = cart_fixtures.make_payment_method(db, name=f"efectivo-{uuid4()}", is_cash=True)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        service.submit_cart(db, participant, efectivo.id)
+
+        sctx = self._ctx(db, table, ts, participant)
+        with cart_fixtures.patched_session_context(ctx=sctx):
+            with self.assertRaises(HTTPException) as ctx:
+                cart_router.leave(x_session_token="token-de-prueba")
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(participant.status, "open")
+
     # --------------------------------------------------------- POST /cart/submit (T031)
 
     def test_submit_cart_endpoint_evento_tras_commit(self):

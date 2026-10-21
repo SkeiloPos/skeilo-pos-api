@@ -183,5 +183,65 @@ class TestSalesPaymentMethodsCatalog(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
 
+class TestActivarPagoMixto130(unittest.TestCase):
+    """Spec 130, FR-004: "Pago mixto" solo se activa si el tenant ya tiene
+    efectivo y transferencia activos. No es characterization test: 'mixed' es
+    un tipo de catálogo enteramente nuevo (Constitución, Principio IV/X)."""
+
+    def test_sin_efectivo_ni_transferencia_activos_rechaza_409(self):
+        db = fx.new_session()
+        mixto = fx.make_payment_method_catalog(db, name="Pago mixto", type="mixed")
+        db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.create_payment_method(db, PaymentMethodCreate(catalog_id=mixto.id))
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("efectivo", ctx.exception.detail)
+        self.assertIn("transferencia", ctx.exception.detail)
+
+    def test_con_solo_transferencia_activa_sigue_rechazando_409(self):
+        db = fx.new_session()
+        mixto = fx.make_payment_method_catalog(db, name="Pago mixto", type="mixed")
+        fx.make_payment_method(db, name="Nequi", type="transfer", is_cash=False)
+        db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.create_payment_method(db, PaymentMethodCreate(catalog_id=mixto.id))
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_con_solo_efectivo_activo_sigue_rechazando_409(self):
+        db = fx.new_session()
+        mixto = fx.make_payment_method_catalog(db, name="Pago mixto", type="mixed")
+        fx.make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
+        db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.create_payment_method(db, PaymentMethodCreate(catalog_id=mixto.id))
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_con_efectivo_y_transferencia_activos_se_acepta(self):
+        db = fx.new_session()
+        mixto = fx.make_payment_method_catalog(db, name="Pago mixto", type="mixed")
+        fx.make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
+        fx.make_payment_method(db, name="Nequi", type="transfer", is_cash=False)
+        db.commit()
+
+        method = service.create_payment_method(db, PaymentMethodCreate(catalog_id=mixto.id))
+        self.assertTrue(method.active)
+        self.assertEqual(method.type, "mixed")
+
+    def test_efectivo_o_transferencia_inactivos_no_cuentan(self):
+        """La validación mira métodos ACTIVOS, no solo existentes."""
+        db = fx.new_session()
+        mixto = fx.make_payment_method_catalog(db, name="Pago mixto", type="mixed")
+        fx.make_payment_method(db, name="Efectivo", type="cash", is_cash=True, active=False)
+        fx.make_payment_method(db, name="Nequi", type="transfer", is_cash=False)
+        db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.create_payment_method(db, PaymentMethodCreate(catalog_id=mixto.id))
+        self.assertEqual(ctx.exception.status_code, 409)
+
+
 if __name__ == "__main__":
     unittest.main()

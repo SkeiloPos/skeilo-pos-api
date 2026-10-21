@@ -69,7 +69,7 @@ class PaymentMethod(UUIDPrimaryKeyMixin, Base):
 
     __table_args__ = (
         CheckConstraint(
-            "type IN ('cash', 'card', 'transfer', 'other')",
+            "type IN ('cash', 'card', 'transfer', 'other', 'mixed')",
             name="ck_payment_method_type",
         ),
         UniqueConstraint("catalog_id", name="uq_payment_method_catalog_id"),

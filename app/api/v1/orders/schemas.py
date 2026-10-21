@@ -238,6 +238,11 @@ class CurrentPaymentAttemptSummary(BaseModel):
     is_cash: bool
     # spec 088 (FR-008): la columna guarda la key; se ensambla la URL al serializar.
     receipt_file_url: AssetUrl = None
+    # Pago mixto (spec 130, FR-008): `None` en cualquier intento no mixto — alimenta
+    # el desglose que ven "Mis pedidos" y la confirmación.
+    cash_amount: Decimal | None = None
+    transfer_amount: Decimal | None = None
+    cash_confirmed_at: UtcDatetime | None = None
 
 
 class AppliedPromotionOut(BaseModel):
@@ -382,6 +387,11 @@ class PaymentAttemptResponse(BaseModel):
     resolved_by_user_id: UUID | None = None
     resolved_at: UtcDatetime | None = None
     created_at: UtcDatetime
+    # Pago mixto (spec 130, FR-008): `None` en cualquier intento no mixto.
+    cash_amount: Decimal | None = None
+    transfer_amount: Decimal | None = None
+    transfer_method_id: UUID | None = None
+    cash_confirmed_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

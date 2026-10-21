@@ -664,10 +664,17 @@ def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrde
     # confirmado. Se verifica antes de tocar inventario a propósito — si el
     # pago no está confirmado, esta llamada no debe tener ningún efecto
     # secundario (research.md spec 024, Decisión 5).
+    #
+    # spec 130: un intento mixto (`cash_amount IS NOT NULL`) exige ADEMÁS
+    # `cash_confirmed_at` — `status='confirmado'` por sí solo ya no basta para
+    # ese caso (la porción en efectivo puede seguir sin cobrar en caja). Un
+    # intento no mixto (`cash_amount IS NULL`) no cambia: solo exige `status`.
     has_confirmed_payment = db.execute(
         select(OrderPaymentAttempt.id).where(
             OrderPaymentAttempt.order_id == order.id,
             OrderPaymentAttempt.status == "confirmado",
+            (OrderPaymentAttempt.cash_amount.is_(None))
+            | (OrderPaymentAttempt.cash_confirmed_at.isnot(None)),
         )
     ).scalar_one_or_none()
     if has_confirmed_payment is None:
@@ -1214,7 +1221,15 @@ def approve_payment_attempt(
     "Liberar Mesa" quedaban permanentemente rotos para ese pedido). Reusa
     exactamente el mismo motor de venta que `pay_order`/`checkout_and_send`
     (líneas, promociones/combos, `build_sale`) — un único pago por el total
-    exacto de la orden, con el método del comprobante ya aprobado."""
+    exacto de la orden, con el método del comprobante ya aprobado.
+
+    Spec 130, research.md Decisión 4: si el intento es mixto
+    (`cash_amount IS NOT NULL`), esta llamada sigue fijando `status='confirmado'`
+    (verifica la porción por transferencia), pero el envío a cocina/`build_sale`
+    solo ocurre si, además, `cash_confirmed_at` ya tiene valor (la porción en
+    efectivo ya se cobró en caja) — si no, la llamada termina aquí, sin tocar
+    inventario ni generar venta, en cualquier orden respecto a `confirm-cash`."""
+    dispatched = False
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
         method = get_or_404(db, PaymentMethod, attempt.payment_method_id, "Payment method not found")
@@ -1241,50 +1256,57 @@ def approve_payment_attempt(
         # `status` todavía persistido ("pendiente") y siempre rechaza con
         # 409, aunque el intento ya esté confirmado en memoria.
         db.flush()
-        order = _confirm_order_impl(db, attempt.order_id, user)
 
-        # spec 073 (FR-009/FR-018, A-70): vigencia temporal contra el instante
-        # congelado del pedido (el flujo QR también lo congela — research.md D2).
-        instant = promotion_evaluation_instant([order], now=utc_now())
-        lines = order_sale_lines(db, order.id)
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
-        # Spec 056, research.md Decisión 5: el domicilio debe quedar incluido
-        # en el ÚNICO pago que se autogenera aquí — de lo contrario queda
-        # corto exactamente en ese valor y el propio chequeo `paid < total`
-        # de build_sale (ya con el domicilio sumado) rechazaría este pago.
-        delivery_fee = order.delivery_fee or Decimal("0")
-        total = (
-            sum((line.line_total for line in lines), Decimal("0"))
-            - promo_discount + delivery_fee
-        )
+        if attempt.cash_amount is not None and attempt.cash_confirmed_at is None:
+            # Pago mixto, porción en efectivo todavía sin cobrar: la transferencia
+            # queda verificada, pero la orden no avanza (research.md Decisión 4).
+            db.commit()
+        else:
+            dispatched = True
+            order = _confirm_order_impl(db, attempt.order_id, user)
 
-        build_sale(
-            db,
-            lines=lines,
-            shift=shift,
-            cashier=user,
-            payments=[PaymentIn(payment_method_id=attempt.payment_method_id, amount=total)],
-            discount=promo_discount,
-            delivery_fee=delivery_fee,
-            customer_name=order.customer_name,
-            dining_table_id=order.dining_table_id,
-            table_session_id=order.table_session_id,
-            participant_id=order.participant_id,
-            customer_order_id=order.id,
-            promotion_id=final_promotion_id,
-            applied_promotions=applied,
-            promotion_evaluated_at=instant,  # FR-011a
-        )
-        order.discount = promo_discount
-        order.applied_promotions = applied
+            # spec 073 (FR-009/FR-018, A-70): vigencia temporal contra el instante
+            # congelado del pedido (el flujo QR también lo congela — research.md D2).
+            instant = promotion_evaluation_instant([order], now=utc_now())
+            lines = order_sale_lines(db, order.id)
+            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+            # Spec 056, research.md Decisión 5: el domicilio debe quedar incluido
+            # en el ÚNICO pago que se autogenera aquí — de lo contrario queda
+            # corto exactamente en ese valor y el propio chequeo `paid < total`
+            # de build_sale (ya con el domicilio sumado) rechazaría este pago.
+            delivery_fee = order.delivery_fee or Decimal("0")
+            total = (
+                sum((line.line_total for line in lines), Decimal("0"))
+                - promo_discount + delivery_fee
+            )
 
-        # spec 035, A-52 (registro-de-anomalias.md): la Sale ya se construyó
-        # arriba en esta misma transacción — igual que en checkout_and_send,
-        # el pedido queda 'pagada' de una vez, no 'abierta' (aunque cocina
-        # todavía no haya terminado de prepararlo).
-        order.status = "pagada"
+            build_sale(
+                db,
+                lines=lines,
+                shift=shift,
+                cashier=user,
+                payments=[PaymentIn(payment_method_id=attempt.payment_method_id, amount=total)],
+                discount=promo_discount,
+                delivery_fee=delivery_fee,
+                customer_name=order.customer_name,
+                dining_table_id=order.dining_table_id,
+                table_session_id=order.table_session_id,
+                participant_id=order.participant_id,
+                customer_order_id=order.id,
+                promotion_id=final_promotion_id,
+                applied_promotions=applied,
+                promotion_evaluated_at=instant,  # FR-011a
+            )
+            order.discount = promo_discount
+            order.applied_promotions = applied
 
-        db.commit()
+            # spec 035, A-52 (registro-de-anomalias.md): la Sale ya se construyó
+            # arriba en esta misma transacción — igual que en checkout_and_send,
+            # el pedido queda 'pagada' de una vez, no 'abierta' (aunque cocina
+            # todavía no haya terminado de prepararlo).
+            order.status = "pagada"
+
+            db.commit()
     except HTTPException:
         db.rollback()
         raise
@@ -1303,9 +1325,12 @@ def approve_payment_attempt(
         details={"receipt_hash": hash_sensitive_or_none(receipt_file_url)},
         request_id=request_id,
     )
-    # La aprobación disparó la confirmación de la orden dentro de la misma
-    # transacción: su actor es `sistema`, no este cajero (US2).
-    _record_order_confirmed(order_id, user, "automatic_payment", request_id)
+    if dispatched:
+        # La aprobación disparó la confirmación de la orden dentro de la misma
+        # transacción: su actor es `sistema`, no este cajero (US2). Para un
+        # intento mixto cuya porción en efectivo seguía pendiente, esta llamada
+        # no disparó nada que confirmar todavía (research.md Decisión 4).
+        _record_order_confirmed(order_id, user, "automatic_payment", request_id)
 
     db.refresh(attempt)
     return attempt
@@ -1366,6 +1391,117 @@ def reject_payment_attempt(
     return attempt
 
 
+def _confirm_cash_portion_of_mixed_attempt(
+    db: Session,
+    attempt_id: UUID,
+    cash_shift_id: UUID,
+    user: User,
+    request_id: str | None = None,
+) -> OrderPaymentAttempt:
+    """`POST /payment-attempts/{id}/confirm-cash` sobre un intento mixto
+    (spec 130, research.md Decisión 4). Fija `cash_confirmed_at` en vez de
+    `status` (esa columna sigue representando la verificación de la porción
+    por transferencia, resuelta aparte por `approve_payment_attempt`). El
+    pedido solo avanza a cocina/factura cuando, además, `status` ya es
+    `confirmado` — en cualquier orden respecto a la aprobación de la
+    transferencia."""
+    dispatched = False
+    try:
+        attempt = db.execute(
+            select(OrderPaymentAttempt)
+            .where(OrderPaymentAttempt.id == attempt_id)
+            .with_for_update(of=OrderPaymentAttempt)
+        ).scalar_one_or_none()
+        if attempt is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Intento de pago no encontrado")
+        if attempt.status == "rechazado":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"El intento de pago ya fue resuelto (status={attempt.status})",
+            )
+        if attempt.cash_confirmed_at is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "La porción en efectivo de este pago mixto ya fue confirmada",
+            )
+
+        order_id = attempt.order_id
+
+        # FR-006/data-model.md: el monto en efectivo ya quedó fijo en
+        # `cash_amount` desde `submit_cart` — esta llamada no recibe ni valida
+        # ningún `amount_received` nuevo, y no calcula cambio (el pago mixto no
+        # calcula cambio, ver edge cases de `spec.md`).
+        attempt.cash_confirmed_at = utc_now()
+        db.flush()
+
+        if attempt.status != "confirmado":
+            # Falta la verificación de la porción por transferencia: no se envía
+            # a cocina todavía, ninguna Sale se genera en esta llamada.
+            db.commit()
+        else:
+            dispatched = True
+            shift = ensure_open_shift(db, cash_shift_id)
+            order = _confirm_order_impl(db, attempt.order_id, user)
+
+            instant = promotion_evaluation_instant([order], now=utc_now())
+            lines = order_sale_lines(db, order.id)
+            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+            delivery_fee = order.delivery_fee or Decimal("0")
+            total = (
+                sum((line.line_total for line in lines), Decimal("0"))
+                - promo_discount + delivery_fee
+            )
+
+            # Un único pago por el total exacto con el método "Pago mixto" en sí
+            # (mismo patrón que `approve_payment_attempt` para transferencia pura)
+            # — el desglose efectivo/transferencia vive en `cash_amount`/
+            # `transfer_amount` del intento, no en `Payment`/`Sale` (research.md
+            # Decisión 3: sin tabla ni columna adicional en la capa de venta).
+            build_sale(
+                db,
+                lines=lines,
+                shift=shift,
+                cashier=user,
+                payments=[PaymentIn(payment_method_id=attempt.payment_method_id, amount=total)],
+                discount=promo_discount,
+                delivery_fee=delivery_fee,
+                customer_name=order.customer_name,
+                dining_table_id=order.dining_table_id,
+                table_session_id=order.table_session_id,
+                participant_id=order.participant_id,
+                customer_order_id=order.id,
+                promotion_id=final_promotion_id,
+                applied_promotions=applied,
+                promotion_evaluated_at=instant,  # FR-011a
+            )
+            order.discount = promo_discount
+            order.applied_promotions = applied
+            order.status = "pagada"
+
+            db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("Error confirmando la porción en efectivo de un pago mixto")
+        raise
+
+    record_order_audit_event(
+        event_type=OrderAuditEventType.PAYMENT_CASH_CONFIRMED,
+        order_id=order_id,
+        tenant_id=_tenant_of(user),
+        actor=_cajero_actor(user),
+        details={"mixed": True},
+        request_id=request_id,
+    )
+    if dispatched:
+        _record_order_confirmed(order_id, user, "automatic_payment", request_id)
+
+    db.refresh(attempt)
+    return attempt
+
+
 def confirm_cash_payment_attempt(
     db: Session,
     attempt_id: UUID,
@@ -1395,7 +1531,23 @@ def confirm_cash_payment_attempt(
     panel "Pagos por confirmar". Antes usaba `_order_total` (suma sin descuento),
     que rechazaba con 422 un monto que sí cubría la venta con promoción.
     `attempt.change_amount` sale de ese mismo `total` → coincide al peso con
-    `Sale.change_given` de `build_sale`."""
+    `Sale.change_given` de `build_sale`.
+
+    Spec 130: si el intento es mixto (`cash_amount IS NOT NULL`), delega en
+    `_confirm_cash_portion_of_mixed_attempt` — un camino separado porque para un
+    intento mixto no aplica nada de lo anterior: no se valida `amount_received`
+    contra el total completo (el monto en efectivo ya quedó fijo en
+    `cash_amount` desde `submit_cart`, FR-006), no se usa `change_amount`
+    (data-model.md § OrderPaymentAttempt), y el intento puede seguir
+    `status='pendiente'` o ya `'confirmado'` (por `approve_payment_attempt` sobre
+    la porción por transferencia) al llegar aquí — el campo de bloqueo relevante
+    es `cash_confirmed_at`, no `status` (research.md Decisión 4)."""
+    is_mixed = db.execute(
+        select(OrderPaymentAttempt.cash_amount).where(OrderPaymentAttempt.id == attempt_id)
+    ).scalar_one_or_none() is not None
+    if is_mixed:
+        return _confirm_cash_portion_of_mixed_attempt(db, attempt_id, cash_shift_id, user, request_id)
+
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
         method = get_or_404(db, PaymentMethod, attempt.payment_method_id, "Payment method not found")
