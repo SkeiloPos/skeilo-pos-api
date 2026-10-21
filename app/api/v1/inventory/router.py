@@ -12,6 +12,7 @@ from app.core.dependencies import get_current_user, require_tenant_admin
 from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import require_module_access
+from app.core.timezone import utc_now
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
 from app.models.inventory_import_job import InventoryImportJob
@@ -179,6 +180,35 @@ def get_import_job(
     _: User = Depends(require_tenant_admin),
 ):
     return _job_response(_get_import_job_or_404(db, job_id))
+
+
+@router.post(
+    "/items/import/{job_id}/cancel", response_model=InventoryImportJobResponse,
+    summary="Cancelar una importación en curso",
+)
+def cancel_import_job(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    """Permite al usuario cerrar desde el front un job que quedó colgado (p.
+    ej. el worker murió sin dejar el job en un estado final), sin necesitar
+    acceso directo a la base de datos. Marcarlo `interrumpido` también lo
+    saca de `find_blocking_import_job`, liberando el bloqueo para un import
+    nuevo. No detiene el proceso del worker si sigue vivo (`procesar_archivo_
+    importacion` relee `job.status` entre fila y fila y corta solo ahí)."""
+    job = _get_import_job_or_404(db, job_id)
+    if job.status != "procesando":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"El job {job_id} ya no está en curso (status: {job.status})",
+        )
+    job.status = "interrumpido"
+    job.finished_at = utc_now().replace(tzinfo=None)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return _job_response(job)
 
 
 @router.get("/items/import/{job_id}/errors", summary="Reporte de filas fallidas de un import")
