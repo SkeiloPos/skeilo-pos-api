@@ -168,6 +168,41 @@ class TestKitchen(unittest.TestCase):
         self.assertEqual(len(cambiados), 1)
         self.assertTrue(all(it.estado_cocina == "listo" for it in cambiados))
 
+    # --------------------------------------- accept_order_for_kitchen (nuevo)
+
+    def test_accept_order_for_kitchen_pasa_pendientes_a_en_preparacion_sin_tocar_status(self):
+        """`accept_order_for_kitchen` ("Aceptar pedido" sin cobrar): mueve los
+        ítems `pendiente` a `en_preparacion` en bloque, sin tocar
+        `CustomerOrder.status` -- el pedido sigue `recibida`, sin descontar
+        inventario ni generar venta. Es la pieza nueva que permite que cocina
+        empiece mientras el pago sigue pendiente de revisión."""
+        s = self._seed_item(order_status="recibida", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        actualizada, cambiados = kitchen.accept_order_for_kitchen(db, order.id)
+        self.assertEqual(len(cambiados), 1)
+        self.assertEqual(cambiados[0].estado_cocina, "en_preparacion")
+        self.assertEqual(actualizada.status, "recibida")
+
+    def test_accept_order_for_kitchen_es_idempotente(self):
+        """Una segunda llamada sin ítems `pendiente` que mover no falla --
+        devuelve la orden sin cambios, igual que `mark_order_ready`."""
+        s = self._seed_item(order_status="recibida", estado_cocina="en_preparacion")
+        db, order = s["db"], s["order"]
+
+        actualizada, cambiados = kitchen.accept_order_for_kitchen(db, order.id)
+        self.assertEqual(cambiados, [])
+        self.assertEqual(actualizada.status, "recibida")
+
+    def test_accept_order_for_kitchen_409_si_orden_pagada_o_cancelada(self):
+        """Mismo guard que `mark_order_ready`: una orden ya terminal rechaza
+        la aceptación."""
+        for terminal_status in ("pagada", "cancelada"):
+            s = self._seed_item(order_status=terminal_status, estado_cocina="pendiente")
+            with self.assertRaises(HTTPException) as ctx:
+                kitchen.accept_order_for_kitchen(s["db"], s["order"].id)
+            self.assertEqual(ctx.exception.status_code, 409)
+
     # ------------------------------------------------------------ void_item (T039)
 
     def test_void_item_anula_y_reemplaza_con_reversa_y_nuevo_descuento(self):

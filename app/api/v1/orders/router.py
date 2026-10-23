@@ -42,7 +42,7 @@ from app.api.v1.orders.schemas import (
     CheckoutPreviewResponse, DraftPreviewIn,
     TableStatusUpdate, MoveOrderIn, MergeOrdersIn, MergeResponse, GroupBillResponse,
     PaymentAttemptResponse, PaymentAttemptApproveIn, PaymentAttemptRejectIn,
-    PaymentAttemptConfirmCashIn,
+    PaymentAttemptConfirmCashIn, PaymentAttemptAdjustSplitIn, PaymentEventOut,
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -295,6 +295,7 @@ def approve_payment_attempt(
     return checkout.approve_payment_attempt(
         db, attempt_id, body.cash_shift_id, user,
         request_id=current_request_id(request),
+        receipt_file_url=body.receipt_file_url,
     )
 
 
@@ -306,10 +307,38 @@ def approve_payment_attempt(
 def reject_payment_attempt(
     attempt_id: UUID, body: PaymentAttemptRejectIn, request: Request = None,
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     return checkout.reject_payment_attempt(
-        db, attempt_id, body.reason, user, request_id=current_request_id(request)
+        db, attempt_id, body.reason.value, user,
+        request_id=current_request_id(request), tenant=tenant,
     )
+
+
+@router.post(
+    "/payment-attempts/{attempt_id}/adjust-split",
+    response_model=PaymentAttemptResponse,
+    summary="Reajustar la división efectivo/transferencia de un intento pendiente (cajero)",
+)
+def adjust_split_payment_attempt(
+    attempt_id: UUID, body: PaymentAttemptAdjustSplitIn,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    return checkout.adjust_split_payment_attempt(
+        db, attempt_id, body.cash_amount, body.transfer_amount,
+        body.transfer_method_id, body.payment_method_id, user,
+    )
+
+
+@router.get(
+    "/{order_id}/payment-events",
+    response_model=list[PaymentEventOut],
+    summary="Historial de auditoría consultable de un pedido (cajero/back-office)",
+)
+def list_payment_events(
+    order_id: UUID, db: Session = Depends(get_db), _: User = Depends(get_current_user),
+):
+    return checkout.list_payment_events(db, order_id)
 
 
 @router.post(
@@ -376,6 +405,33 @@ def kitchen_transition(
     if entry_id is not None:
         out.rt_v = events.version_of(entry_id)
     return out
+
+
+@router.post(
+    "/{order_id}/start-preparation",
+    response_model=OrderResponse,
+    summary="Aceptar el pedido para cocina, sin cobrarlo todavía",
+)
+def start_preparation(
+    order_id: UUID,
+    db: Session = Depends(get_db), _: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    """"Aceptar pedido" sin cobrar: deja que cocina empiece mientras el pago
+    sigue pendiente de revisión. Reutiliza `item_kitchen_changed` (mismo
+    evento que `kitchen_transition`/`order_ready`) -- ya viaja al canal de
+    sesión del comensal, así que no hace falta un evento ni un canal nuevo
+    para que "Mis pedidos" se entere."""
+    order, cambiados = kitchen.accept_order_for_kitchen(db, order_id)
+    for it in cambiados:
+        events.item_kitchen_changed(
+            tenant.id,
+            order_id=order.id,
+            table_session_id=order.table_session_id,
+            item_id=it.id,
+            estado_cocina=it.estado_cocina,
+        )
+    return _load_order(db, order.id)
 
 
 @router.post(

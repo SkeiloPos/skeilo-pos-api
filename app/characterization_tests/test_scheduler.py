@@ -17,7 +17,9 @@ import unittest
 from unittest.mock import patch
 import uuid
 
+from app.characterization_tests import cart_fixtures as cart_fx
 from app.characterization_tests import table_sessions_fixtures as fx
+from app.characterization_tests.fixtures import make_shared_tenant
 from app.core import scheduler
 from app.models.cart import Cart
 from app.models.customer_order import CustomerOrder
@@ -130,6 +132,71 @@ class TestSweepSchema(unittest.TestCase):
         self.assertEqual(ts.status, "closed")
         self.assertEqual(table.status, "ocupada")
         self.assertIsNotNone(db.get(Cart, cart_id))
+
+
+class TestExpirePromotions(unittest.TestCase):
+    """`scheduler.expire_promotions()` (spec 063/A-08): `ends_at` se guarda en
+    hora local del tenant, así que el corte de expiración tiene que
+    calcularse en esa misma zona horaria por tenant -- no contra un único
+    `now` en UTC crudo. Caso real que motivó la corrección: a las 00:19 UTC
+    (ya 23 de octubre en UTC) en Bogotá (UTC-5) todavía son las 19:19 del 22
+    de octubre -- una promoción vigente hasta las 23:00 del 22 aún NO debería
+    expirar en ese instante."""
+
+    def _run_expire(self, db):
+        @contextmanager
+        def fake_with_db(schema):
+            yield db
+
+        with patch("app.core.scheduler.with_db", fake_with_db):
+            return scheduler.expire_promotions()
+
+    def _fake_now_utc(self, instante_utc):
+        class FakeDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instante_utc if tz is None else instante_utc.astimezone(tz)
+
+        return patch("app.core.scheduler.datetime", FakeDateTime)
+
+    def test_no_expira_antes_de_tiempo_comparando_en_hora_local_del_tenant(self):
+        db = cart_fx.new_session()
+        make_shared_tenant(db, schema="tenant", timezone="America/Bogota")
+        aun_vigente = cart_fx.make_promotion(
+            db, status="active", ends_at=datetime(2026, 10, 22, 23, 0),
+        )
+        ya_vencida = cart_fx.make_promotion(
+            db, status="active", ends_at=datetime(2026, 10, 22, 18, 0),
+        )
+        db.commit()
+
+        instante_utc = datetime(2026, 10, 23, 0, 19, tzinfo=timezone.utc)
+        with self._fake_now_utc(instante_utc):
+            total = self._run_expire(db)
+
+        self.assertEqual(total, 1)
+        db.refresh(aun_vigente)
+        db.refresh(ya_vencida)
+        self.assertEqual(aun_vigente.status, "active")
+        self.assertEqual(ya_vencida.status, "finished")
+
+    def test_respalda_en_tenant_timezone_global_si_el_schema_no_tiene_fila_en_shared_tenants(self):
+        """Si `shared.tenants` no devuelve ninguna fila para el schema (dato
+        inconsistente, no debería pasar tras la migración de A-46), el schema
+        simplemente no corre -- no hay from onde sacar el schema a iterar."""
+        db = cart_fx.new_session()
+        promo = cart_fx.make_promotion(
+            db, status="active", ends_at=datetime(2026, 10, 22, 18, 0),
+        )
+        db.commit()
+
+        instante_utc = datetime(2026, 10, 23, 0, 19, tzinfo=timezone.utc)
+        with self._fake_now_utc(instante_utc):
+            total = self._run_expire(db)
+
+        self.assertEqual(total, 0)
+        db.refresh(promo)
+        self.assertEqual(promo.status, "active")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ Dos detalles que no son opcionales:
 """
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
 
@@ -211,21 +212,27 @@ def sweep_orphan_sessions() -> int:
 
 def expire_promotions() -> int:
     """Pasa a `finished` las promociones cuyo `ends_at` ya venció, en todos los
-    tenants. Puramente informativo: `_valid_now()` ya compara `ends_at` contra
-    `now` en cada evaluación, así que esto nunca decide si una promoción aplica
-    — solo mantiene el listado de administración limpio y le da a `finished` su
-    significado real. `finished` es terminal: para revivir una promoción se
-    duplica."""
+    tenants. `ends_at` se guarda en hora **local del tenant** (A-08, igual que
+    `_valid_now`), así que el corte también tiene que calcularse en esa misma
+    zona horaria por tenant -- comparar contra un único `now` en UTC corre el
+    job ~5h (o lo que sea el offset del tenant) antes de tiempo, y SÍ afecta la
+    vigencia real: `active_variant_set_rules` filtra `status == "active"` en
+    SQL antes de llamar a `_valid_now()`, así que una promoción marcada
+    `finished` de más deja de evaluarse aunque su `ends_at` siga vigente.
+    `finished` es terminal: para revivir una promoción se duplica."""
     from sqlalchemy import update
     from app.models.promotion import Promotion
 
     total = 0
     with with_db(None) as db:
-        schemas = [r[0] for r in db.execute(text("SELECT schema FROM shared.tenants")).fetchall()]
+        tenants = db.execute(
+            text("SELECT schema, timezone FROM shared.tenants")
+        ).fetchall()
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    for schema in schemas:
+    for schema, tz_name in tenants:
         try:
+            tz = ZoneInfo(tz_name) if tz_name else ZoneInfo(settings.TENANT_TIMEZONE)
+            now_local = datetime.now(tz).replace(tzinfo=None)
             with with_db(schema) as db:
                 # `update()` sobre el modelo (no SQL crudo): el `schema_translate_map`
                 # de `with_db` solo traduce sentencias ORM, no texto plano con nombres
@@ -233,7 +240,7 @@ def expire_promotions() -> int:
                 result = db.execute(
                     update(Promotion)
                     .where(Promotion.status.in_(("active", "paused", "draft")),
-                           Promotion.ends_at.is_not(None), Promotion.ends_at < now)
+                           Promotion.ends_at.is_not(None), Promotion.ends_at < now_local)
                     .values(status="finished")
                 )
                 db.commit()

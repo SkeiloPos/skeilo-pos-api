@@ -9,7 +9,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -667,7 +667,10 @@ def cancel_my_order(
 ) -> CustomerOrder:
     """Cancelación por el propio comensal. Solo hasta que cocina empieza:
 
-    - `recibida`: siempre (no se descontó nada);
+    - `recibida`: siempre, salvo que ya se haya "aceptado para cocina" sin
+      cobrar (`POST /orders/{id}/start-preparation`) -- ahí ya hay ítems
+      `en_preparacion` aunque el pago siga pendiente y `status` no se haya
+      movido de `recibida`;
     - `abierta`: solo si **todos** sus ítems siguen `pendiente`;
     - a partir de `en_preparacion` el insumo ya se combinó y la decisión de cuánto
       se pierde es del staff, no del cliente.
@@ -691,16 +694,15 @@ def cancel_my_order(
         raise HTTPException(
             status.HTTP_409_CONFLICT, f"El pedido ya es terminal (status={order.status})"
         )
-    if order.status != "recibida":
-        en_cocina = [
-            it for it in order.items
-            if it.estado_cocina not in ("pendiente", "anulado")
-        ]
-        if en_cocina or order.status != "abierta":
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "El pedido ya está en preparación; pide al personal que lo cancele.",
-            )
+    en_cocina = [
+        it for it in order.items
+        if it.estado_cocina not in ("pendiente", "anulado")
+    ]
+    if en_cocina or order.status not in ("recibida", "abierta"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "El pedido ya está en preparación; pide al personal que lo cancele.",
+        )
 
     result = checkout.cancel_order(
         db, order_id, CancelIn(motivo=motivo), user=None, participant=participant,
@@ -893,12 +895,13 @@ def submit_cart(
                 "Ingresa cuánto vas a pagar en efectivo (mayor a $0); si vas a pagar todo "
                 "en efectivo, elige 'Efectivo' en vez de 'Pago mixto'",
             )
-        if not receipt_file_url:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "Este método de pago exige cargar un comprobante",
-            )
-        receipt_file_url = resolve_receipt_key(receipt_file_url, _require_receipt_schema(tenant_schema))
+        # spec 132 (FR-002/FR-023): el comensal ya no sube comprobante desde el
+        # QR — la verificación queda enteramente a cargo del cajero en la
+        # entrega (research.md Decisión 1). Si de todos modos llega un
+        # `receipt_file_url` (compatibilidad con integraciones existentes), se
+        # valida y persiste igual que antes; su ausencia nunca bloquea el envío.
+        if receipt_file_url:
+            receipt_file_url = resolve_receipt_key(receipt_file_url, _require_receipt_schema(tenant_schema))
 
         # FR-005: se resuelve automáticamente si el tenant tiene exactamente un
         # método de transferencia activo; con más de uno, el comensal debe elegir.
@@ -927,15 +930,12 @@ def submit_cart(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Un pago en efectivo no lleva comprobante",
             )
-    elif not receipt_file_url:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "Este método de pago exige cargar un comprobante",
-        )
-    else:
-        # spec 088 (FR-008): el comprobante deja de ser texto libre. Se valida DESPUÉS de los
-        # 422 de arriba y ANTES de comprobar disponibilidad y de crear nada: un 422/503 no crea
-        # orden ni intento ni borra el carrito. Se persiste (y se audita) la key resuelta.
+    elif receipt_file_url:
+        # spec 132 (FR-001/FR-023): el comensal ya no sube comprobante desde el QR (ver
+        # rama "mixed" arriba) — se mantiene la validación solo por compatibilidad si de
+        # todos modos llega uno. Se valida DESPUÉS de los 422 de arriba y ANTES de
+        # comprobar disponibilidad y de crear nada: un 422/503 no crea orden ni intento ni
+        # borra el carrito. Se persiste (y se audita) la key resuelta.
         receipt_file_url = resolve_receipt_key(receipt_file_url, _require_receipt_schema(tenant_schema))
 
     variants = [
@@ -1266,6 +1266,30 @@ def create_payment_attempt(
             status.HTTP_409_CONFLICT,
             "Ya hay un intento de pago pendiente de revisión para esta orden",
         )
+
+    # spec 132, research.md Decisión 5 (FR-017, spec.md edge case línea 108):
+    # un único reintento por transferencia tras un rechazo — el primer
+    # rechazo (1 fila) todavía admite este reintento; si ESE reintento
+    # también se rechaza (2 filas), ya no admite otro: el cajero continúa con
+    # efectivo total o cancelación por impago. Se cuenta sobre el historial
+    # real de intentos `rechazado` de método no efectivo, sin columna de
+    # contador.
+    if not method.is_cash:
+        rejected_transfer_attempts = db.execute(
+            select(func.count(OrderPaymentAttempt.id))
+            .join(PaymentMethod, PaymentMethod.id == OrderPaymentAttempt.payment_method_id)
+            .where(
+                OrderPaymentAttempt.order_id == order_id,
+                OrderPaymentAttempt.status == "rechazado",
+                PaymentMethod.is_cash.is_(False),
+            )
+        ).scalar_one()
+        if rejected_transfer_attempts >= 2:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Ya se usó el único reintento por transferencia y también fue rechazado; "
+                "paga en efectivo con el cajero o cancela el pedido",
+            )
 
     try:
         attempt = OrderPaymentAttempt(order_id=order_id, payment_method_id=payment_method_id)

@@ -12,7 +12,7 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.audit import record_audit
@@ -25,7 +25,8 @@ from app.core.order_audit import (
     hash_sensitive_or_none,
     record_order_audit_event,
 )
-from app.core.timezone import utc_now
+from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now
+from app.models.audit_log import AuditLog
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
 from app.models.session_participant import SessionParticipant
@@ -970,7 +971,15 @@ def cancel_order(
         ).scalar_one_or_none()
         if pending_attempt is not None:
             pending_attempt.status = "rechazado"
-            pending_attempt.rejection_reason = data.motivo
+            # Spec 132 (FR-015, migración a7f3c9d1b246): `rejection_reason` ya
+            # no admite texto libre — este camino no es un rechazo de
+            # verificación del cajero (eso es `reject_payment_attempt`), es
+            # la cancelación del pedido resolviendo su pago pendiente, así que
+            # usa el valor cerrado más fiel ("la transferencia nunca se
+            # completó") y conserva el motivo real de la cancelación, tal
+            # cual lo escribió el cajero/comensal, en `OrderCancelLog.motivo`
+            # (sin pérdida de información, Principio VII).
+            pending_attempt.rejection_reason = "transferencia_no_completada"
             pending_attempt.resolved_by_user_id = actor_id
             pending_attempt.resolved_at = utc_now()
 
@@ -1206,6 +1215,7 @@ def approve_payment_attempt(
     cash_shift_id: UUID,
     user: User,
     request_id: str | None = None,
+    receipt_file_url: str | None = None,
 ) -> OrderPaymentAttempt:
     """Aprueba un comprobante de transferencia (US2, Acceptance Scenario 4).
 
@@ -1228,7 +1238,13 @@ def approve_payment_attempt(
     (verifica la porción por transferencia), pero el envío a cocina/`build_sale`
     solo ocurre si, además, `cash_confirmed_at` ya tiene valor (la porción en
     efectivo ya se cobró en caja) — si no, la llamada termina aquí, sin tocar
-    inventario ni generar venta, en cualquier orden respecto a `confirm-cash`."""
+    inventario ni generar venta, en cualquier orden respecto a `confirm-cash`.
+
+    Spec 132, research.md Decisión 1 (FR-012): el comprobante deja de ser
+    obligatorio para aprobar — la verificación real es la del cajero en
+    persona en la mesa, no un archivo. `receipt_file_url`, si llega, es
+    evidencia opcional que *solo* el cajero adjunta aquí; nunca bloquea la
+    aprobación si se omite."""
     dispatched = False
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
@@ -1238,19 +1254,36 @@ def approve_payment_attempt(
                 status.HTTP_409_CONFLICT,
                 "Un método en efectivo se confirma con confirm-cash, no con approve",
             )
-        if not attempt.receipt_file_url:
-            raise HTTPException(status.HTTP_409_CONFLICT, "El intento no tiene comprobante todavía")
-
-        # spec 074: se copian antes del `commit` (que expira los atributos del
-        # intento) para auditarlos después, con la transición ya comprometida.
-        order_id = attempt.order_id
-        receipt_file_url = attempt.receipt_file_url
+        if receipt_file_url:
+            attempt.receipt_file_url = receipt_file_url
 
         shift = ensure_open_shift(db, cash_shift_id)
+
+        # spec 074: se copia antes del `commit` (que expira los atributos del
+        # intento) para auditarlo después, con la transición ya comprometida.
+        order_id = attempt.order_id
+        receipt_file_url = attempt.receipt_file_url
 
         attempt.status = "confirmado"
         attempt.resolved_by_user_id = user.id
         attempt.resolved_at = utc_now()
+        # spec 132 (FR-019, data-model.md § AuditLog): historial consultable
+        # del pedido, vía `GET /orders/{order_id}/payment-events` — distinto
+        # del evento solo-Sentry de spec 074 de más abajo (research.md
+        # Decisión 3).
+        record_audit(
+            db,
+            action="payment_attempt.confirmed",
+            entity="order_payment_attempts",
+            entity_id=attempt.id,
+            user=user,
+            payload={
+                "cash_amount": float(attempt.cash_amount) if attempt.cash_amount is not None else None,
+                "transfer_amount": (
+                    float(attempt.transfer_amount) if attempt.transfer_amount is not None else None
+                ),
+            },
+        )
         # La sesión tiene autoflush=False (ver `with_db`); sin este flush,
         # el chequeo `has_confirmed_payment` de `_confirm_order_impl` lee el
         # `status` todavía persistido ("pendiente") y siempre rechaza con
@@ -1342,10 +1375,14 @@ def reject_payment_attempt(
     reason: str,
     user: User,
     request_id: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
-    """Rechaza un comprobante con motivo obligatorio (FR-014, US2 Acceptance
-    Scenario 5-6). El motivo queda visible solo para cajero/back-office
-    (Clarification 3) — el router del comensal nunca lo serializa."""
+    """Rechaza un comprobante con motivo obligatorio del conjunto cerrado
+    (spec 132, FR-015; antes FR-014, US2 Acceptance Scenario 5-6). El motivo
+    queda visible solo para cajero/back-office (Clarification 3) — el router
+    del comensal nunca lo serializa."""
+    dining_table_id = None
+    rejection_count_today = None
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
         method = get_or_404(db, PaymentMethod, attempt.payment_method_id, "Payment method not found")
@@ -1363,6 +1400,49 @@ def reject_payment_attempt(
         attempt.rejection_reason = reason
         attempt.resolved_by_user_id = user.id
         attempt.resolved_at = utc_now()
+        # spec 132 (FR-019/T045, data-model.md § AuditLog): historial
+        # consultable del pedido — distinto del evento solo-Sentry de spec
+        # 074 de más abajo (research.md Decisión 3).
+        record_audit(
+            db,
+            action="payment_attempt.rejected",
+            entity="order_payment_attempts",
+            entity_id=attempt.id,
+            user=user,
+            payload={"motivo": reason},
+        )
+        db.flush()
+
+        # spec 132, research.md Decisión 7 (FR-020): segundo rechazo del día
+        # para la misma mesa — marca para revisión vía auditoría, sin alterar
+        # la respuesta ni bloquear el flujo.
+        order = db.get(CustomerOrder, order_id)
+        dining_table_id = order.dining_table_id if order is not None else None
+        if dining_table_id is not None:
+            tz = resolve_timezone(tenant)
+            start_utc, end_utc = local_day_bounds_utc(utc_now().date(), tz)
+            rejection_count_today = db.execute(
+                select(func.count(OrderPaymentAttempt.id))
+                .join(CustomerOrder, CustomerOrder.id == OrderPaymentAttempt.order_id)
+                .join(PaymentMethod, PaymentMethod.id == OrderPaymentAttempt.payment_method_id)
+                .where(
+                    CustomerOrder.dining_table_id == dining_table_id,
+                    OrderPaymentAttempt.status == "rechazado",
+                    PaymentMethod.is_cash.is_(False),
+                    OrderPaymentAttempt.created_at >= start_utc,
+                    OrderPaymentAttempt.created_at < end_utc,
+                )
+            ).scalar_one()
+            if rejection_count_today >= 2:
+                record_audit(
+                    db,
+                    action="payment.table_repeat_rejection",
+                    entity="dining_tables",
+                    entity_id=dining_table_id,
+                    user=user,
+                    payload={"order_id": str(order_id), "rejection_count_today": rejection_count_today},
+                )
+
         db.commit()
     except HTTPException:
         db.rollback()
@@ -1389,6 +1469,119 @@ def reject_payment_attempt(
 
     db.refresh(attempt)
     return attempt
+
+
+def adjust_split_payment_attempt(
+    db: Session,
+    attempt_id: UUID,
+    cash_amount: Decimal,
+    transfer_amount: Decimal,
+    transfer_method_id: UUID | None,
+    payment_method_id: UUID | None,
+    user: User,
+) -> OrderPaymentAttempt:
+    """Reajusta la división efectivo/transferencia de un intento `pendiente`
+    al confirmar (spec 132, FR-013/014), incluyendo convertir un intento 100%
+    transferencia en mixto o en 100% efectivo, y viceversa, sin crear un
+    intento nuevo (contracts/payment-attempts-api.md).
+
+    Cuando el reajuste deja uno de los dos lados en cero, el intento deja de
+    ser mixto: `cash_amount`/`transfer_amount`/`transfer_method_id` vuelven a
+    `None`, el mismo estado que ya tiene cualquier intento no-mixto desde que
+    se crea (data-model.md) — así `approve_payment_attempt`/
+    `confirm_cash_payment_attempt` siguen aplicando sin cambios, por el mismo
+    discriminador que ya usan (`cash_amount IS NOT NULL`)."""
+    cash_amount = Decimal(cash_amount)
+    transfer_amount = Decimal(transfer_amount)
+    try:
+        attempt = _load_pending_attempt_for_update(db, attempt_id)
+        total = compute_checkout_preview(db, attempt.order_id).total
+        if cash_amount + transfer_amount != total:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "La suma de efectivo y transferencia no coincide con el total del pedido",
+            )
+
+        # float, no Decimal: igual que el resto de `details=` de spec 074
+        # (`record_order_audit_event`) — un `Decimal` no es serializable a
+        # JSON tal cual (`AuditLog.payload` es JSONB).
+        before = {
+            "cash_amount_antes": float(attempt.cash_amount) if attempt.cash_amount is not None else None,
+            "transfer_amount_antes": (
+                float(attempt.transfer_amount) if attempt.transfer_amount is not None else None
+            ),
+        }
+
+        if transfer_amount == 0:
+            # Efectivo total: de ahora en adelante se confirma con confirm-cash.
+            attempt.cash_amount = None
+            attempt.transfer_amount = None
+            attempt.transfer_method_id = None
+        elif cash_amount == 0:
+            # Transferencia total: de ahora en adelante se confirma con approve.
+            if transfer_method_id is None and payment_method_id is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "La transferencia total requiere el método de transferencia",
+                )
+            attempt.cash_amount = None
+            attempt.transfer_amount = None
+            attempt.transfer_method_id = None
+            if payment_method_id is None:
+                payment_method_id = transfer_method_id
+        else:
+            attempt.cash_amount = cash_amount
+            attempt.transfer_amount = transfer_amount
+            if transfer_method_id is not None:
+                attempt.transfer_method_id = transfer_method_id
+
+        if payment_method_id is not None:
+            attempt.payment_method_id = payment_method_id
+
+        after = {
+            "cash_amount_despues": float(attempt.cash_amount) if attempt.cash_amount is not None else None,
+            "transfer_amount_despues": (
+                float(attempt.transfer_amount) if attempt.transfer_amount is not None else None
+            ),
+        }
+        record_audit(
+            db,
+            action="payment_attempt.split_adjusted",
+            entity="order_payment_attempts",
+            entity_id=attempt.id,
+            user=user,
+            payload={**before, **after},
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("Error reajustando la división de un pago")
+        raise
+
+    db.refresh(attempt)
+    return attempt
+
+
+def list_payment_events(db: Session, order_id: UUID) -> list[AuditLog]:
+    """Historial de auditoría consultable de un pedido (spec 132, FR-019):
+    filas de `AuditLog` sobre sus intentos de pago o sobre el pedido mismo,
+    ordenadas por `at` ascendente."""
+    get_or_404(db, CustomerOrder, order_id, "Order not found")
+    attempt_ids = db.execute(
+        select(OrderPaymentAttempt.id).where(OrderPaymentAttempt.order_id == order_id)
+    ).scalars().all()
+    entity_ids = [order_id, *attempt_ids]
+    return db.execute(
+        select(AuditLog)
+        .where(
+            AuditLog.entity.in_(("order_payment_attempts", "customer_orders")),
+            AuditLog.entity_id.in_(entity_ids),
+        )
+        .order_by(AuditLog.at)
+    ).scalars().all()
 
 
 def _confirm_cash_portion_of_mixed_attempt(
@@ -1432,6 +1625,15 @@ def _confirm_cash_portion_of_mixed_attempt(
         # ningún `amount_received` nuevo, y no calcula cambio (el pago mixto no
         # calcula cambio, ver edge cases de `spec.md`).
         attempt.cash_confirmed_at = utc_now()
+        # spec 132 (FR-019, data-model.md § AuditLog): historial consultable.
+        record_audit(
+            db,
+            action="payment_attempt.confirmed",
+            entity="order_payment_attempts",
+            entity_id=attempt.id,
+            user=user,
+            payload={"cash_amount": float(attempt.cash_amount)},
+        )
         db.flush()
 
         if attempt.status != "confirmado":
@@ -1577,6 +1779,15 @@ def confirm_cash_payment_attempt(
         attempt.status = "confirmado"
         attempt.resolved_by_user_id = user.id
         attempt.resolved_at = utc_now()
+        # spec 132 (FR-019, data-model.md § AuditLog): historial consultable.
+        record_audit(
+            db,
+            action="payment_attempt.confirmed",
+            entity="order_payment_attempts",
+            entity_id=attempt.id,
+            user=user,
+            payload={"amount_received": float(amount_received)},
+        )
         # Mismo motivo que en `approve_payment_attempt`: autoflush=False no
         # deja ver este `UPDATE` a la `SELECT` de `_confirm_order_impl` sin
         # este flush explícito (mismo patrón que ya usan

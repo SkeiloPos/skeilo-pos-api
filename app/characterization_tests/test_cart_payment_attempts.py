@@ -213,7 +213,7 @@ class TestCartPaymentAttempts(unittest.TestCase):
 
         first = service.create_payment_attempt(db, participant.id, order.id, nequi.id)
         first.status = "rechazado"
-        first.rejection_reason = "el monto no coincide"
+        first.rejection_reason = "monto_no_coincide"
         db.commit()
 
         # Mientras el primero está rechazado (no pendiente), un intento nuevo
@@ -238,7 +238,7 @@ class TestCartPaymentAttempts(unittest.TestCase):
 
         first = service.create_payment_attempt(db, participant.id, order.id, nequi.id)
         first.status = "rechazado"
-        first.rejection_reason = "no llegó el pago"
+        first.rejection_reason = "transferencia_no_completada"
         db.commit()
         service.create_payment_attempt(db, participant.id, order.id, nequi.id)
 
@@ -340,16 +340,18 @@ class TestCartPaymentAttempts(unittest.TestCase):
         # spec 088 (A-93): se persiste la key del `public_url` del presign.
         self.assertEqual(order.current_payment_attempt.receipt_file_url, presign.key)
 
-    def test_submit_cart_transferencia_sin_receipt_file_url_falla_422(self):
-        """FR-006, Acceptance Scenario 3 (US3): no se crea el pedido de una
-        transferencia sin comprobante."""
+    def test_submit_cart_transferencia_sin_receipt_file_url_crea_orden(self):
+        """spec 132 (A-144, FR-001/FR-023): el comensal ya no sube comprobante
+        desde el QR — `submit_cart` crea el pedido igual, con el intento
+        `pendiente` y `receipt_file_url=None`. Antes de spec 132 esto fallaba
+        con 422 (ver A-144 en registro-de-anomalias.md, Principio II)."""
         db, participant, variant = self._seed_session_con_carrito()
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         db.commit()
 
-        with self.assertRaises(HTTPException) as ctx:
-            service.submit_cart(db, participant, nequi.id)
-        self.assertEqual(ctx.exception.status_code, 422)
+        order = service.submit_cart(db, participant, nequi.id)
+        self.assertEqual(order.current_payment_attempt.status, "pendiente")
+        self.assertIsNone(order.current_payment_attempt.receipt_file_url)
 
     # ------------------------------------------------- FR-012: reintento sin volver a subir (T019)
 
@@ -487,16 +489,20 @@ class TestCartPaymentAttempts(unittest.TestCase):
             0,
         )
 
-    def test_submit_cart_mixto_sin_comprobante_falla_422(self):
-        """FR-007: el comprobante de la porción por transferencia es obligatorio."""
+    def test_submit_cart_mixto_sin_comprobante_crea_orden(self):
+        """spec 132 (A-144, FR-002/FR-023): el comensal ya no sube comprobante
+        de la porción por transferencia desde el QR — `submit_cart` crea el
+        pedido igual. Antes de spec 132 esto fallaba con 422."""
         db, participant, variant = self._seed_session_con_carrito()
         mixto = fx.make_payment_method(db, name="Pago mixto", is_cash=False, type="mixed")
         fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         db.commit()
 
-        with self.assertRaises(HTTPException) as ctx:
-            service.submit_cart(db, participant, mixto.id, cash_amount=Decimal("3000"))
-        self.assertEqual(ctx.exception.status_code, 422)
+        order = service.submit_cart(db, participant, mixto.id, cash_amount=Decimal("3000"))
+        attempt = order.current_payment_attempt
+        self.assertEqual(attempt.cash_amount, Decimal("3000"))
+        self.assertEqual(attempt.transfer_amount, Decimal("5000"))
+        self.assertIsNone(attempt.receipt_file_url)
 
 
 if __name__ == "__main__":

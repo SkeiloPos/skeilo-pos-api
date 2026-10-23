@@ -123,15 +123,34 @@ class TestOrdersPaymentGate(unittest.TestCase):
         self.assertEqual(sale.delivery_fee, Decimal("6000"))
         self.assertEqual(sale.total, PRECIO + Decimal("6000"))
 
-    def test_approve_409_sin_comprobante_todavia(self):
+    def test_approve_sin_comprobante_todavia_confirma_igual(self):
+        """spec 132 (A-144, FR-012, research.md Decisión 1): el comprobante
+        deja de ser obligatorio para aprobar — la verificación real es la del
+        cajero en persona, no un archivo. Antes de spec 132 esto fallaba con
+        409 ("El intento no tiene comprobante todavía")."""
         db, order = self._seed_order_recibida()
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         attempt = fx.make_payment_attempt(db, order, nequi, status="pendiente")
         db.commit()
 
-        with self.assertRaises(HTTPException) as ctx:
-            checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
-        self.assertEqual(ctx.exception.status_code, 409)
+        result = checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
+        self.assertEqual(result.status, "confirmado")
+        self.assertIsNone(result.receipt_file_url)
+
+    def test_approve_con_foto_opcional_del_cajero_la_persiste(self):
+        """spec 132 (FR-012): el cajero puede adjuntar una foto opcional al
+        confirmar — se persiste en el intento sin bloquear la aprobación."""
+        db, order = self._seed_order_recibida()
+        nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        attempt = fx.make_payment_attempt(db, order, nequi, status="pendiente")
+        db.commit()
+
+        result = checkout.approve_payment_attempt(
+            db, attempt.id, self._shift(db).id, self._user(),
+            receipt_file_url="tenant_test/comprobantes/cajero.jpg",
+        )
+        self.assertEqual(result.status, "confirmado")
+        self.assertEqual(result.receipt_file_url, "tenant_test/comprobantes/cajero.jpg")
 
     def test_reject_exige_motivo_y_lo_registra(self):
         """FR-014, Acceptance Scenario 6 (US2)."""
@@ -143,10 +162,10 @@ class TestOrdersPaymentGate(unittest.TestCase):
         db.commit()
 
         result = checkout.reject_payment_attempt(
-            db, attempt.id, "el monto no coincide", self._user()
+            db, attempt.id, "monto_no_coincide", self._user()
         )
         self.assertEqual(result.status, "rechazado")
-        self.assertEqual(result.rejection_reason, "el monto no coincide")
+        self.assertEqual(result.rejection_reason, "monto_no_coincide")
 
     def test_approve_o_reject_de_metodo_efectivo_falla_409(self):
         db, order = self._seed_order_recibida()
@@ -299,7 +318,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         db, order = self._seed_order_recibida()
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         fx.make_payment_attempt(
-            db, order, nequi, status="rechazado", rejection_reason="no coincide"
+            db, order, nequi, status="rechazado", rejection_reason="monto_no_coincide"
         )
         db.commit()
 
@@ -465,7 +484,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         db, order = self._seed_order_recibida()
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         fx.make_payment_attempt(
-            db, order, nequi, status="rechazado", rejection_reason="el monto no coincide",
+            db, order, nequi, status="rechazado", rejection_reason="monto_no_coincide",
         )
         fx.make_payment_attempt(db, order, nequi, status="pendiente")
         db.commit()
@@ -473,7 +492,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         attempts = checkout.list_payment_attempts(db, order.id)
         self.assertEqual(len(attempts), 2)
         rechazado = next(a for a in attempts if a.status == "rechazado")
-        self.assertEqual(rechazado.rejection_reason, "el monto no coincide")
+        self.assertEqual(rechazado.rejection_reason, "monto_no_coincide")
 
     # ---------------------------------- Orden creada por spec 025 (T020)
 
@@ -513,7 +532,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         first_attempt_id = order.current_payment_attempt.id
 
         rejected = checkout.reject_payment_attempt(
-            db, first_attempt_id, "el monto no coincide", self._user()
+            db, first_attempt_id, "monto_no_coincide", self._user()
         )
         self.assertEqual(rejected.status, "rechazado")
 

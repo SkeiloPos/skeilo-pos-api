@@ -7,10 +7,23 @@ from sqlalchemy.orm import mapped_column, Mapped, relationship
 from typing import Optional, TYPE_CHECKING
 from decimal import Decimal
 from datetime import datetime, timezone
+from enum import Enum
 
 if TYPE_CHECKING:
     from .customer_order import CustomerOrder
     from .payment import PaymentMethod
+
+
+class RejectionReason(str, Enum):
+    """Conjunto cerrado de motivos de rechazo de un pago (spec 132, FR-015).
+    Reutilizado tanto por este modelo (vía el `CheckConstraint` de la
+    migración `_132_rejection_reason_enum`) como por
+    `app/api/v1/orders/schemas.py` (`PaymentAttemptRejectIn.reason`)."""
+    CLIENTE_NO_MUESTRA_APP = "cliente_no_muestra_app"
+    MONTO_NO_COINCIDE = "monto_no_coincide"
+    TRANSFERENCIA_NO_COMPLETADA = "transferencia_no_completada"
+    CLIENTE_SE_NIEGA_A_MOSTRAR = "cliente_se_niega_a_mostrar"
+    COMPROBANTE_SOSPECHOSO = "comprobante_sospechoso"
 
 
 class OrderPaymentAttempt(UUIDPrimaryKeyMixin, Base):
@@ -120,6 +133,16 @@ class OrderPaymentAttempt(UUIDPrimaryKeyMixin, Base):
         CheckConstraint(
             "status != 'rechazado' OR rejection_reason IS NOT NULL",
             name="ck_order_payment_attempt_rejection_reason",
+        ),
+        # Spec 132 (FR-015, migración a7f3c9d1b246): conjunto cerrado de
+        # motivos de rechazo — coexiste con el CheckConstraint anterior, que
+        # solo exige que no sea NULL.
+        CheckConstraint(
+            "status != 'rechazado' OR rejection_reason IN ("
+            "'cliente_no_muestra_app', 'monto_no_coincide', "
+            "'transferencia_no_completada', 'cliente_se_niega_a_mostrar', "
+            "'comprobante_sospechoso')",
+            name="ck_order_payment_attempt_rejection_reason_enum",
         ),
         # A lo sumo un intento 'pendiente' por orden a la vez (FR-015a).
         Index(
