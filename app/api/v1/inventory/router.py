@@ -45,10 +45,11 @@ router = APIRouter(
 def list_items(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
-    search: str | None = Query(None, description="Búsqueda por nombre (contiene, sin distinguir mayúsculas)"),
+    search: str | None = Query(None, description="Búsqueda por nombre o código (contiene, sin distinguir mayúsculas)"),
     type: InventoryItemType | None = Query(None, description="Filtrar por tipo de insumo"),
     active: bool | None = Query(None),
     low_stock: bool | None = Query(None, description="Solo insumos en o bajo el mínimo"),
+    supplier_id: UUID | None = Query(None, description="Filtrar por proveedor (solo relaciones activas)"),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -57,6 +58,7 @@ def list_items(
         type_=type.value if type is not None else None,
         active=active,
         low_stock=low_stock,
+        supplier_id=supplier_id,
     )
     result = paginate(db, stmt, page, size)
     supplier_items.attach_preferred_supplier_names(db, result["items"])

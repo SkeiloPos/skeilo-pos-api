@@ -64,6 +64,8 @@ from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
 from app.models.presentation import Presentation
 from app.models.category_presentation import CategoryPresentation
+from app.models.supplier import Supplier
+from app.models.supplier_item import SupplierItem
 
 _TABLE_NAMES = [
     "categories",
@@ -85,6 +87,9 @@ _TABLE_NAMES = [
     # negocio y `shared.tenants` (ver `attach_shared_tenants`).
     "payment_methods",
     "order_payment_attempts",
+    # spec 106: relación N:M proveedor-insumo, usada por el filtro de proveedor de spec 133.
+    "suppliers",
+    "supplier_items",
 ]
 
 
@@ -217,6 +222,34 @@ def make_inventory_item(db: Session, unit: UnitMeasure | None = None, **kw) -> I
     kw.setdefault("unit_cost", Decimal("0"))
     kw.setdefault("active", True)
     obj = InventoryItem(**kw)
+    db.add(obj)
+    db.flush()
+    return obj
+
+
+def make_supplier(db: Session, **kw) -> Supplier:
+    kw.setdefault("id", _uid())
+    kw.setdefault("name", f"proveedor-{kw['id']}")
+    kw.setdefault("active", True)
+    obj = Supplier(**kw)
+    db.add(obj)
+    db.flush()
+    return obj
+
+
+def make_supplier_item(db: Session, supplier: Supplier | None = None, inventory_item: InventoryItem | None = None, **kw) -> SupplierItem:
+    if supplier is None:
+        supplier = make_supplier(db)
+    if inventory_item is None:
+        inventory_item = make_inventory_item(db)
+    kw.setdefault("id", _uid())
+    kw.setdefault("supplier_id", supplier.id)
+    kw.setdefault("inventory_item_id", inventory_item.id)
+    kw.setdefault("presentation", f"presentacion-{kw['id']}")
+    kw.setdefault("conversion_factor", Decimal("1"))
+    kw.setdefault("active", True)
+    kw.setdefault("preferred", False)
+    obj = SupplierItem(**kw)
     db.add(obj)
     db.flush()
     return obj

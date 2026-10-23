@@ -14,7 +14,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
@@ -65,6 +65,7 @@ def list_items_query(
     type_: str | None = None,
     active: bool | None = None,
     low_stock: bool | None = None,
+    supplier_id: UUID | None = None,
 ) -> Select:
     """Construye el Select filtrado/ordenado para GET /inventory/items.
 
@@ -72,13 +73,26 @@ def list_items_query(
     """
     stmt = select(InventoryItem).order_by(InventoryItem.name)
     if search:
-        stmt = stmt.where(InventoryItem.name.ilike(f"%{search}%"))
+        stmt = stmt.where(
+            or_(
+                InventoryItem.name.ilike(f"%{search}%"),
+                InventoryItem.code.ilike(f"%{search}%"),
+            )
+        )
     if type_ is not None:
         stmt = stmt.where(InventoryItem.type == type_)
     if active is not None:
         stmt = stmt.where(InventoryItem.active == active)
     if low_stock:
         stmt = stmt.where(InventoryItem.current_stock <= InventoryItem.min_stock)
+    if supplier_id is not None:
+        stmt = stmt.where(
+            exists().where(
+                SupplierItem.inventory_item_id == InventoryItem.id,
+                SupplierItem.supplier_id == supplier_id,
+                SupplierItem.active.is_(True),
+            )
+        )
     return stmt
 
 
