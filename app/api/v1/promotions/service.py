@@ -830,12 +830,13 @@ def _add_rules(db: Session, promo: Promotion, rules_in: list) -> None:
         _apply_variant_set(db, rule, rule_in.variant_ids)
 
 
-def create(db: Session, data) -> Promotion:
+def create(db: Session, data, tenant: Tenant | None = None) -> Promotion:
     _guard_no_shared_variants_within_payload(data.rules)
     promo = Promotion(
         name=data.name, description=data.description,
         status=data.status.value,
-        starts_at=data.starts_at, ends_at=data.ends_at,
+        starts_at=local_now(data.starts_at, tenant) if data.starts_at is not None else None,
+        ends_at=local_now(data.ends_at, tenant) if data.ends_at is not None else None,
         days_of_week=data.days_of_week,
         start_time=data.start_time, end_time=data.end_time,
     )
@@ -851,7 +852,7 @@ def create(db: Session, data) -> Promotion:
     return promo
 
 
-def update(db: Session, promo: Promotion, data) -> Promotion:
+def update(db: Session, promo: Promotion, data, tenant: Tenant | None = None) -> Promotion:
     """Campos escalares de la **promoción** (FR-018): `type`/`value`/
     `min_qty`/conjunto ya no están en `PromotionUpdate` — viven en cada
     regla y solo se editan por `update_shape`, y solo en `draft`.
@@ -880,7 +881,10 @@ def update(db: Session, promo: Promotion, data) -> Promotion:
     for field_name in ("name", "description", "starts_at", "ends_at",
                        "days_of_week", "start_time", "end_time"):
         if field_name in provided:
-            setattr(promo, field_name, getattr(data, field_name))
+            value = getattr(data, field_name)
+            if field_name in ("starts_at", "ends_at") and value is not None:
+                value = local_now(value, tenant)
+            setattr(promo, field_name, value)
 
     if (promo.start_time is None) != (promo.end_time is None):
         raise HTTPException(

@@ -10,10 +10,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.db import get_db
+from app.core.db import get_db, get_tenant
 from app.core.crud import get_or_404, ensure_unique
 from app.core.dependencies import get_current_user, require_tenant_admin
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core.audit import record_audit
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import require_module_access
@@ -65,9 +65,10 @@ def list_promotions(
 @router.post("", response_model=PromotionResponse,
              status_code=status.HTTP_201_CREATED, summary="Crear promoción")
 def create_promotion(body: PromotionCreate, db: Session = Depends(get_db),
-                     user: User = Depends(require_tenant_admin)):
+                     user: User = Depends(require_tenant_admin),
+                     tenant: Tenant = Depends(get_tenant)):
     ensure_unique(db, Promotion, Promotion.name, body.name, "Ya existe una promoción con ese nombre")
-    promo = service.create(db, body)
+    promo = service.create(db, body, tenant=tenant)
     record_audit(db, action="create", entity="promotion", entity_id=promo.id,
                  user=user, payload={
                      "name": promo.name, "status": promo.status,
@@ -82,13 +83,14 @@ def create_promotion(body: PromotionCreate, db: Session = Depends(get_db),
 @router.patch("/{promotion_id}", response_model=PromotionResponse,
               summary="Actualizar campos escalares")
 def update_promotion(promotion_id: UUID, body: PromotionUpdate, db: Session = Depends(get_db),
-                     user: User = Depends(require_tenant_admin)):
+                     user: User = Depends(require_tenant_admin),
+                     tenant: Tenant = Depends(get_tenant)):
     promo = get_or_404(db, Promotion, promotion_id, "Promoción no encontrada")
     if "name" in body.model_fields_set and body.name is not None:
         ensure_unique(db, Promotion, Promotion.name, body.name,
                       "Ya existe una promoción con ese nombre", exclude_id=promo.id)
     before = {f: getattr(promo, f) for f in body.model_fields_set if hasattr(promo, f)}
-    promo = service.update(db, promo, body)
+    promo = service.update(db, promo, body, tenant=tenant)
     record_audit(db, action="update", entity="promotion", entity_id=promo.id, user=user,
                  payload={"before": {k: str(v) for k, v in before.items()},
                           "after": {k: str(getattr(promo, k)) for k in before}})

@@ -471,6 +471,30 @@ class TestCartService(unittest.TestCase):
 
         self.assertEqual(cancelled.status, "cancelada")
 
+    def test_cancel_my_order_aceptado_para_cocina_sin_cobrar_409(self):
+        """Comportamiento NUEVO: un pedido "aceptado para cocina" sin cobrar
+        (`kitchen.accept_order_for_kitchen` -- `POST /orders/{id}/start-preparation`)
+        queda con `status` aún en `'recibida'` pero sus ítems ya
+        `en_preparacion`. Antes de este fix, `cancel_my_order` solo miraba
+        `estado_cocina` cuando `status != 'recibida'`, así que el comensal
+        podía seguir cancelando un pedido que cocina ya estaba preparando.
+        Ahora responde 409 igual que `test_cancel_my_order_en_preparacion_409`."""
+        db, table, ts, participant = self._seed_session()
+        variant, _, _ = self._seed_variant(db)
+        efectivo = self._seed_efectivo(db)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        order = service.submit_cart(db, participant, efectivo.id)
+        self.assertEqual(order.status, "recibida")
+
+        from app.api.v1.orders import kitchen
+        kitchen.accept_order_for_kitchen(db, order.id)
+        db.refresh(order)
+        self.assertEqual(order.status, "recibida")
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.cancel_my_order(db, participant, order.id, "Ya no quiero")
+        self.assertEqual(ctx.exception.status_code, 409)
+
     def test_cancel_my_order_en_preparacion_409(self):
         """CONGELA comportamiento actual: un pedido cuyos ítems ya están
         'en_preparacion' (staff ya confirmó y cocina ya empezó) responde 409

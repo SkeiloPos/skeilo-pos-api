@@ -122,12 +122,13 @@ class TestSubmitCartComprobante(unittest.TestCase):
         self.assertEqual(ctx.exception.detail, "Un pago en efectivo no lleva comprobante")
         exists.assert_not_called()
 
-    def test_metodo_que_exige_comprobante_sin_comprobante_sigue_siendo_422_con_su_mensaje(self):
+    def test_metodo_que_ya_no_exige_comprobante_sin_comprobante_crea_la_orden(self):
+        """spec 132 (A-144, FR-001/FR-023): el comensal ya no sube comprobante
+        desde el QR — antes de spec 132 esto fallaba con 422 ("Este método de
+        pago exige cargar un comprobante")."""
         db, participant, nequi, _ = _seed_carrito()
-        with self.assertRaises(HTTPException) as ctx:
-            service.submit_cart(db, participant, nequi.id, tenant_schema=SCHEMA)
-        self.assertEqual(ctx.exception.status_code, 422)
-        self.assertEqual(ctx.exception.detail, "Este método de pago exige cargar un comprobante")
+        order = service.submit_cart(db, participant, nequi.id, tenant_schema=SCHEMA)
+        self.assertIsNone(order.current_payment_attempt.receipt_file_url)
 
     def test_efectivo_sin_comprobante_no_consulta_r2(self):
         db, participant, _, efectivo = _seed_carrito()

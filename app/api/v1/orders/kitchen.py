@@ -89,6 +89,42 @@ def mark_order_ready(db: Session, order_id: UUID) -> tuple[CustomerOrder, list[O
     return order, cambiados
 
 
+def accept_order_for_kitchen(db: Session, order_id: UUID) -> tuple[CustomerOrder, list[OrderItem]]:
+    """"Aceptar pedido" sin cobrar: pasa a `en_preparacion` todos los ítems
+    `pendiente` de la orden, en un solo commit. Gemela de `mark_order_ready`
+    (arriba), pero con el target de la transición invertido.
+
+    No toca `CustomerOrder.status` a propósito: aceptar para cocina y cobrar
+    son decisiones separadas (el pedido puede seguir `recibida`, esperando
+    revisión de pago, mientras cocina ya empezó). Por eso tampoco descuenta
+    inventario aquí -- eso sigue pasando únicamente en `confirm`/`pay`."""
+    order = db.execute(
+        select(CustomerOrder)
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
+        .where(CustomerOrder.id == order_id)
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    if order.status in ("pagada", "cancelada"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"La orden ya es terminal (status={order.status})",
+        )
+
+    cambiados = [it for it in order.items if it.estado_cocina == "pendiente"]
+    if not cambiados:
+        return order, []
+
+    for it in cambiados:
+        it.estado_cocina = "en_preparacion"
+    db.commit()
+    db.refresh(order)
+    return order, cambiados
+
+
 def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> CustomerOrder:
     item = db.execute(
         select(OrderItem)

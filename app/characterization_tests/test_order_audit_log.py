@@ -363,7 +363,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         el primero nace dentro de `submit_cart`)."""
         db, order, attempt = self._seed_orden_recibida(is_cash=False)
         attempt.status = "rechazado"
-        attempt.rejection_reason = "el comprobante no se lee"
+        attempt.rejection_reason = "comprobante_sospechoso"
         nequi = fx.make_payment_method(db, name="Nequi 2", is_cash=False, type="transfer")
         db.commit()
 
@@ -443,12 +443,12 @@ class TestOrderAuditIntegration(unittest.TestCase):
         user = _staff()
 
         with mock.patch.object(checkout, "record_order_audit_event") as rec:
-            checkout.reject_payment_attempt(db, attempt.id, "el monto no coincide", user)
+            checkout.reject_payment_attempt(db, attempt.id, "monto_no_coincide", user)
 
         eventos = _eventos(rec, OrderAuditEventType.PAYMENT_TRANSFER_REJECTED)
         self.assertEqual(len(eventos), 1)
         self.assertEqual(eventos[0]["order_id"], order.id)
-        self.assertEqual(eventos[0]["details"]["rejection_reason"], "el monto no coincide")
+        self.assertEqual(eventos[0]["details"]["rejection_reason"], "monto_no_coincide")
 
     # ---------------------------------------------------- cancel_order (T017)
 
@@ -629,7 +629,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
             is_cash=False, receipt=COMPROBANTE
         )
         with mock.patch.object(checkout, "record_order_audit_event") as rec_ko:
-            checkout.reject_payment_attempt(db_d, attempt_d.id, "borroso", _staff())
+            checkout.reject_payment_attempt(db_d, attempt_d.id, "comprobante_sospechoso", _staff())
         capturados += _eventos(rec_ko)
 
         # (e) cobro y envío en un solo paso (FR-014, adenda): confirmed(sistema)
@@ -701,7 +701,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
                 tenant_schema="tenant_test",
             )
             attempt = self._attempt_de(db, order.id)
-            checkout.reject_payment_attempt(db, attempt.id, "borroso", _staff())
+            checkout.reject_payment_attempt(db, attempt.id, "comprobante_sospechoso", _staff())
 
             # Intento aprobado, con el mismo comprobante en otra orden.
             db2, participant2, nequi2 = self._seed_carrito_qr(is_cash=False)

@@ -693,7 +693,8 @@ class TestCheckout(unittest.TestCase):
 
         db.refresh(attempt)
         self.assertEqual(attempt.status, "rechazado")
-        self.assertEqual(attempt.rejection_reason, "no llegó")
+        # spec 132 (A-144, FR-015): ver test_cancel_order_resuelve_intento_de_pago_pendiente_transferencia_spec_044.
+        self.assertEqual(attempt.rejection_reason, "transferencia_no_completada")
         self.assertEqual(attempt.resolved_by_user_id, user.id)
         self.assertIsNotNone(attempt.resolved_at)
 
@@ -716,7 +717,11 @@ class TestCheckout(unittest.TestCase):
 
         db.refresh(attempt)
         self.assertEqual(attempt.status, "rechazado")
-        self.assertEqual(attempt.rejection_reason, "se fue sin pagar")
+        # spec 132 (A-144, FR-015): `rejection_reason` ya no admite texto
+        # libre; este camino (cancelación, no rechazo de verificación) usa el
+        # valor cerrado más fiel — el motivo real de la cancelación sigue
+        # íntegro en `OrderCancelLog.motivo`, no se pierde.
+        self.assertEqual(attempt.rejection_reason, "transferencia_no_completada")
 
     def test_cancel_order_sin_intento_de_pago_no_falla_spec_044(self):
         """Guarda de no-regresión: un pedido de mostrador/mesero (sin ningún

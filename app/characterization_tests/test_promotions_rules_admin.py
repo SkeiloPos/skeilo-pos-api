@@ -356,8 +356,10 @@ class TestUS5DuplicarEditarEstados(unittest.TestCase):
 
         service.update(self.db, draft, PromotionUpdate(starts_at=nueva_fecha))
         self.db.commit()
-        # SQLite no preserva tzinfo (Postgres sí) -- se compara el instante naive.
-        self.assertEqual(draft.starts_at, nueva_fecha.replace(tzinfo=None))
+        # `service.update()` convierte a hora local del tenant (respaldo
+        # `America/Bogota`, UTC-5) antes de persistir -- la columna guarda
+        # siempre hora local naive, nunca los dígitos de reloj UTC crudos.
+        self.assertEqual(draft.starts_at, datetime(2026, 8, 31, 19, 0))
 
         service.change_status(self.db, draft, "active")
         service.change_status(self.db, draft, "paused")
@@ -477,8 +479,10 @@ class TestUS5MantenimientoPorLote(unittest.TestCase):
         nueva_fecha = datetime(2026, 12, 31, tzinfo=timezone.utc)
         service.update(self.db, self.promo, PromotionUpdate(ends_at=nueva_fecha))
         self.db.commit()
-        # SQLite no conserva tzinfo en un DateTime — se compara naive.
-        self.assertEqual(self.promo.ends_at, nueva_fecha.replace(tzinfo=None))
+        # `service.update()` convierte a hora local del tenant (respaldo
+        # `America/Bogota`, UTC-5) antes de persistir -- la columna guarda
+        # siempre hora local naive, nunca los dígitos de reloj UTC crudos.
+        self.assertEqual(self.promo.ends_at, datetime(2026, 12, 30, 19, 0))
         # las 6 reglas siguen colgando de la misma promoción — no hicieron
         # falta 6 llamadas para que la vigencia nueva les aplique a todas.
         self.assertEqual(len(self.promo.rules), 6)

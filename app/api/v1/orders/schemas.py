@@ -7,8 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.catalog.schemas import OptionSelectionIn, ToppingSelectionIn
 from app.api.v1.sales.schemas import PaymentIn
-from app.core.schema_types import AssetUrl
+from app.core.schema_types import AssetRefIn, AssetUrl
 from app.core.timezone import UtcDatetime
+from app.models.order_payment_attempt import RejectionReason
 
 
 class OrderChannel(str, Enum):
@@ -397,7 +398,9 @@ class PaymentAttemptResponse(BaseModel):
 
 
 class PaymentAttemptRejectIn(BaseModel):
-    reason: str = Field(..., min_length=1, max_length=500)
+    # Spec 132 (FR-015): conjunto cerrado — ya no es texto libre. `422` si el
+    # valor no pertenece a `RejectionReason`.
+    reason: RejectionReason
 
 
 class PaymentAttemptApproveIn(BaseModel):
@@ -405,12 +408,38 @@ class PaymentAttemptApproveIn(BaseModel):
     que necesita el turno de caja donde registrarla — mismo campo que
     `PayIn`/`CheckoutAndSendIn`."""
     cash_shift_id: UUID
+    # Spec 132 (FR-012): foto opcional del comprobante que solo el cajero
+    # adjunta al confirmar — nunca bloquea la aprobación si se omite.
+    receipt_file_url: AssetRefIn = None
 
 
 class PaymentAttemptConfirmCashIn(BaseModel):
     amount_received: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2)
     # Spec 028: ver `PaymentAttemptApproveIn`.
     cash_shift_id: UUID
+
+
+class PaymentAttemptAdjustSplitIn(BaseModel):
+    """Spec 132 (FR-013): reajuste de la división efectivo/transferencia de
+    un intento `pendiente` al confirmar — convierte transferencia total ↔
+    mixto ↔ efectivo total sin crear un intento nuevo."""
+    cash_amount: int = Field(..., ge=0)
+    transfer_amount: int = Field(..., ge=0)
+    transfer_method_id: UUID | None = None
+    payment_method_id: UUID | None = None
+
+
+class PaymentEventOut(BaseModel):
+    """Una fila del historial de auditoría consultable de un pedido (spec
+    132, FR-019) — `GET /orders/{order_id}/payment-events`."""
+    action: str
+    entity: str
+    entity_id: UUID | None = None
+    user_name: str | None = None
+    at: UtcDatetime
+    payload: dict | None = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ---------- Preparación ----------
