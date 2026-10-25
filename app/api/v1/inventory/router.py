@@ -278,8 +278,18 @@ def update_item(
     if body.name is not None and body.name != item.name:
         ensure_unique(db, InventoryItem, InventoryItem.name, body.name, "Inventory item name already exists")
         item.name = body.name
-    if body.unit_measure_id is not None:
+    if body.unit_measure_id is not None and body.unit_measure_id != item.unit_measure_id:
         get_or_404(db, UnitMeasure, body.unit_measure_id, "Unit measure not found")
+        has_movements = db.execute(
+            select(InventoryMovement.id)
+            .where(InventoryMovement.inventory_item_id == item.id)
+            .limit(1)
+        ).first() is not None
+        if has_movements:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "No se puede cambiar la unidad base de un insumo con movimientos registrados",
+            )
         item.unit_measure_id = body.unit_measure_id
     if body.type is not None:
         item.type = body.type.value
@@ -467,9 +477,10 @@ def list_purchases(
 def create_purchase(
     body: PurchaseCreate,
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     user: User = Depends(require_tenant_admin),
 ):
-    purchase = service.create_purchase(db, body, user_id=user.id)
+    purchase = service.create_purchase(db, body, user_id=user.id, tenant=tenant)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
 
@@ -482,9 +493,10 @@ def create_purchase(
 def create_purchase_order(
     body: PurchaseCreate,
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     user: User = Depends(require_tenant_admin),
 ):
-    purchase = service.create_purchase_order(db, body, user_id=user.id)
+    purchase = service.create_purchase_order(db, body, user_id=user.id, tenant=tenant)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
 
@@ -501,5 +513,20 @@ def receive_purchase(
     user: User = Depends(require_tenant_admin),
 ):
     purchase = service.receive_purchase(db, purchase_id, body, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
+
+
+@router.post(
+    "/purchases/{purchase_id}/void", response_model=PurchaseResponse,
+    summary="Anular una compra confirmada (spec 134)",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def void_purchase(
+    purchase_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_tenant_admin),
+):
+    purchase = service.void_purchase(db, purchase_id, user_id=user.id)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase

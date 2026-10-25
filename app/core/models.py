@@ -98,6 +98,12 @@ class Tenant(Base,TimestampMixin):
         "notification_retention_days", Integer, nullable=False, server_default="90"
     )
 
+    # Permite capturar una línea de compra en una unidad distinta de la base del insumo
+    # (spec 134, FR-016). `true` preserva el comportamiento de todo tenant existente.
+    unit_conversion_enabled:Mapped[bool] = mapped_column(
+        "unit_conversion_enabled", Boolean, nullable=False, server_default="true", default=True
+    )
+
     users: Mapped[list["User"]] = relationship(
             back_populates="tenant",
             cascade="all, delete-orphan"

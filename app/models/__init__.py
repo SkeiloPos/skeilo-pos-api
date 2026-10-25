@@ -2,6 +2,7 @@
 # Catálogo / menú
 from .category import Category
 from .unit_measure import UnitMeasure
+from .unit_measure_factor_change import UnitMeasureFactorChange
 from .product import Product
 from .product_variant import ProductVariant
 from .product_topping import ProductTopping

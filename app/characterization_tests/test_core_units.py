@@ -45,25 +45,22 @@ class ConvertWithDuckTypedUnitsTests(unittest.TestCase):
 
 
 class ConvertWithRealUnitMeasureModelTests(unittest.TestCase):
-    """RN-CAT-41 [HALLAZGO CRÍTICO / CÓDIGO MUERTO]: el modelo real
-    `UnitMeasure` (`app/models/unit_measure.py`) NO tiene columnas
-    `dimension` ni `factor_to_base`. Invocar `convert()` con instancias
-    reales de la BD actual lanza `AttributeError`, no el 422 documentado.
-    Se congela ese `AttributeError` tal cual, porque es el comportamiento
-    real hoy — no se simula el campo que falta."""
+    """RN-CAT-41 [RESUELTO por spec 134]: el modelo real `UnitMeasure`
+    (`app/models/unit_measure.py`) ya declara `dimension`/`factor_to_base` --
+    `convert()` deja de ser código muerto y opera sobre instancias reales
+    exactamente igual que sobre los objetos duck-typed de arriba."""
 
     def setUp(self):
         self.db = f.new_session()
 
-    def test_rn_cat_41_unit_measure_real_no_tiene_dimension_attributeerror(self):
-        gramo = f.make_unit(self.db, name="gramo", abbreviation="g")
-        mililitro = f.make_unit(self.db, name="mililitro", abbreviation="ml")
-        with self.assertRaises(AttributeError):
-            convert(Decimal("500"), gramo, mililitro)
+    def test_rn_cat_41_unit_measure_real_ya_convierte_entre_dimensiones_iguales(self):
+        kg = f.make_unit(self.db, name="kilogramo", abbreviation="kg", dimension="masa", factor_to_base=Decimal("1000"))
+        g = f.make_unit(self.db, name="gramo", abbreviation="g", dimension="masa", factor_to_base=Decimal("1"))
+        self.assertEqual(convert(Decimal("2"), kg, g), Decimal("2000"))
 
-    def test_rn_cat_41_unit_measure_no_declara_esas_columnas_en_absoluto(self):
-        self.assertNotIn("dimension", UnitMeasure.__table__.columns.keys())
-        self.assertNotIn("factor_to_base", UnitMeasure.__table__.columns.keys())
+    def test_rn_cat_41_unit_measure_real_ya_declara_esas_columnas(self):
+        self.assertIn("dimension", UnitMeasure.__table__.columns.keys())
+        self.assertIn("factor_to_base", UnitMeasure.__table__.columns.keys())
 
 
 if __name__ == "__main__":

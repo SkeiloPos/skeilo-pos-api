@@ -1,6 +1,6 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -10,7 +10,10 @@ from app.core.crud import get_or_404, ensure_unique
 from app.core.models import User
 from app.core.plan_limits import require_module_access
 from app.models.unit_measure import UnitMeasure
-from app.api.v1.unit_measures.schemas import UnitMeasureCreate, UnitMeasureUpdate, UnitMeasureResponse
+from app.models.unit_measure_factor_change import UnitMeasureFactorChange
+from app.api.v1.unit_measures.schemas import (
+    UnitMeasureCreate, UnitMeasureUpdate, UnitMeasureResponse, FactorChangeResponse,
+)
 
 router = APIRouter(
     prefix="/unit-measures", tags=["unit_measures"],
@@ -32,12 +35,17 @@ def list_unit_measures(
     active: bool | None = Query(
         None, description="Filtra por estado activo (true) o inactivo (false)."
     ),
+    dimension: str | None = Query(
+        None, description="Filtra por grupo de medida exacto (spec 134), p. ej. 'Masa'.",
+    ),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
     query = select(UnitMeasure)
     if active is not None:
         query = query.where(UnitMeasure.active == active)
+    if dimension is not None:
+        query = query.where(UnitMeasure.dimension == dimension)
     return db.execute(query).scalars().all()
 
 
@@ -83,6 +91,8 @@ def create_unit_measure(
     unit_measure = UnitMeasure(
         name=body.name,
         abbreviation=body.abbreviation,
+        dimension=body.dimension,
+        factor_to_base=body.factor_to_base,
     )
     db.add(unit_measure)
     db.commit()
@@ -107,7 +117,7 @@ def update_unit_measure(
     id: UUID,
     body: UnitMeasureUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     unit_measure = get_or_404(db, UnitMeasure, id, "Unit measure not found")
 
@@ -118,12 +128,53 @@ def update_unit_measure(
     if body.name is not None:
         unit_measure.name = body.name
 
+    if body.dimension is not None:
+        unit_measure.dimension = body.dimension
+
+    # Cambiar factor_to_base exige rol ADMIN (spec 134, FR-011a); los demás campos de este
+    # mismo endpoint no adquieren esa restricción. Cada cambio queda auditado (FR-011).
+    if body.factor_to_base is not None and body.factor_to_base != unit_measure.factor_to_base:
+        if not user.role or user.role.name != "ADMIN":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Tenant admin access required",
+            )
+        db.add(UnitMeasureFactorChange(
+            id=uuid4(),
+            unit_measure_id=unit_measure.id,
+            old_factor=unit_measure.factor_to_base,
+            new_factor=body.factor_to_base,
+            changed_by=user.id,
+        ))
+        unit_measure.factor_to_base = body.factor_to_base
+
     if body.active is not None:
         unit_measure.active = body.active
 
     db.commit()
     db.refresh(unit_measure)
     return unit_measure
+
+
+@router.get(
+    "/{id}/factor-changes",
+    response_model=list[FactorChangeResponse],
+    summary="Historial de cambios de factor_to_base (spec 134)",
+    responses={
+        401: {"description": "No autenticado o token inválido."},
+        404: {"description": "La unidad de medida no existe."},
+    },
+)
+def list_factor_changes(
+    id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    get_or_404(db, UnitMeasure, id, "Unit measure not found")
+    return db.execute(
+        select(UnitMeasureFactorChange)
+        .where(UnitMeasureFactorChange.unit_measure_id == id)
+        .order_by(UnitMeasureFactorChange.changed_at)
+    ).scalars().all()
 
 
 @router.delete(
