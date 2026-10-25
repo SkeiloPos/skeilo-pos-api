@@ -18,6 +18,7 @@ tests de `orders` (`orders_fixtures`), igual que `test_cash_net_sales.py`
 """
 from decimal import Decimal
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.api.v1.orders import checkout
@@ -135,6 +136,52 @@ def test_tres_lineas_de_pago_aceptadas() -> None:
     print("OK: tres_lineas_de_pago_aceptadas")
 
 
+def test_dos_lineas_mismo_metodo_rechazadas_422() -> None:
+    """spec 135 (A-146, revierte A-124/FR-005 de spec 112): 2 líneas con el
+    mismo método se rechazan con 422 y el pedido queda sin pagos."""
+    s = _seed_order()
+    data = PayIn(
+        cash_shift_id=s["shift"].id,
+        payments=[
+            _pago(s["transferencia"].id, Decimal("4000")),
+            _pago(s["transferencia"].id, Decimal("6000")),
+        ],
+    )
+    try:
+        checkout.pay_order(s["db"], s["order"].id, data, s["cashier"])
+    except HTTPException as exc:
+        assert exc.status_code == 422, f"se esperaba 422, fue {exc.status_code}"
+        assert "Transferencia Nequi" in exc.detail, exc.detail
+    else:
+        raise AssertionError("debía rechazar 2 líneas con el mismo método")
+    s["db"].refresh(s["order"])
+    assert s["order"].status == "bloqueada", f"el pedido no debía quedar pagado, quedó {s['order'].status}"
+    print("OK: dos_lineas_mismo_metodo_rechazadas_422")
+
+
+def test_tres_lineas_dos_repiten_metodo_rechazadas_422() -> None:
+    """FR-003: la regla aplica sin importar cuántas líneas tenga el cobro --
+    3 líneas donde 2 de las 3 repiten método también se rechazan."""
+    s = _seed_order()
+    efectivo_extra = fx.make_payment_method(s["db"], name="Efectivo 2", is_cash=False, type="other")
+    s["db"].commit()
+    data = PayIn(
+        cash_shift_id=s["shift"].id,
+        payments=[
+            _pago(s["transferencia"].id, Decimal("3000")),
+            _pago(s["transferencia"].id, Decimal("3000")),
+            _pago(efectivo_extra.id, Decimal("4000")),
+        ],
+    )
+    try:
+        checkout.pay_order(s["db"], s["order"].id, data, s["cashier"])
+    except HTTPException as exc:
+        assert exc.status_code == 422, f"se esperaba 422, fue {exc.status_code}"
+    else:
+        raise AssertionError("debía rechazar 3 líneas donde 2 repiten método")
+    print("OK: tres_lineas_dos_repiten_metodo_rechazadas_422")
+
+
 def test_release_table_tras_pago_mixto() -> None:
     """US5/RN12/FR-018: `release_table` sigue liberando la mesa tras un
     cobro con 2 líneas de pago, igual que con una sola (no depende de
@@ -162,6 +209,8 @@ def main() -> None:
         test_un_solo_pago_sigue_creando_una_fila,
         test_cuarta_linea_de_pago_rechazada_422,
         test_tres_lineas_de_pago_aceptadas,
+        test_dos_lineas_mismo_metodo_rechazadas_422,
+        test_tres_lineas_dos_repiten_metodo_rechazadas_422,
         test_release_table_tras_pago_mixto,
     ]
     fallos = 0

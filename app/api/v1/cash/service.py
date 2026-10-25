@@ -198,16 +198,48 @@ def reconcile(db: Session, shift: CashShift) -> dict:
             )
             row["total"] -= share
 
-    # --- Movimientos manuales agrupados por kind ---
+    # --- Movimientos manuales agrupados por kind + is_cash (spec 135, D5) ---
     mov_rows = db.execute(
-        select(CashMovement.kind, func.coalesce(func.sum(CashMovement.amount), 0))
+        select(
+            CashMovement.kind, PaymentMethod.is_cash,
+            func.coalesce(func.sum(CashMovement.amount), 0),
+        )
+        .join(PaymentMethod, PaymentMethod.id == CashMovement.payment_method_id)
         .where(CashMovement.cash_shift_id == shift.id)
-        .group_by(CashMovement.kind)
+        .group_by(CashMovement.kind, PaymentMethod.is_cash)
     ).all()
-    by_kind = {kind: Decimal(total) for kind, total in mov_rows}
-    ingresos = by_kind.get("ingreso", Decimal(0))
-    egresos = by_kind.get("egreso", Decimal(0))
-    retiros = by_kind.get("retiro", Decimal(0))
+    by_kind_cash: dict[tuple[str, bool], Decimal] = {
+        (kind, is_cash): Decimal(total) for kind, is_cash, total in mov_rows
+    }
+    # FR-007: solo el ingreso en efectivo entra en `expected` -- la fórmula no
+    # cambia, solo se vuelve más estricta la fuente de `ingresos`.
+    ingresos = by_kind_cash.get(("ingreso", True), Decimal(0))
+    # FR-012: egreso/retiro siguen siendo siempre efectivo por construcción.
+    egresos = by_kind_cash.get(("egreso", True), Decimal(0))
+    retiros = by_kind_cash.get(("retiro", True), Decimal(0))
+
+    # FR-008: desglose de ingresos en métodos distintos a efectivo, junto al
+    # total de ventas de ese mismo método -- sin ceros rellenados.
+    ingreso_method_rows = db.execute(
+        select(
+            PaymentMethod.id, PaymentMethod.name, PaymentMethod.type,
+            func.coalesce(func.sum(CashMovement.amount), 0), func.count(CashMovement.id),
+        )
+        .join(PaymentMethod, PaymentMethod.id == CashMovement.payment_method_id)
+        .where(
+            CashMovement.cash_shift_id == shift.id,
+            CashMovement.kind == "ingreso",
+            PaymentMethod.is_cash.is_(False),
+        )
+        .group_by(PaymentMethod.id, PaymentMethod.name, PaymentMethod.type)
+    ).all()
+    ingresos_by_method = [
+        {
+            "method_id": method_id, "method_name": method_name,
+            "method_type": method_type, "total": Decimal(total), "count": count,
+        }
+        for method_id, method_name, method_type, total, count in ingreso_method_rows
+    ]
 
     # Solo el efectivo entra en el esperado del cajón.
     expected = (
@@ -232,6 +264,7 @@ def reconcile(db: Session, shift: CashShift) -> dict:
         "ingresos": ingresos,
         "egresos": egresos,
         "retiros": retiros,
+        "ingresos_by_method": ingresos_by_method,
         "expected": expected,
         "counted_amount": shift.counted_amount,
         "difference": difference,

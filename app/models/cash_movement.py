@@ -1,10 +1,13 @@
 from app.core.models import Base, UUIDPrimaryKeyMixin
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import String, Numeric, ForeignKey, DateTime, func, CheckConstraint
-from sqlalchemy.orm import mapped_column, Mapped
-from typing import Optional
+from sqlalchemy.orm import mapped_column, Mapped, relationship
+from typing import Optional, TYPE_CHECKING
 from decimal import Decimal
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from .payment import PaymentMethod
 
 
 class CashMovement(UUIDPrimaryKeyMixin, Base):
@@ -27,6 +30,26 @@ class CashMovement(UUIDPrimaryKeyMixin, Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
 
     description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # spec 135: método de esta línea -- egreso/retiro siempre el método
+    # `is_cash=True` del tenant (forzado por el endpoint, FR-012); ingreso
+    # cualquier método activo (FR-004). `NOT NULL` tras backfill (migración),
+    # nullable aquí solo porque SQLAlchemy no distingue "nullable en Python"
+    # de "nullable en la base de datos" -- la columna real sí es NOT NULL.
+    payment_method_id: Mapped[UUID] = mapped_column(
+        ForeignKey("payment_methods.id"), nullable=False, index=True
+    )
+    payment_method: Mapped["PaymentMethod"] = relationship()
+
+    @property
+    def payment_method_name(self) -> str:
+        """Nombre legible del método de esta línea (dashboard/reporte de
+        caja): `CashMovementResponse` lo expone vía `from_attributes`."""
+        return self.payment_method.name
+
+    # spec 135 (FR-011): enlaza las 1-2 filas de un mismo evento de ingreso
+    # mixto (US3). `NULL` para egreso/retiro y para un ingreso de 1 sola línea.
+    group_id: Mapped[Optional[UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     # Referencia blanda a shared.users.id (sin FK cross-schema) + snapshot.
     user_id: Mapped[Optional[UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
