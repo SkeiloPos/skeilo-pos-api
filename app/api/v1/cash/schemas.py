@@ -82,11 +82,23 @@ class DenominationCatalogItem(BaseModel):
 
 
 # ---------- Movimientos de efectivo ----------
+class CashMovementLineIn(BaseModel):
+    """spec 135 (FR-004/FR-005): una línea de un ingreso -- método explícito
+    distinto del efectivo (US2) o una de 1-2 líneas de un ingreso mixto (US3)."""
+    payment_method_id: UUID
+    amount: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2)
+
+
 class CashMovementIn(BaseModel):
     kind: CashMovementKind
-    amount: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2)
     category: str = Field(..., min_length=1, max_length=100)
     description: str | None = Field(None, max_length=255)
+    # Compatibilidad (FR-009): una sola línea en efectivo, forma actual sin
+    # cambios -- interpretada como antes de spec 135.
+    amount: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=2)
+    # spec 135 (FR-004/FR-005): 1-2 líneas con método explícito, solo para
+    # kind='ingreso'. Exclusivo con `amount` (validado en el router).
+    lines: list[CashMovementLineIn] | None = Field(None, min_length=1, max_length=2)
 
 
 class CashMovementResponse(BaseModel):
@@ -94,6 +106,9 @@ class CashMovementResponse(BaseModel):
     cash_shift_id: UUID
     kind: str
     amount: Decimal
+    payment_method_id: UUID
+    payment_method_name: str
+    group_id: UUID | None = None
     category: str | None = None
     description: str | None = None
     user_name: str | None = None
@@ -128,10 +143,15 @@ class ReconciliationResponse(BaseModel):
     cambio_entregado: Decimal
     # Una fila por método de pago activo, aunque no haya vendido nada en el turno.
     sales_by_method: list[SalesByMethod]
-    # Movimientos manuales por kind.
+    # Movimientos manuales por kind. `ingresos` (spec 135, FR-007): solo los
+    # registrados en un método `is_cash=True` -- es el único término que entra
+    # en `expected`.
     ingresos: Decimal
     egresos: Decimal
     retiros: Decimal
+    # spec 135 (FR-008): una fila por método `is_cash=False` con al menos un
+    # ingreso en el turno. Sin ceros rellenados (a diferencia de `sales_by_method`).
+    ingresos_by_method: list[SalesByMethod] = Field(default_factory=list)
     expected: Decimal
     counted_amount: Decimal | None = None
     difference: Decimal | None = None

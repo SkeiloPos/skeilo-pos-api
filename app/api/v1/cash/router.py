@@ -1,6 +1,6 @@
 from datetime import date
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
@@ -19,6 +19,7 @@ from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.cash_movement import CashMovement
 from app.models.cash_count_denomination import CashCountDenomination
+from app.models.payment import PaymentMethod
 from app.api.v1.cash import service, reports, active_orders, denominations
 from app.api.v1.cash.schemas import (
     RegisterCreate, RegisterResponse,
@@ -30,6 +31,7 @@ from app.api.v1.cash.schemas import (
     ShiftSalesReportResponse, PeriodSalesReportResponse, ActiveOrderSummary,
     PaymentMethodsReportResponse,
 )
+from app.api.v1.sales.payment_validation import assert_distinct_payment_methods
 
 router = APIRouter(prefix="/cash", tags=["cash"])
 
@@ -398,17 +400,73 @@ def list_movements(shift_id: UUID, db: Session = Depends(get_db), _: User = Depe
     ).scalars().all()
 
 
-@router.post("/shifts/{shift_id}/movements", response_model=CashMovementResponse, status_code=status.HTTP_201_CREATED, summary="Registrar ingreso/egreso/retiro de efectivo")
+def _cash_payment_method(db: Session) -> PaymentMethod:
+    """El método `is_cash=True` del tenant -- al que egreso/retiro (y el
+    ingreso en efectivo de compatibilidad) quedan forzados (FR-012/FR-009)."""
+    method = db.execute(
+        select(PaymentMethod).where(PaymentMethod.is_cash.is_(True))
+    ).scalars().first()
+    if method is None:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "El tenant no tiene un método de pago en efectivo"
+        )
+    return method
+
+
+def _active_payment_method(db: Session, payment_method_id: UUID) -> PaymentMethod:
+    method = get_or_404(db, PaymentMethod, payment_method_id, "Payment method not found")
+    if not method.active:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"El método de pago «{method.name}» no está activo.",
+        )
+    return method
+
+
+@router.post("/shifts/{shift_id}/movements", response_model=list[CashMovementResponse], status_code=status.HTTP_201_CREATED, summary="Registrar ingreso/egreso/retiro de efectivo")
 def add_movement(shift_id: UUID, body: CashMovementIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     shift = get_or_404(db, CashShift, shift_id, "Shift not found")
     if shift.status != "open":
         raise HTTPException(status.HTTP_409_CONFLICT, "El turno está cerrado")
-    mov = CashMovement(
-        cash_shift_id=shift.id, kind=body.kind.value, amount=body.amount,
-        category=body.category, description=body.description,
-        user_id=user.id, user_name=user.name,
-    )
-    db.add(mov)
+
+    # spec 135 (research.md D6): `amount`/`lines` son mutuamente excluyentes.
+    if (body.amount is None) == (body.lines is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Debes enviar exactamente uno de 'amount' o 'lines'.",
+        )
+
+    if body.kind.value in ("egreso", "retiro"):
+        # FR-012: egreso/retiro siguen cash-only, sin excepción -- no aceptan `lines`.
+        if body.lines is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Los egresos y retiros solo admiten efectivo.",
+            )
+        lines = [(_cash_payment_method(db), body.amount)]
+    elif body.lines is None:
+        # FR-009: ingreso de compatibilidad -- 1 línea en efectivo, sin cambios.
+        lines = [(_cash_payment_method(db), body.amount)]
+    else:
+        # FR-004/FR-005: ingreso con 1-2 líneas de método explícito.
+        methods = [_active_payment_method(db, line.payment_method_id) for line in body.lines]
+        if len(body.lines) == 2:
+            # FR-006/FR-011: mismo criterio de rechazo que US1 (A-146).
+            assert_distinct_payment_methods(db, body.lines, "ingreso")
+        lines = list(zip(methods, (line.amount for line in body.lines)))
+
+    group_id = uuid4() if len(lines) == 2 else None
+    movimientos = []
+    for method, amount in lines:
+        mov = CashMovement(
+            cash_shift_id=shift.id, kind=body.kind.value, amount=amount,
+            payment_method_id=method.id, group_id=group_id,
+            category=body.category, description=body.description,
+            user_id=user.id, user_name=user.name,
+        )
+        db.add(mov)
+        movimientos.append(mov)
     db.commit()
-    db.refresh(mov)
-    return mov
+    for mov in movimientos:
+        db.refresh(mov)
+    return movimientos
