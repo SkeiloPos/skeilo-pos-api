@@ -13,13 +13,12 @@ if TYPE_CHECKING:
 class UnitMeasure(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Unidad de medida simple (litro, gramo, ml, unidad, bola).
 
-    `dimension`/`factor_to_base` (spec 134) activan `app/core/units.py::convert()`: dos
-    unidades son convertibles entre sí si `dimension` coincide exactamente, y
-    `factor_to_base` lleva la cantidad a la base de esa dimensión (kg→1000 g).
+    `factor_to_base` (spec 134) activa `app/core/units.py::convert()`: lleva la cantidad a
+    la base del grupo de la unidad (kg→1000 g).
 
-    `group_id`/`is_base` (spec 137) formalizan esa dimensión como `UnitMeasureGroup`:
-    `dimension` se mantiene como espejo sincronizado con `group.name` (research.md D2),
-    `convert()` no cambia.
+    `group_id`/`is_base` (spec 137) formalizan el grupo/dimensión de la unidad como
+    `UnitMeasureGroup`, la única fuente de verdad (spec 139 eliminó la columna `dimension`,
+    que hasta entonces era un espejo de `group.name`).
     """
 
     __tablename__ = "unit_measures"
@@ -28,14 +27,6 @@ class UnitMeasure(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     abbreviation: Mapped[str] = mapped_column(
         String(50), nullable=False, unique=True, index=True
-    )
-
-    # Sin default explícito de negocio (research.md D1: sin catálogo cerrado, el admin lo
-    # escribe igual que `name`/`abbreviation`) -- el `server_default` solo cubre el mismo
-    # valor que usó el backfill de la migración 134, para no romper scripts/importaciones
-    # preexistentes que crean una UnitMeasure sin pasar por el endpoint nuevo.
-    dimension: Mapped[str] = mapped_column(
-        String(100), nullable=False, default="general", server_default="general"
     )
 
     factor_to_base: Mapped[Decimal] = mapped_column(

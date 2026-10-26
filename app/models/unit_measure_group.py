@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 class UnitMeasureGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Grupo de unidades de medida con una unidad base explícita (spec 137).
 
-    Reemplaza el rol que cumplía `UnitMeasure.dimension` como texto libre; `dimension`
-    se conserva como espejo sincronizado con `name` (research.md D2) para no tocar
-    `app/core/units.py::convert()` (FR-010).
+    Única fuente de verdad del grupo/dimensión de una unidad (spec 139 eliminó la
+    columna `UnitMeasure.dimension`, que era un texto libre espejo de `name`).
+    `app/core/units.py::convert()` valida compatibilidad comparando `group_id`.
     """
 
     __tablename__ = "unit_measure_groups"

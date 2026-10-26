@@ -56,11 +56,12 @@ def _fixture(db):
     db.flush()
 
     # group_id/is_base (spec 137): g/ml quedan como base de su grupo (factor_to_base=1),
-    # igual que antes de esta spec -- no cambia ningún valor de dimension/factor_to_base.
-    g = UnitMeasure(name=f"gramo-test-{uuid4().hex[:6]}", abbreviation=f"g{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("1"), group_id=grupo_masa.id, is_base=True)
-    kg = UnitMeasure(name=f"kilogramo-test-{uuid4().hex[:6]}", abbreviation=f"kg{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("1000"), group_id=grupo_masa.id)
-    lb = UnitMeasure(name=f"libra-test-{uuid4().hex[:6]}", abbreviation=f"lb{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("453.592"), group_id=grupo_masa.id)
-    ml = UnitMeasure(name=f"mililitro-test-{uuid4().hex[:6]}", abbreviation=f"ml{uuid4().hex[:5]}", dimension=volumen, factor_to_base=Decimal("1"), group_id=grupo_volumen.id, is_base=True)
+    # igual que antes de esta spec -- no cambia ningún valor de factor_to_base. `dimension`
+    # ya no existe (spec 139); el grupo se identifica exclusivamente por group_id.
+    g = UnitMeasure(name=f"gramo-test-{uuid4().hex[:6]}", abbreviation=f"g{uuid4().hex[:5]}", factor_to_base=Decimal("1"), group_id=grupo_masa.id, is_base=True)
+    kg = UnitMeasure(name=f"kilogramo-test-{uuid4().hex[:6]}", abbreviation=f"kg{uuid4().hex[:5]}", factor_to_base=Decimal("1000"), group_id=grupo_masa.id)
+    lb = UnitMeasure(name=f"libra-test-{uuid4().hex[:6]}", abbreviation=f"lb{uuid4().hex[:5]}", factor_to_base=Decimal("453.592"), group_id=grupo_masa.id)
+    ml = UnitMeasure(name=f"mililitro-test-{uuid4().hex[:6]}", abbreviation=f"ml{uuid4().hex[:5]}", factor_to_base=Decimal("1"), group_id=grupo_volumen.id, is_base=True)
     db.add_all([g, kg, lb, ml])
     db.flush()
 
@@ -185,10 +186,10 @@ def main():
             )
 
             # ===================== Historia 2 =====================
-            masa_list = unit_measures_router.list_unit_measures(active=True, dimension=masa, group_id=None, db=db, _=None)
+            masa_list = unit_measures_router.list_unit_measures(active=True, group_id=g.group_id, db=db, _=None)
             masa_ids = {u.id for u in masa_list}
-            _check("selector filtrado por dimensión: incluye KG/LB/g", {kg.id, lb.id, g.id} <= masa_ids, True)
-            _check("selector filtrado por dimensión: no incluye ml (otra dimensión)", ml.id in masa_ids, False)
+            _check("selector filtrado por grupo: incluye KG/LB/g", {kg.id, lb.id, g.id} <= masa_ids, True)
+            _check("selector filtrado por grupo: no incluye ml (otro grupo)", ml.id in masa_ids, False)
 
             _expect_error(
                 "dimensión incompatible (ml en insumo de masa): rechazado", 422,
@@ -203,7 +204,7 @@ def main():
             lb.active = False
             db.add(lb)
             db.commit()
-            masa_list_tras_desactivar = unit_measures_router.list_unit_measures(active=True, dimension=masa, group_id=None, db=db, _=None)
+            masa_list_tras_desactivar = unit_measures_router.list_unit_measures(active=True, group_id=g.group_id, db=db, _=None)
             _check(
                 "unidad desactivada desaparece del selector",
                 lb.id in {u.id for u in masa_list_tras_desactivar}, False,

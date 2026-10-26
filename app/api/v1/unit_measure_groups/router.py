@@ -87,7 +87,6 @@ def create_unit_measure_group(
     base_unit = UnitMeasure(
         name=body.base_unit.name,
         abbreviation=body.base_unit.abbreviation,
-        dimension=group.name,
         factor_to_base=1,
         group_id=group.id,
         is_base=True,
@@ -122,7 +121,6 @@ def add_unit_to_group(
     unit = UnitMeasure(
         name=body.name,
         abbreviation=body.abbreviation,
-        dimension=group.name,
         factor_to_base=body.factor_to_base,
         group_id=group.id,
         is_base=False,
@@ -136,7 +134,7 @@ def add_unit_to_group(
 @router.patch(
     "/{id}",
     response_model=UnitMeasureGroupResponse,
-    summary="Renombrar un grupo (sincroniza dimension de sus unidades)",
+    summary="Renombrar un grupo",
     responses={
         401: {"description": "No autenticado o token inválido."},
         404: {"description": "El grupo no existe."},
@@ -156,8 +154,6 @@ def rename_unit_measure_group(
             "Unit measure group name already exists", exclude_id=group.id,
         )
         group.name = body.name
-        for unit in group.units:
-            unit.dimension = body.name
     db.commit()
     db.refresh(group)
     return group

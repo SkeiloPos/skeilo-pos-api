@@ -37,10 +37,6 @@ def list_unit_measures(
     active: bool | None = Query(
         None, description="Filtra por estado activo (true) o inactivo (false)."
     ),
-    dimension: str | None = Query(
-        None, description="Filtra por grupo de medida exacto (spec 134), p. ej. 'Masa'. "
-        "Espejo de group.name (spec 137, research.md D2).",
-    ),
     group_id: UUID | None = Query(
         None, description="Filtra por grupo de unidades (spec 137).",
     ),
@@ -50,8 +46,6 @@ def list_unit_measures(
     query = select(UnitMeasure)
     if active is not None:
         query = query.where(UnitMeasure.active == active)
-    if dimension is not None:
-        query = query.where(UnitMeasure.dimension == dimension)
     if group_id is not None:
         query = query.where(UnitMeasure.group_id == group_id)
     return db.execute(query).scalars().all()
@@ -103,7 +97,6 @@ def create_unit_measure(
     unit_measure = UnitMeasure(
         name=body.name,
         abbreviation=body.abbreviation,
-        dimension=group.name,
         factor_to_base=body.factor_to_base,
         group_id=group.id,
         is_base=False,
