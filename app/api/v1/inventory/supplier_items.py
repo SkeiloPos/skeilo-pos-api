@@ -36,7 +36,9 @@ def _format_decimal(value: Decimal) -> str:
 
 
 def _equivalence(relation: SupplierItem, unit_abbreviation: str) -> Optional[str]:
-    if relation.last_cost is None:
+    # spec 138: una relación creada por import de inventario puede no tener
+    # presentación/factor todavía -- sin factor no hay equivalencia que mostrar.
+    if relation.last_cost is None or relation.conversion_factor is None:
         return None
     cost_per_unit = (relation.last_cost / relation.conversion_factor).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP

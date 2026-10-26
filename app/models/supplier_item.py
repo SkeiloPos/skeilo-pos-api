@@ -22,11 +22,15 @@ class SupplierItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("inventory_items.id"), nullable=False, index=True
     )
 
-    presentation: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Nullable (spec 138): una relación creada por import de inventario desde la columna
+    # Proveedor preferido no trae presentación/factor -- esa plantilla ya no los tiene -- y
+    # queda así hasta que el administrador la completa desde el módulo de proveedores. La
+    # creación manual desde ese módulo (SupplierItemCreate) sigue exigiendo ambos.
+    presentation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
-    # Cuántas unidades base trae 1 presentación (RN-16/RN-17 enunciado). > 0, ver
-    # ck__supplier_items__conversion_factor.
-    conversion_factor: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
+    # Cuántas unidades base trae 1 presentación (RN-16/RN-17 enunciado). > 0 si no es NULL,
+    # ver ck__supplier_items__conversion_factor.
+    conversion_factor: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 3), nullable=True)
 
     last_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
 

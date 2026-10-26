@@ -26,11 +26,12 @@ def build_inventory_excel(
 ) -> io.BytesIO:
     """Arma el workbook completo en memoria: fila 1 con `INVENTORY_TEMPLATE_HEADERS`
     (FR-001/FR-002) y una fila por cada `InventoryItem` recibido, con Stock/Mínimo/
-    Costo/Factor de conversión/Último costo como valores numéricos nativos (sin
-    redondear ni truncar). `preferred_by_item` es el resultado de
-    `supplier_items.preferred_relations_by_item` -- un insumo sin proveedor
-    preferido deja esas 4 columnas en blanco, sin error (spec 109, Historia 1,
-    escenario 3)."""
+    Costo como valores numéricos nativos (sin redondear ni truncar). Spec 138 retiró
+    las columnas de presentación, factor de conversión y último costo del proveedor
+    preferido (esos datos solo son editables desde el módulo de proveedores), pero
+    conservó el nombre del proveedor preferido mismo. `preferred_by_item` es el
+    resultado de `supplier_items.preferred_relations_by_item` -- un insumo sin
+    proveedor preferido deja esa columna en blanco, sin error."""
     preferred_by_item = preferred_by_item or {}
     wb = Workbook()
     ws = wb.active
@@ -48,9 +49,6 @@ def build_inventory_excel(
             item.min_stock,
             item.unit_cost,
             preferred["supplier_name"] if preferred else "",
-            preferred["presentation"] if preferred else "",
-            preferred["conversion_factor"] if preferred else "",
-            preferred["last_cost"] if preferred else "",
         ])
 
     buffer = io.BytesIO()
