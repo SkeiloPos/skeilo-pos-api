@@ -190,6 +190,14 @@ def _resolve_purchase_line(
             raise HTTPException(
                 422, "La presentación elegida no corresponde al proveedor de esta compra",
             )
+        if relation.conversion_factor is None:
+            # spec 138: una relación creada por import de inventario puede no tener
+            # presentación/factor todavía -- no se puede usar en una compra hasta
+            # completarla desde el módulo de proveedores.
+            raise HTTPException(
+                422, "Esta relación todavía no tiene un factor de conversión asignado; "
+                     "complétala desde el módulo de proveedores antes de usarla en una compra",
+            )
 
         quantity = it.presentation_quantity * relation.conversion_factor
         unit_cost = (it.presentation_unit_cost / relation.conversion_factor).quantize(

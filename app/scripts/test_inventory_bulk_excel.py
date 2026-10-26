@@ -1,13 +1,17 @@
-"""Test de export/import masivo de inventario en Excel (spec 109).
+"""Test de export/import masivo de inventario en Excel (spec 109, ajustada por
+spec 138: retiro de las columnas de proveedor preferido y vinculación de la
+columna Unidad a `UnitMeasure` reales).
 
 No hay pytest en el proyecto, así que es un script autoejecutable:
 
     python -m app.scripts.test_inventory_bulk_excel
 
-Cubre los Acceptance Scenarios de las 4 historias de usuario de la spec — ver
-quickstart.md §1 para el mapeo exacto. Trabaja sobre un tenant real con datos
-desechables: crea su propio insumo, unidad y proveedor, y los borra al terminar
-(incluso si alguna prueba falla a mitad de camino -- ver `main()`).
+Cubre los Acceptance Scenarios de las historias de usuario de la spec 138 que
+solo se pueden ejercer contra Postgres real -- en particular el gap de
+`group_id` NOT NULL (spec 137/139) en la autocreación de unidades, que SQLite
+no expone igual (ver quickstart.md §1, Escenario 4). Trabaja sobre un tenant
+real con datos desechables: crea su propio insumo y unidad, y los borra al
+terminar (incluso si alguna prueba falla a mitad de camino -- ver `main()`).
 """
 from decimal import Decimal
 from uuid import uuid4
@@ -18,6 +22,7 @@ from app.core.db import with_db
 from app.core.timezone import utc_now
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
+from app.models.unit_measure_group import UnitMeasureGroup
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
 from app.models.inventory_import_job import InventoryImportJob
@@ -33,6 +38,7 @@ from app.api.v1.inventory.schemas import INVENTORY_TEMPLATE_HEADERS
 _codigos_extra: list[str] = []
 _job_ids: list = []
 _unidades_extra: list = []
+_grupos_extra: list = []
 _proveedores_extra: list = []
 
 
@@ -50,9 +56,17 @@ def _schema() -> str:
 
 
 def _fixture(db):
-    unit = db.execute(select(UnitMeasure).where(UnitMeasure.abbreviation == "g")).scalar_one_or_none()
+    unit = db.execute(
+        select(UnitMeasure).where(func.upper(UnitMeasure.abbreviation) == "G")
+    ).scalars().first()
     if unit is None:
-        unit = UnitMeasure(name=f"gramo-test-{uuid4().hex[:6]}", abbreviation="g")
+        grupo = UnitMeasureGroup(name=f"gramo-test-{uuid4().hex[:6]}")
+        db.add(grupo)
+        db.flush()
+        unit = UnitMeasure(
+            name=f"gramo-test-{uuid4().hex[:6]}", abbreviation="g",
+            group_id=grupo.id, is_base=True, factor_to_base=1,
+        )
         db.add(unit)
         db.flush()
 
@@ -61,21 +75,12 @@ def _fixture(db):
         unit_measure_id=unit.id, current_stock=Decimal("10"), min_stock=Decimal("2"),
         unit_cost=Decimal("2000"),
     )
-    supplier = Supplier(name=f"Distribuidora-test-{uuid4().hex[:6]}", is_system=False)
-    db.add_all([item_exacto, supplier])
+    db.add(item_exacto)
     db.flush()
-
-    relation = SupplierItem(
-        supplier_id=supplier.id, inventory_item_id=item_exacto.id,
-        presentation="Bolsa x 500 g", conversion_factor=Decimal("500"),
-        last_cost=Decimal("4000"), active=True, preferred=True,
-    )
-    db.add(relation)
-    db.flush()
-    return unit, item_exacto, supplier
+    return unit, item_exacto
 
 
-def _cleanup(db, unit, item, supplier) -> None:
+def _cleanup(db, unit, item) -> None:
     """ORM `delete()`, no SQL crudo con nombres de tabla sin calificar -- un
     `text()` plano no pasa por el `schema_translate_map` de `with_db()` y
     apunta al esquema equivocado (o a ninguno)."""
@@ -86,17 +91,16 @@ def _cleanup(db, unit, item, supplier) -> None:
     ).scalars().all() if extra_codes else []
     all_item_ids = [item.id, *extra_ids]
 
-    all_supplier_ids = [supplier.id, *_proveedores_extra]
-    db.execute(delete(SupplierItem).where(
-        SupplierItem.inventory_item_id.in_(all_item_ids)
-        | SupplierItem.supplier_id.in_(all_supplier_ids)
-    ))
     if _job_ids:
         db.execute(delete(InventoryImportJob).where(InventoryImportJob.id.in_(_job_ids)))
+    if _proveedores_extra:
+        db.execute(delete(SupplierItem).where(SupplierItem.supplier_id.in_(_proveedores_extra)))
+        db.execute(delete(Supplier).where(Supplier.id.in_(_proveedores_extra)))
     db.execute(delete(InventoryItem).where(InventoryItem.id.in_(all_item_ids)))
-    db.execute(delete(Supplier).where(Supplier.id.in_(all_supplier_ids)))
     if _unidades_extra:
         db.execute(delete(UnitMeasure).where(UnitMeasure.id.in_(_unidades_extra)))
+    if _grupos_extra:
+        db.execute(delete(UnitMeasureGroup).where(UnitMeasureGroup.id.in_(_grupos_extra)))
     db.commit()
 
 
@@ -104,22 +108,24 @@ def _row_by_header(headers: list[str], values: list, header: str):
     return values[headers.index(header)]
 
 
-def test_export_incluye_codigo_y_proveedor_preferido(db, item, unit):
-    """Historia 1: la plantilla trae código y, para un insumo con proveedor
-    preferido, presentación/factor/último costo (escenario 1-2 de US1)."""
-    items = [item]
+def test_export_incluye_proveedor_preferido_sin_presentacion_ni_factor(db, item, unit):
+    """spec 138, FR-001/FR-002: la plantilla trae código y el nombre del
+    proveedor preferido, pero ya no trae presentación/factor de conversión/
+    último costo."""
     preferred = supplier_items.preferred_relations_by_item(db, [item.id])
-    buffer = build_inventory_excel(items, {unit.id: unit}, preferred)
+    buffer = build_inventory_excel([item], {unit.id: unit}, preferred)
 
     import openpyxl
     wb = openpyxl.load_workbook(buffer)
     headers = [c.value for c in next(wb.active.iter_rows(min_row=1, max_row=1))]
     assert headers == INVENTORY_TEMPLATE_HEADERS, headers
+    assert "Presentación" not in headers
+    assert "Factor de conversión" not in headers
+    assert "Último costo" not in headers
     row = [c.value for c in next(wb.active.iter_rows(min_row=2, max_row=2))]
     assert _row_by_header(headers, row, "Código") == item.code
-    assert _row_by_header(headers, row, "Proveedor preferido") == preferred[item.id]["supplier_name"]
-    assert _row_by_header(headers, row, "Presentación") == preferred[item.id]["presentation"]
-    print("OK: export_incluye_codigo_y_proveedor_preferido")
+    assert len(row) == 8, row
+    print("OK: export_incluye_proveedor_preferido_sin_presentacion_ni_factor")
 
 
 def _job(db, user_id, total_rows: int) -> InventoryImportJob:
@@ -135,14 +141,12 @@ def _job(db, user_id, total_rows: int) -> InventoryImportJob:
 
 def test_reimportar_archivo_exportado_no_falla_y_actualiza(db, item, unit):
     """Historia 1, escenario 2: re-subir el mismo archivo exportado no produce
-    ningún error y trata cada fila como actualización."""
-    preferred = supplier_items.preferred_relations_by_item(db, [item.id])
+    ningún error y trata la fila como actualización -- la unidad de la fila
+    (igual a la actual) se ignora por completo (FR-007), no solo no cambia."""
     headers = INVENTORY_TEMPLATE_HEADERS
     fila = [
         item.code, item.name, "Materia prima", unit.abbreviation,
         float(item.current_stock), float(item.min_stock), float(item.unit_cost),
-        preferred[item.id]["supplier_name"], preferred[item.id]["presentation"],
-        float(preferred[item.id]["conversion_factor"]), float(preferred[item.id]["last_cost"]),
     ]
     assert validar_estructura(headers) is None
 
@@ -160,8 +164,7 @@ def test_editar_costo_actualiza_el_insumo(db, item, unit):
     """Historia 2, escenario 1: editar una fila (costo) y reimportar actualiza
     ese insumo."""
     nuevo_costo = Decimal("2500")
-    fila = [item.code, item.name, "Materia prima", unit.abbreviation, "10", "2", str(nuevo_costo),
-            "", "", "", ""]
+    fila = [item.code, item.name, "Materia prima", unit.abbreviation, "10", "2", str(nuevo_costo)]
     job = _job(db, item.id, 1)
     db.commit()
     procesar_archivo_importacion(db, job, [fila])
@@ -174,8 +177,7 @@ def test_fila_nueva_con_codigo_vacio_crea_insumo_con_codigo_automatico(db, unit)
     """Historia 2, escenario 2: código vacío -> se crea un insumo nuevo con un
     código asignado automáticamente."""
     antes = set(db.execute(select(InventoryItem.code)).scalars().all())
-    fila = ["", f"Nuevo-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation, "0", "0", "0",
-            "", "", "", ""]
+    fila = ["", f"Nuevo-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation, "0", "0", "0"]
     job = _job(db, uuid4(), 1)
     db.commit()
     procesar_archivo_importacion(db, job, [fila])
@@ -189,42 +191,39 @@ def test_fila_nueva_con_codigo_vacio_crea_insumo_con_codigo_automatico(db, unit)
 
 
 def test_filas_con_errores_distintos_fallan_individualmente(db, unit):
-    """Historia 2, escenario 3: costo no numérico, tipo inválido y factor de
-    conversión inválido fallan cada una con un motivo propio, sin bloquear el
-    resto. (Unidad/proveedor inexistentes ya NO son motivo de fallo -- se
-    consolidan automáticamente, ver los tests de consolidación más abajo.)"""
+    """Historia 2, escenario 3: costo no numérico y tipo inválido fallan cada
+    una con un motivo propio, sin bloquear el resto."""
     filas = [
         [f"T{uuid4().hex[:6]}", "Costo malo", "Materia prima", unit.abbreviation,
-         "0", "0", "no-es-numero", "", "", "", ""],
+         "0", "0", "no-es-numero"],
         [f"T{uuid4().hex[:6]}", "Tipo malo", "Un tipo que no existe", unit.abbreviation,
-         "0", "0", "0", "", "", "", ""],
-        [f"T{uuid4().hex[:6]}", "Factor malo", "Materia prima", unit.abbreviation,
-         "0", "0", "0", "Proveedor Nuevo SA", "Caja x 10", "0", ""],
+         "0", "0", "0"],
     ]
     job = _job(db, uuid4(), len(filas))
     db.commit()
     procesar_archivo_importacion(db, job, filas)
     db.refresh(job)
-    assert job.failed_count == 3, job.errors
+    assert job.failed_count == 2, job.errors
     assert job.created_count == 0
     motivos = {e["motivo"] for e in job.errors}
-    assert len(motivos) == 3, motivos
+    assert len(motivos) == 2, motivos
     print("OK: filas_con_errores_distintos_fallan_individualmente")
 
 
-def test_unidad_inexistente_se_consolida_creandola_en_mayuscula(db):
-    """Ajuste pedido por el usuario: una unidad que no existe ya no hace
-    fallar la fila -- se crea automáticamente, siempre en mayúscula sin
-    importar cómo venía escrita en el Excel."""
+def test_unidad_inexistente_se_crea_con_grupo_propio_sin_integrity_error(db):
+    """spec 138, Historia 2 (research.md §3): el gap de `group_id` NOT NULL
+    (spec 137/139) rompía esta ruta contra Postgres real -- una unidad que no
+    existe ya se crea con su propio `UnitMeasureGroup`, como base, factor 1, sin
+    lanzar `IntegrityError`."""
     etiqueta = f"lb-test-{uuid4().hex[:5]}"
     code = f"T{uuid4().hex[:6]}"
-    fila = [code, f"Insumo en {etiqueta}", "Materia prima", etiqueta,
-            "0", "0", "0", "", "", "", ""]
+    fila = [code, f"Insumo en {etiqueta}", "Materia prima", etiqueta, "0", "0", "0"]
     job = _job(db, uuid4(), 1)
     db.commit()
     procesar_archivo_importacion(db, job, [fila])
     db.refresh(job)
     assert job.created_count == 1, job.errors
+    assert job.failed_count == 0, job.errors
 
     _codigos_extra.append(code)
     unidad = db.execute(
@@ -232,8 +231,14 @@ def test_unidad_inexistente_se_consolida_creandola_en_mayuscula(db):
     ).scalar_one_or_none()
     assert unidad is not None, "la unidad debía quedar creada en mayúscula"
     assert unidad.name == etiqueta.upper()
+    assert unidad.group_id is not None, "group_id debía quedar asignado (research.md §3)"
+    assert unidad.is_base is True
+    assert unidad.factor_to_base == Decimal("1")
     _unidades_extra.append(unidad.id)
-    print("OK: unidad_inexistente_se_consolida_creandola_en_mayuscula")
+    _grupos_extra.append(unidad.group_id)
+    grupo = db.get(UnitMeasureGroup, unidad.group_id)
+    assert grupo is not None and grupo.name == etiqueta.upper()
+    print("OK: unidad_inexistente_se_crea_con_grupo_propio_sin_integrity_error")
 
 
 def test_unidad_existente_se_reconoce_sin_distinguir_mayusculas(db, unit):
@@ -243,7 +248,7 @@ def test_unidad_existente_se_reconoce_sin_distinguir_mayusculas(db, unit):
     antes = db.execute(select(UnitMeasure.id)).scalars().all()
     code = f"T{uuid4().hex[:6]}"
     fila = [code, "Insumo con unidad en otro caso", "Materia prima",
-            unit.abbreviation.swapcase(), "0", "0", "0", "", "", "", ""]
+            unit.abbreviation.swapcase(), "0", "0", "0"]
     job = _job(db, uuid4(), 1)
     db.commit()
     procesar_archivo_importacion(db, job, [fila])
@@ -256,57 +261,24 @@ def test_unidad_existente_se_reconoce_sin_distinguir_mayusculas(db, unit):
     print("OK: unidad_existente_se_reconoce_sin_distinguir_mayusculas")
 
 
-def test_proveedor_inexistente_se_consolida_creandolo_en_mayuscula(db, unit):
-    """Mismo ajuste para proveedores: uno que no existe se crea
-    automáticamente en mayúscula, en vez de fallar la fila."""
-    nombre = f"proveedor nuevo {uuid4().hex[:5]}"
-    code = f"T{uuid4().hex[:6]}"
-    fila = [code, "Insumo con proveedor nuevo", "Materia prima", unit.abbreviation,
-            "0", "0", "0", nombre, "Caja x 10", "10", ""]
-    job = _job(db, uuid4(), 1)
+def test_actualizar_insumo_existente_ignora_la_unidad_de_la_fila(db, item, unit):
+    """spec 138, Historia 3 (FR-007): actualizar por código con una Unidad
+    distinta a la actual no cambia la unidad del insumo ni crea ninguna
+    `UnitMeasure` nueva -- solo el resto de campos de la fila se actualiza."""
+    antes_unidades = set(db.execute(select(UnitMeasure.id)).scalars().all())
+    fila = [item.code, item.name, "Materia prima", "UNIDAD-QUE-NO-EXISTE",
+            "7", "1", "999"]
+    job = _job(db, item.id, 1)
     db.commit()
     procesar_archivo_importacion(db, job, [fila])
     db.refresh(job)
-    assert job.created_count == 1, job.errors
-    _codigos_extra.append(code)
-
-    proveedor = db.execute(
-        select(Supplier).where(Supplier.name == nombre.upper())
-    ).scalar_one_or_none()
-    assert proveedor is not None, "el proveedor debía quedar creado en mayúscula"
-    assert proveedor.active and not proveedor.is_system
-    _proveedores_extra.append(proveedor.id)
-    print("OK: proveedor_inexistente_se_consolida_creandolo_en_mayuscula")
-
-
-def test_proveedor_inactivo_se_reactiva_en_vez_de_duplicarse(db, unit):
-    """Un proveedor ya existente pero inactivo, con el mismo nombre (sin
-    distinguir mayúsculas), se reactiva en vez de crear un duplicado --
-    `Supplier.name` no tiene restricción de unicidad, así que sin este
-    cuidado se acumularían filas repetidas."""
-    nombre = f"Proveedor Inactivo {uuid4().hex[:5]}"
-    inactivo = Supplier(name=nombre, active=False, is_system=False)
-    db.add(inactivo)
-    db.flush()
-    _proveedores_extra.append(inactivo.id)
-
-    code = f"T{uuid4().hex[:6]}"
-    fila = [code, "Insumo con proveedor reactivado", "Materia prima", unit.abbreviation,
-            "0", "0", "0", nombre.upper(), "Caja x 10", "10", ""]
-    job = _job(db, uuid4(), 1)
-    db.commit()
-    procesar_archivo_importacion(db, job, [fila])
-    db.refresh(job)
-    assert job.created_count == 1, job.errors
-    _codigos_extra.append(code)
-
-    db.refresh(inactivo)
-    assert inactivo.active, "el proveedor existente debía reactivarse, no duplicarse"
-    total_con_ese_nombre = db.execute(
-        select(Supplier).where(func.upper(Supplier.name) == nombre.upper())
-    ).scalars().all()
-    assert len(total_con_ese_nombre) == 1, "no debía crear un proveedor duplicado"
-    print("OK: proveedor_inactivo_se_reactiva_en_vez_de_duplicarse")
+    assert job.updated_count == 1, job.errors
+    db.refresh(item)
+    assert item.unit_measure_id == unit.id, "la unidad del insumo no debía cambiar"
+    assert item.unit_cost == Decimal("999")
+    despues_unidades = set(db.execute(select(UnitMeasure.id)).scalars().all())
+    assert despues_unidades == antes_unidades, "no debía crear ninguna unidad nueva"
+    print("OK: actualizar_insumo_existente_ignora_la_unidad_de_la_fila")
 
 
 def test_estructura_alterada_no_crea_job():
@@ -316,13 +288,95 @@ def test_estructura_alterada_no_crea_job():
     print("OK: estructura_alterada_no_crea_job")
 
 
+def test_archivo_legado_de_11_columnas_se_acepta_sin_error_de_estructura():
+    """spec 138, FR-003: un archivo exportado antes de este cambio (11
+    columnas, con presentación/factor/último costo al final) se sigue
+    aceptando."""
+    legacy_headers = [
+        *INVENTORY_TEMPLATE_HEADERS,
+        "Presentación", "Factor de conversión", "Último costo",
+    ]
+    assert validar_estructura(legacy_headers) is None
+    print("OK: archivo_legado_de_11_columnas_se_acepta_sin_error_de_estructura")
+
+
+def test_proveedor_preferido_marca_relacion_existente_sin_integrity_error(db, item, unit):
+    """spec 138 (ajuste pedido por el usuario): importar un Proveedor preferido
+    que ya tiene una relación activa con el insumo la marca como preferida --
+    sin tocar presentación/factor/último costo de esa relación."""
+    proveedor = Supplier(name=f"Proveedor-test-{uuid4().hex[:6]}", is_system=False)
+    db.add(proveedor)
+    db.flush()
+    relacion = SupplierItem(
+        supplier_id=proveedor.id, inventory_item_id=item.id,
+        presentation="Bolsa x 500 g", conversion_factor=Decimal("500"),
+        active=True, preferred=False,
+    )
+    db.add(relacion)
+    db.flush()
+    _proveedores_extra.append(proveedor.id)
+
+    fila = [item.code, item.name, "Materia prima", unit.abbreviation,
+            str(item.current_stock), str(item.min_stock), str(item.unit_cost),
+            proveedor.name.lower()]
+    job = _job(db, item.id, 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.updated_count == 1, job.errors
+
+    db.refresh(relacion)
+    assert relacion.preferred, "la relación debía quedar marcada como preferida"
+    assert relacion.presentation == "Bolsa x 500 g"
+    assert relacion.conversion_factor == Decimal("500")
+    print("OK: proveedor_preferido_marca_relacion_existente_sin_integrity_error")
+
+
+def test_proveedor_preferido_sin_relacion_activa_crea_proveedor_y_relacion_con_null(db, item, unit):
+    """spec 138 (ajuste pedido por el usuario): si el proveedor no existe
+    todavía, se crea (igual que antes de esta spec); y se crea también la
+    relación proveedor-insumo preferida, con `presentation`/`conversion_factor`
+    en `NULL` porque la plantilla ya no los trae -- cierra el gap de NOT NULL
+    de esas dos columnas (ver migración `c5815ab62693`), que el admin completa
+    después desde el módulo de proveedores."""
+    nombre = f"Proveedor sin relacion {uuid4().hex[:5]}"
+    fila = [item.code, item.name, "Materia prima", unit.abbreviation,
+            str(item.current_stock), str(item.min_stock), "12345", nombre]
+    job = _job(db, item.id, 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.updated_count == 1, job.errors
+    assert job.failed_count == 0, job.errors
+    db.refresh(item)
+    assert item.unit_cost == Decimal("12345")
+
+    proveedor = db.execute(
+        select(Supplier).where(Supplier.name == nombre.upper())
+    ).scalar_one_or_none()
+    assert proveedor is not None, "el proveedor debía quedar creado en mayúscula"
+    _proveedores_extra.append(proveedor.id)
+
+    relacion = db.execute(
+        select(SupplierItem).where(
+            SupplierItem.inventory_item_id == item.id,
+            SupplierItem.supplier_id == proveedor.id,
+        )
+    ).scalar_one_or_none()
+    assert relacion is not None, "la relación preferida debía quedar creada"
+    assert relacion.preferred is True
+    assert relacion.presentation is None
+    assert relacion.conversion_factor is None
+    print("OK: proveedor_preferido_sin_relacion_activa_crea_proveedor_y_relacion_con_null")
+
+
 def test_codigos_duplicados_en_el_archivo_fallan_ambas(db, unit):
     """Edge case del spec: dos filas con el mismo código en el mismo archivo
     fallan las dos, ninguna se aplica."""
     code = f"DUP-{uuid4().hex[:6]}"
     filas = [
-        [code, "Primera", "Materia prima", unit.abbreviation, "0", "0", "0", "", "", "", ""],
-        [code, "Segunda", "Materia prima", unit.abbreviation, "0", "0", "0", "", "", "", ""],
+        [code, "Primera", "Materia prima", unit.abbreviation, "0", "0", "0"],
+        [code, "Segunda", "Materia prima", unit.abbreviation, "0", "0", "0"],
     ]
     job = _job(db, uuid4(), len(filas))
     db.commit()
@@ -345,10 +399,9 @@ def test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item):
     code_nuevo = f"T{uuid4().hex[:6]}"
     code_ok = f"T{uuid4().hex[:6]}"
     filas = [
-        [code_nuevo, item.name, "Materia prima", unit.abbreviation,
-         "0", "0", "0", "", "", "", ""],
+        [code_nuevo, item.name, "Materia prima", unit.abbreviation, "0", "0", "0"],
         [code_ok, f"Insumo-normal-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation,
-         "0", "0", "0", "", "", "", ""],
+         "0", "0", "0"],
     ]
     job = _job(db, uuid4(), len(filas))
     db.commit()
@@ -381,9 +434,9 @@ def test_job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes(db, unit, 
     code_2 = f"T{uuid4().hex[:6]}"
     filas = [
         [code_1, f"Antes-de-cancelar-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation,
-         "0", "0", "0", "", "", "", ""],
+         "0", "0", "0"],
         [code_2, f"Despues-de-cancelar-{uuid4().hex[:6]}", "Materia prima", unit.abbreviation,
-         "0", "0", "0", "", "", "", ""],
+         "0", "0", "0"],
     ]
     job = _job(db, uuid4(), len(filas))
     db.commit()
@@ -427,7 +480,7 @@ def test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit):
 
     code = f"T{uuid4().hex[:6]}"
     fila_aplicada = [code, f"Sobrevive-{uuid4().hex[:6]}", "Materia prima",
-                      unit.abbreviation, "0", "0", "0", "", "", "", ""]
+                      unit.abbreviation, "0", "0", "0"]
     job = _job(db, uuid4(), 2)
     db.commit()
 
@@ -450,23 +503,25 @@ def main() -> None:
     schema = _schema()
     print(f"Usando tenant con esquema: {schema}")
     with with_db(schema) as db:
-        unit, item, supplier = _fixture(db)
+        unit, item = _fixture(db)
         db.commit()
         tests = [
-            lambda: test_export_incluye_codigo_y_proveedor_preferido(db, item, unit),
+            lambda: test_export_incluye_proveedor_preferido_sin_presentacion_ni_factor(db, item, unit),
             lambda: test_reimportar_archivo_exportado_no_falla_y_actualiza(db, item, unit),
             lambda: test_editar_costo_actualiza_el_insumo(db, item, unit),
             lambda: test_fila_nueva_con_codigo_vacio_crea_insumo_con_codigo_automatico(db, unit),
             lambda: test_filas_con_errores_distintos_fallan_individualmente(db, unit),
             test_estructura_alterada_no_crea_job,
+            test_archivo_legado_de_11_columnas_se_acepta_sin_error_de_estructura,
             lambda: test_codigos_duplicados_en_el_archivo_fallan_ambas(db, unit),
             lambda: test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item),
             lambda: test_job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes(db, unit, schema),
             lambda: test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit),
-            lambda: test_unidad_inexistente_se_consolida_creandola_en_mayuscula(db),
+            lambda: test_unidad_inexistente_se_crea_con_grupo_propio_sin_integrity_error(db),
             lambda: test_unidad_existente_se_reconoce_sin_distinguir_mayusculas(db, unit),
-            lambda: test_proveedor_inexistente_se_consolida_creandolo_en_mayuscula(db, unit),
-            lambda: test_proveedor_inactivo_se_reactiva_en_vez_de_duplicarse(db, unit),
+            lambda: test_actualizar_insumo_existente_ignora_la_unidad_de_la_fila(db, item, unit),
+            lambda: test_proveedor_preferido_marca_relacion_existente_sin_integrity_error(db, item, unit),
+            lambda: test_proveedor_preferido_sin_relacion_activa_crea_proveedor_y_relacion_con_null(db, item, unit),
         ]
         fallos = 0
         try:
@@ -477,7 +532,7 @@ def main() -> None:
                     fallos += 1
                     print(f"FALLÓ: {test}: {exc}")
         finally:
-            _cleanup(db, unit, item, supplier)
+            _cleanup(db, unit, item)
         if fallos:
             raise SystemExit(f"{fallos}/{len(tests)} pruebas fallaron")
         print(f"Todas las {len(tests)} pruebas pasaron.")

@@ -25,9 +25,6 @@ INVENTORY_TEMPLATE_HEADERS = [
     "Mínimo",
     "Costo",
     "Proveedor preferido",
-    "Presentación",
-    "Factor de conversión",
-    "Último costo",
 ]
 
 
@@ -154,8 +151,10 @@ class SupplierItemResponse(BaseModel):
     supplier_name: str
     inventory_item_id: UUID
     inventory_item_name: str
-    presentation: str
-    conversion_factor: Decimal
+    # Opcionales (spec 138): una relación creada por import de inventario desde la columna
+    # Proveedor preferido no trae presentación/factor -- el admin la completa después.
+    presentation: str | None = None
+    conversion_factor: Decimal | None = None
     last_cost: Decimal | None = None
     last_cost_at: UtcDatetime | None = None
     active: bool
