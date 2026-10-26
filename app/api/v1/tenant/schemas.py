@@ -17,6 +17,9 @@ class TenantInfoResponse(BaseModel):
     # Zona horaria IANA del negocio (spec 030). Solo lectura — no se agrega a
     # TenantUpdate, ver contracts/tenant-info-endpoint.md.
     timezone: str
+    # Permite capturar una línea de compra en una unidad distinta de la base del insumo
+    # (spec 134, FR-016).
+    unit_conversion_enabled: bool
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -34,3 +37,6 @@ class TenantUpdate(BaseModel):
     receipt_message: str | None = Field(None, max_length=255)
     # Prefijo del consecutivo de facturación. Vaciarlo = numeración sin prefijo.
     invoice_prefix: str | None = Field(None, max_length=20)
+    # spec 134, FR-016: editable únicamente por ADMIN (mismo criterio que el resto de
+    # este endpoint, ya detrás de require_tenant_admin).
+    unit_conversion_enabled: bool | None = None

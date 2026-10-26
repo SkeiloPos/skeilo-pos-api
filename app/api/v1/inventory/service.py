@@ -21,10 +21,12 @@ from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
 from app.core.timezone import utc_now
+from app.core import units
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_import_job import InventoryImportJob
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
+from app.models.unit_measure import UnitMeasure
 from app.models.purchase import Purchase, PurchaseItem
 from app.api.v1.inventory import supplier_items
 from app.api.v1.inventory.stock import record_movement
@@ -162,14 +164,16 @@ def resolve_or_create_by_code(
 
 
 def _resolve_purchase_line(
-    db: Session, purchase: Purchase, it: PurchaseItemIn,
+    db: Session, purchase: Purchase, it: PurchaseItemIn, tenant,
 ) -> tuple[PurchaseItem, Decimal, InventoryItem]:
-    """Resuelve una línea de alta directa u orden (spec 107): si trae `supplier_item_id`,
-    calcula `quantity`/`unit_cost` en unidad base a partir de la presentación (FR-003/FR-004),
-    conserva lo capturado originalmente (`presentation_quantity`, snapshot de
-    `presentation_label`) y aplica RN-15; si no, se comporta exactamente igual que antes de
-    esta spec (FR-007). Devuelve el `PurchaseItem` sin persistir todavía, el total de la línea
-    con los valores originales (FR-005), y el `InventoryItem` ya cargado."""
+    """Resuelve una línea de alta directa u orden: si trae `supplier_item_id`, calcula
+    `quantity`/`unit_cost` en unidad base a partir de la presentación (spec 106/107,
+    FR-003/FR-004), conserva lo capturado originalmente (`presentation_quantity`, snapshot de
+    `presentation_label`) y aplica RN-15; si trae `unit_measure_id`, resuelve el factor de
+    conversión hacia la unidad base del insumo (spec 134, FR-008); si no trae ninguno de los
+    dos, se comporta exactamente igual que antes de esta spec (FR-007). Devuelve el
+    `PurchaseItem` sin persistir todavía, el total de la línea con los valores originales
+    (FR-005), y el `InventoryItem` ya cargado."""
     item = get_or_404(db, InventoryItem, it.inventory_item_id, "Inventory item not found")
 
     if it.supplier_item_id is not None:
@@ -201,21 +205,64 @@ def _resolve_purchase_line(
             supplier_item_id=relation.id,
             presentation_quantity=it.presentation_quantity,
             presentation_label=relation.presentation,
+            # La conversión de esta ruta la gobierna `relation.conversion_factor`, no esta
+            # spec: se guarda la unidad base del insumo con factor 1 (research.md D5).
+            unit_measure_id=item.unit_measure_id,
+            conversion_factor_applied=Decimal("1"),
+            quantity_base=quantity,
+            cost_base=unit_cost,
         )
         supplier_items.apply_purchase_cost(db, relation, it.presentation_unit_cost)
+    elif it.unit_measure_id is not None:
+        chosen_unit = get_or_404(db, UnitMeasure, it.unit_measure_id, "Unit measure not found")
+        if not chosen_unit.active:
+            raise HTTPException(422, "La unidad de medida no está activa")
+        base_unit = get_or_404(db, UnitMeasure, item.unit_measure_id, "Unit measure not found")
+        if (
+            tenant is not None
+            and not tenant.unit_conversion_enabled
+            and chosen_unit.id != base_unit.id
+        ):
+            raise HTTPException(
+                422,
+                "La conversión de unidades está desactivada para este negocio; "
+                "usa la unidad base del insumo",
+            )
+
+        conversion_factor_applied = units.convert(Decimal("1"), chosen_unit, base_unit)
+        quantity_base = it.quantity * conversion_factor_applied
+        cost_base = it.unit_cost / conversion_factor_applied
+        line_total = it.quantity * it.unit_cost
+
+        purchase_item = PurchaseItem(
+            purchase_id=purchase.id,
+            inventory_item_id=it.inventory_item_id,
+            quantity=it.quantity,
+            unit_cost=it.unit_cost,
+            unit_measure_id=chosen_unit.id,
+            conversion_factor_applied=conversion_factor_applied,
+            quantity_base=quantity_base,
+            cost_base=cost_base,
+        )
     else:
         purchase_item = PurchaseItem(
             purchase_id=purchase.id,
             inventory_item_id=it.inventory_item_id,
             quantity=it.quantity,
             unit_cost=it.unit_cost,
+            unit_measure_id=item.unit_measure_id,
+            conversion_factor_applied=Decimal("1"),
+            quantity_base=it.quantity,
+            cost_base=it.unit_cost,
         )
         line_total = it.quantity * it.unit_cost
 
     return purchase_item, line_total, item
 
 
-def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> Purchase:
+def create_purchase(
+    db: Session, data: PurchaseCreate, user_id: UUID | None, tenant=None,
+) -> Purchase:
     if data.supplier_id is not None:
         get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
 
@@ -231,16 +278,17 @@ def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> 
 
         total = Decimal("0")
         for it in data.items:
-            purchase_item, line_total, item = _resolve_purchase_line(db, purchase, it)
+            purchase_item, line_total, item = _resolve_purchase_line(db, purchase, it, tenant)
             purchase_item.received_quantity = purchase_item.quantity  # alta directa: recibida por completo
             db.add(purchase_item)
-            # Alta de stock + kardex + actualización del costo unitario.
+            # Alta de stock + kardex + actualización del costo unitario, en unidad base
+            # (spec 134: `quantity_base`/`cost_base` ya resueltos por `_resolve_purchase_line`).
             record_movement(
-                db, item.id, type="in", quantity=purchase_item.quantity,
+                db, item.id, type="in", quantity=purchase_item.quantity_base,
                 reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE, reference_id=purchase.id,
                 user_id=user_id,
             )
-            item.unit_cost = purchase_item.unit_cost
+            item.unit_cost = purchase_item.cost_base
             total += line_total
 
         purchase.status = "received"
@@ -257,7 +305,9 @@ def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> 
     return purchase
 
 
-def create_purchase_order(db: Session, data: PurchaseCreate, user_id: UUID | None) -> Purchase:
+def create_purchase_order(
+    db: Session, data: PurchaseCreate, user_id: UUID | None, tenant=None,
+) -> Purchase:
     """Crea una orden de compra en estado `draft` SIN dar alta de stock (RF-022).
     El stock se suma luego con `receive_purchase` (parcial o total)."""
     if data.supplier_id is not None:
@@ -271,7 +321,7 @@ def create_purchase_order(db: Session, data: PurchaseCreate, user_id: UUID | Non
         db.flush()
         total = Decimal("0")
         for it in data.items:
-            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, it)
+            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, it, tenant)
             purchase_item.received_quantity = Decimal("0")
             db.add(purchase_item)
             total += line_total
@@ -330,15 +380,18 @@ def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
                     422,
                     f"Recepción {quantity_received} excede lo pendiente ({remaining}) del ítem {pi.id}",
                 )
+            # `quantity_received` está en la unidad capturada de la línea (`pi.unit_measure_id`,
+            # spec 134); el stock/kardex se mueven en unidad base del insumo.
+            quantity_received_base = quantity_received * Decimal(pi.conversion_factor_applied)
             record_movement(
-                db, pi.inventory_item_id, type="in", quantity=quantity_received,
+                db, pi.inventory_item_id, type="in", quantity=quantity_received_base,
                 reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE,
                 reference_id=purchase.id, user_id=user_id,
             )
             pi.received_quantity = Decimal(pi.received_quantity) + quantity_received
             inv = db.get(InventoryItem, pi.inventory_item_id)
             if inv is not None:
-                inv.unit_cost = pi.unit_cost
+                inv.unit_cost = pi.cost_base
 
         fully = all(Decimal(i.received_quantity) >= Decimal(i.quantity) for i in purchase.items)
         any_received = any(Decimal(i.received_quantity) > 0 for i in purchase.items)
@@ -348,5 +401,32 @@ def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
         db.rollback(); raise
     except Exception:
         db.rollback(); logger.exception("Error recibiendo compra"); raise
+    db.refresh(purchase)
+    return purchase
+
+
+def void_purchase(db: Session, purchase_id: UUID, user_id: UUID | None) -> Purchase:
+    """Anula una compra confirmada (spec 134, US3, FR-012/FR-013): revierte el stock
+    exactamente en la cantidad base guardada en cada línea (`quantity_base`), nunca
+    recalculada con el factor de conversión vigente -- `conversion_factor_applied` es
+    inmutable por diseño (FR-010). Rechaza una segunda anulación de la misma compra."""
+    purchase = get_or_404(db, Purchase, purchase_id, "Purchase not found")
+    if purchase.voided_at is not None:
+        raise HTTPException(409, "La compra ya fue anulada")
+
+    try:
+        for pi in purchase.items:
+            record_movement(
+                db, pi.inventory_item_id, type="out", quantity=pi.quantity_base,
+                reason=reasons.AJUSTE, reference_type=reasons.REF_PURCHASE_VOID,
+                reference_id=purchase.id, user_id=user_id,
+            )
+        purchase.voided_at = utc_now().replace(tzinfo=None)
+        purchase.voided_by = user_id
+        db.commit()
+    except HTTPException:
+        db.rollback(); raise
+    except Exception:
+        db.rollback(); logger.exception("Error anulando compra"); raise
     db.refresh(purchase)
     return purchase

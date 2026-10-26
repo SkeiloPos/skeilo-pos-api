@@ -172,15 +172,20 @@ class SupplierItemConflict(BaseModel):
 
 # ---------- Compras ----------
 class PurchaseItemIn(BaseModel):
-    """spec 107: una línea viene en unidad base (`quantity`/`unit_cost`, como siempre) o en
-    una presentación guardada (`supplier_item_id` + `presentation_quantity` +
-    `presentation_unit_cost`) -- nunca una mezcla de las dos (FR-001/FR-002/FR-007)."""
+    """Una línea viene en unidad base (`quantity`/`unit_cost`, como siempre), en una
+    presentación guardada (`supplier_item_id` + `presentation_quantity` +
+    `presentation_unit_cost`, spec 106/107) o en otra unidad del mismo grupo de medida del
+    insumo (`unit_measure_id`, spec 134) -- nunca una mezcla de estos tres modos
+    (FR-001/FR-002/FR-007, FR-015)."""
     inventory_item_id: UUID
     quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
     unit_cost: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     supplier_item_id: UUID | None = None
     presentation_quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
     presentation_unit_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+    # Unidad en la que se capturaron quantity/unit_cost de esta línea (spec 134), cuando no
+    # es la unidad base del insumo ni una presentación de proveedor.
+    unit_measure_id: UUID | None = None
 
     @model_validator(mode="after")
     def _exactly_one_mode(self):
@@ -191,6 +196,13 @@ class PurchaseItemIn(BaseModel):
                 )
             if self.quantity is not None:
                 raise ValueError("no se puede indicar quantity junto con supplier_item_id")
+            if self.unit_measure_id is not None:
+                raise ValueError("no se puede indicar unit_measure_id junto con supplier_item_id")
+        elif self.unit_measure_id is not None:
+            if self.quantity is None:
+                raise ValueError("quantity es obligatorio cuando se indica unit_measure_id")
+            if self.unit_cost <= 0:
+                raise ValueError("La cantidad debe ser mayor que cero")
         elif self.quantity is None:
             raise ValueError("quantity es obligatorio cuando no se indica supplier_item_id")
         return self
@@ -216,6 +228,10 @@ class PurchaseItemResponse(BaseModel):
     # una compra, y esta fila es ese mismo uso. Lo llena
     # supplier_items.attach_conversion_factors (ver router.py).
     conversion_factor: Decimal | None = None
+    unit_measure_id: UUID
+    conversion_factor_applied: Decimal
+    quantity_base: Decimal
+    cost_base: Decimal
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -227,6 +243,8 @@ class PurchaseResponse(BaseModel):
     status: str
     total: Decimal
     purchased_at: UtcDatetime
+    voided_at: UtcDatetime | None = None
+    voided_by: UUID | None = None
     items: list[PurchaseItemResponse] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)

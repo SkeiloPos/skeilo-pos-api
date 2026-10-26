@@ -34,8 +34,12 @@ class InventoryItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(20), nullable=False, server_default="raw_material"
     )
 
+    # Numeric(18,6) (spec 134, research.md D4): la cantidad/costo en unidad base puede
+    # tener más de 3/2 decimales significativos tras convertir desde otra unidad (p. ej.
+    # LB→g, factor 453.592). `min_stock` no se ensancha -- lo captura el administrador
+    # directamente en unidad base, sin conversión de por medio.
     current_stock: Mapped[Decimal] = mapped_column(
-        Numeric(12, 3), nullable=False, default=0, server_default="0"
+        Numeric(18, 6), nullable=False, default=0, server_default="0"
     )
 
     min_stock: Mapped[Decimal] = mapped_column(
@@ -43,7 +47,7 @@ class InventoryItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     unit_cost: Mapped[Decimal] = mapped_column(
-        Numeric(12, 2), nullable=False, default=0, server_default="0"
+        Numeric(18, 6), nullable=False, default=0, server_default="0"
     )
 
     active: Mapped[bool] = mapped_column(Boolean, default=True)

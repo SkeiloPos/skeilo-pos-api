@@ -90,6 +90,9 @@ def update_tenant(
         # consecutivo, así que el nuevo empieza en 1 y el anterior se conserva.
         row.invoice_prefix = body.invoice_prefix.strip().upper() or None
 
+    if body.unit_conversion_enabled is not None:
+        row.unit_conversion_enabled = body.unit_conversion_enabled
+
     db.commit()
     # A-44 / spec 021 (intacto): primero confirmar, después borrar best-effort. spec 088
     # (FR-006): y solo si ninguna otra fila usa el archivo anterior. La sesión `shared` no

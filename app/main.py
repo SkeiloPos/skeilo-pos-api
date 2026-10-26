@@ -20,6 +20,7 @@ from app.api.v1.auth.routes import auth_router
 from app.api.v1.categories.router import router as categories_router
 from app.api.v1.presentations.router import router as presentations_router
 from app.api.v1.unit_measures.router import router as unit_measures_router
+from app.api.v1.unit_measure_groups.router import router as unit_measure_groups_router
 from app.api.v1.products.router import router as products_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.invitations.router import router as invitations_router
@@ -143,6 +144,7 @@ def create_app()->FastAPI:
     app.include_router(categories_router, prefix="/api/v1")
     app.include_router(presentations_router, prefix="/api/v1")
     app.include_router(unit_measures_router, prefix="/api/v1")
+    app.include_router(unit_measure_groups_router, prefix="/api/v1")
     app.include_router(products_router, prefix="/api/v1")
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(invitations_router, prefix="/api/v1")
