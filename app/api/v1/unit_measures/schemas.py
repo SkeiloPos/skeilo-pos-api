@@ -39,7 +39,6 @@ class UnitMeasureResponse(BaseModel):
     id: UUID
     name: str
     abbreviation: str
-    dimension: str
     factor_to_base: Decimal
     active: bool
     group_id: UUID

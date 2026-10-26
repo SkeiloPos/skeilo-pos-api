@@ -79,6 +79,8 @@ _TABLE_NAMES = [
     "inventory_items",
     "inventory_movements",
     "unit_measures",
+    # spec 137: grupo real al que pertenece cada unidad de medida (group_id FK).
+    "unit_measure_groups",
     # spec 083: catálogo de presentaciones + asociación categoría<->presentación.
     "presentations",
     "category_presentations",
