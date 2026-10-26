@@ -1,6 +1,7 @@
 
 # Catálogo / menú
 from .category import Category
+from .unit_measure_group import UnitMeasureGroup
 from .unit_measure import UnitMeasure
 from .unit_measure_factor_change import UnitMeasureFactorChange
 from .product import Product

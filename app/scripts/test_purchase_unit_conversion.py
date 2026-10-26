@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from app.core.db import with_db
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
+from app.models.unit_measure_group import UnitMeasureGroup
 from app.models.purchase import Purchase
 from app.api.v1.inventory import service
 from app.api.v1.inventory.schemas import PurchaseCreate, PurchaseItemIn
@@ -49,10 +50,17 @@ def _fixture(db):
     masa = f"masa-test-{uuid4().hex[:6]}"
     volumen = f"volumen-test-{uuid4().hex[:6]}"
 
-    g = UnitMeasure(name=f"gramo-test-{uuid4().hex[:6]}", abbreviation=f"g{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("1"))
-    kg = UnitMeasure(name=f"kilogramo-test-{uuid4().hex[:6]}", abbreviation=f"kg{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("1000"))
-    lb = UnitMeasure(name=f"libra-test-{uuid4().hex[:6]}", abbreviation=f"lb{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("453.592"))
-    ml = UnitMeasure(name=f"mililitro-test-{uuid4().hex[:6]}", abbreviation=f"ml{uuid4().hex[:5]}", dimension=volumen, factor_to_base=Decimal("1"))
+    grupo_masa = UnitMeasureGroup(name=masa)
+    grupo_volumen = UnitMeasureGroup(name=volumen)
+    db.add_all([grupo_masa, grupo_volumen])
+    db.flush()
+
+    # group_id/is_base (spec 137): g/ml quedan como base de su grupo (factor_to_base=1),
+    # igual que antes de esta spec -- no cambia ningún valor de dimension/factor_to_base.
+    g = UnitMeasure(name=f"gramo-test-{uuid4().hex[:6]}", abbreviation=f"g{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("1"), group_id=grupo_masa.id, is_base=True)
+    kg = UnitMeasure(name=f"kilogramo-test-{uuid4().hex[:6]}", abbreviation=f"kg{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("1000"), group_id=grupo_masa.id)
+    lb = UnitMeasure(name=f"libra-test-{uuid4().hex[:6]}", abbreviation=f"lb{uuid4().hex[:5]}", dimension=masa, factor_to_base=Decimal("453.592"), group_id=grupo_masa.id)
+    ml = UnitMeasure(name=f"mililitro-test-{uuid4().hex[:6]}", abbreviation=f"ml{uuid4().hex[:5]}", dimension=volumen, factor_to_base=Decimal("1"), group_id=grupo_volumen.id, is_base=True)
     db.add_all([g, kg, lb, ml])
     db.flush()
 
@@ -103,7 +111,7 @@ def _set_tenant_unit_conversion(schema: str, enabled: bool) -> None:
         db.commit()
 
 
-def _cleanup(db, schema: str, purchase_ids, unit_ids, item_ids):
+def _cleanup(db, schema: str, purchase_ids, unit_ids, item_ids, group_ids=()):
     if purchase_ids:
         ids = [str(i) for i in purchase_ids]
         db.execute(text(f'DELETE FROM "{schema}".inventory_movements WHERE reference_id = ANY(:p)'), {"p": ids})
@@ -116,6 +124,8 @@ def _cleanup(db, schema: str, purchase_ids, unit_ids, item_ids):
         db.execute(text(f'DELETE FROM "{schema}".inventory_items WHERE id = :i'), {"i": str(item_id)})
     if unit_ids:
         db.execute(text(f'DELETE FROM "{schema}".unit_measures WHERE id = ANY(:u)'), {"u": [str(i) for i in unit_ids]})
+    if group_ids:
+        db.execute(text(f'DELETE FROM "{schema}".unit_measure_groups WHERE id = ANY(:g)'), {"g": [str(i) for i in group_ids]})
     db.commit()
     _set_tenant_unit_conversion(schema, True)
 
@@ -126,6 +136,7 @@ def main():
 
     with with_db(schema) as db:
         masa, volumen, g, kg, lb, ml, azucar, leche = _fixture(db)
+        group_ids = [g.group_id, ml.group_id]
         purchase_ids: list[UUID] = []
 
         try:
@@ -174,7 +185,7 @@ def main():
             )
 
             # ===================== Historia 2 =====================
-            masa_list = unit_measures_router.list_unit_measures(active=True, dimension=masa, db=db, _=None)
+            masa_list = unit_measures_router.list_unit_measures(active=True, dimension=masa, group_id=None, db=db, _=None)
             masa_ids = {u.id for u in masa_list}
             _check("selector filtrado por dimensión: incluye KG/LB/g", {kg.id, lb.id, g.id} <= masa_ids, True)
             _check("selector filtrado por dimensión: no incluye ml (otra dimensión)", ml.id in masa_ids, False)
@@ -192,7 +203,7 @@ def main():
             lb.active = False
             db.add(lb)
             db.commit()
-            masa_list_tras_desactivar = unit_measures_router.list_unit_measures(active=True, dimension=masa, db=db, _=None)
+            masa_list_tras_desactivar = unit_measures_router.list_unit_measures(active=True, dimension=masa, group_id=None, db=db, _=None)
             _check(
                 "unidad desactivada desaparece del selector",
                 lb.id in {u.id for u in masa_list_tras_desactivar}, False,
@@ -277,7 +288,7 @@ def main():
             print("TODO OK ✔")
         finally:
             db.rollback()
-            _cleanup(db, schema, purchase_ids, [g.id, kg.id, lb.id, ml.id], [azucar.id, leche.id])
+            _cleanup(db, schema, purchase_ids, [g.id, kg.id, lb.id, ml.id], [azucar.id, leche.id], group_ids)
 
 
 if __name__ == "__main__":

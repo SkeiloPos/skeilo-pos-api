@@ -15,11 +15,11 @@ class UnitMeasureCreate(BaseModel):
         description="Abreviatura de la unidad de medida. Debe ser única.",
         examples=["L", "g", "bola"],
     )
-    dimension: str = Field(
-        ..., min_length=1, max_length=100,
-        description="Grupo de medida (spec 134): dos unidades son convertibles entre sí si "
-        "coincide exactamente.",
-        examples=["Masa", "Volumen"],
+    group_id: UUID = Field(
+        ...,
+        description="Grupo al que pertenece la unidad (spec 137). Retirado del flujo "
+        "normal: usar POST /unit-measure-groups/{id}/units desde el frontend nuevo; "
+        "se mantiene por compatibilidad con integraciones existentes.",
     )
     factor_to_base: Decimal = Field(
         ..., gt=0, max_digits=18, decimal_places=6,
@@ -31,7 +31,6 @@ class UnitMeasureCreate(BaseModel):
 class UnitMeasureUpdate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=255)
     abbreviation: str | None = Field(None, min_length=1, max_length=50)
-    dimension: str | None = Field(None, min_length=1, max_length=100)
     factor_to_base: Decimal | None = Field(None, gt=0, max_digits=18, decimal_places=6)
     active: bool | None = None
 
@@ -43,6 +42,8 @@ class UnitMeasureResponse(BaseModel):
     dimension: str
     factor_to_base: Decimal
     active: bool
+    group_id: UUID
+    is_base: bool
     created_at: datetime
     updated_at: datetime | None = None
 
