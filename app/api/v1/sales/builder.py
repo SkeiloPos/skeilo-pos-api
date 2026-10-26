@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.core.crud import get_or_404
 from app.core.models import User
+from app.api.v1.sales.payment_validation import assert_distinct_payment_methods
 from app.models.cash_shift import CashShift
 from app.models.payment import Payment, PaymentMethod
 from app.models.sale import Sale, SaleItem
@@ -209,6 +210,11 @@ def build_sale(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "El total no puede ser negativo"
         )
+
+    # spec 135 (A-146): revierte A-124/FR-005 de spec 112 — un pago mixto ya no
+    # admite repetir el mismo método en dos líneas. Antes de crear cualquier
+    # `Payment`, para que el rechazo no deje facturación/stock a medias.
+    assert_distinct_payment_methods(db, payments, "cobro")
 
     paid = Decimal("0")
     no_efectivo = Decimal("0")
