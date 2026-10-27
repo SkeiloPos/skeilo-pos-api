@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.core.db import get_db
 from app.core.dependencies import get_current_user
-from app.core.crud import get_or_404, ensure_unique
+from app.core.crud import get_or_404, ensure_unique, ensure_unique_ci
 from app.core.models import User
 from app.core.plan_limits import require_module_access
 from app.models.unit_measure import UnitMeasure
@@ -37,9 +37,11 @@ def _blocking_units_conflict(units: list[UnitMeasure]) -> HTTPException:
     )
 
 
-def _ensure_unit_fields_unique(db: Session, name: str, abbreviation: str) -> None:
-    ensure_unique(db, UnitMeasure, UnitMeasure.name, name, "Unit measure name already exists")
-    ensure_unique(db, UnitMeasure, UnitMeasure.abbreviation, abbreviation, "Unit measure abbreviation already exists")
+def _ensure_unit_fields_unique(db: Session, name: str) -> None:
+    # spec 140: solo el NOMBRE es único en todo el tenant (insensible a mayúsculas,
+    # respaldado por `ux_unit_measures_name_ci`). La abreviatura puede repetirse
+    # libremente -- ni siquiera dentro del mismo grupo -- por pedido explícito del usuario.
+    ensure_unique_ci(db, UnitMeasure, UnitMeasure.name, name, "Unit measure name already exists")
 
 
 @router.get(
@@ -78,7 +80,7 @@ def create_unit_measure_group(
     _: User = Depends(get_current_user),
 ):
     ensure_unique(db, UnitMeasureGroup, UnitMeasureGroup.name, body.name, "Unit measure group name already exists")
-    _ensure_unit_fields_unique(db, body.base_unit.name, body.base_unit.abbreviation)
+    _ensure_unit_fields_unique(db, body.base_unit.name)
 
     group = UnitMeasureGroup(name=body.name)
     db.add(group)
@@ -105,7 +107,7 @@ def create_unit_measure_group(
     responses={
         401: {"description": "No autenticado o token inválido."},
         404: {"description": "El grupo no existe."},
-        409: {"description": "Nombre o abreviatura de unidad duplicado."},
+        409: {"description": "Nombre de unidad duplicado."},
         422: {"description": "Datos de entrada inválidos."},
     },
 )
@@ -116,7 +118,7 @@ def add_unit_to_group(
     _: User = Depends(get_current_user),
 ):
     group = get_or_404(db, UnitMeasureGroup, id, "Unit measure group not found")
-    _ensure_unit_fields_unique(db, body.name, body.abbreviation)
+    _ensure_unit_fields_unique(db, body.name)
 
     unit = UnitMeasure(
         name=body.name,

@@ -29,7 +29,7 @@ from app.api.v1.inventory.schemas import (
     AdjustmentIn, MovementResponse,
     SupplierCreate, SupplierUpdate, SupplierResponse,
     SupplierItemCreate, SupplierItemUpdate, SupplierItemResponse,
-    PurchaseCreate, PurchaseResponse, PurchaseReceiveIn,
+    PurchaseCreate, PurchaseOrderCreate, PurchaseResponse, PurchaseReceiveIn,
     LowStockResponse, InventoryImportJobResponse,
 )
 
@@ -492,12 +492,46 @@ def create_purchase(
     dependencies=[Depends(require_module_access("compras"))],
 )
 def create_purchase_order(
-    body: PurchaseCreate,
+    body: PurchaseOrderCreate,
     db: Session = Depends(get_db),
     tenant: Tenant = Depends(get_tenant),
     user: User = Depends(require_tenant_admin),
 ):
     purchase = service.create_purchase_order(db, body, user_id=user.id, tenant=tenant)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
+
+
+@router.put(
+    "/purchases/{purchase_id}", response_model=PurchaseResponse,
+    summary="Registrar compra editando un borrador/orden existente (convierte en recibida) — spec 140",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def update_purchase(
+    purchase_id: UUID,
+    body: PurchaseCreate,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    user: User = Depends(require_tenant_admin),
+):
+    purchase = service.update_purchase(db, purchase_id, body, user_id=user.id, tenant=tenant)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
+
+
+@router.put(
+    "/purchases/{purchase_id}/order", response_model=PurchaseResponse,
+    summary="Actualizar una orden de compra / borrador existente (sin alta de stock) — spec 140",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def update_purchase_order(
+    purchase_id: UUID,
+    body: PurchaseOrderCreate,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    user: User = Depends(require_tenant_admin),
+):
+    purchase = service.update_purchase_order(db, purchase_id, body, user_id=user.id, tenant=tenant)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
 
@@ -531,3 +565,16 @@ def void_purchase(
     purchase = service.void_purchase(db, purchase_id, user_id=user.id)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
+
+
+@router.delete(
+    "/purchases/{purchase_id}", status_code=status.HTTP_204_NO_CONTENT,
+    summary="Eliminar una orden de compra / borrador pendiente (hard-delete) — spec 140",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def delete_purchase(
+    purchase_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    service.delete_purchase(db, purchase_id)

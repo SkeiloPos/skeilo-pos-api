@@ -1,6 +1,6 @@
 from app.core.models import Base, UUIDPrimaryKeyMixin
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy import String, Numeric, ForeignKey, DateTime, func, CheckConstraint
+from sqlalchemy import String, Numeric, ForeignKey, DateTime, Boolean, func, CheckConstraint
 from sqlalchemy.orm import mapped_column, Mapped, relationship
 from typing import Optional, List
 from decimal import Decimal
@@ -42,6 +42,14 @@ class Purchase(UUIDPrimaryKeyMixin, Base):
 
     # Referencia blanda a shared.users.id (sin FK cross-schema), mismo patrón que user_id.
     voided_by: Mapped[Optional[UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    # spec 140: solo tiene sentido junto a `status='draft'`. `true` = borrador incompleto
+    # guardado sin exigir líneas completas (User Story 3); `false` (default) preserva el
+    # significado histórico de "orden de compra pendiente" (User Story 2) para toda fila
+    # existente antes de esta columna.
+    is_incomplete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     items: Mapped[List["PurchaseItem"]] = relationship(
         back_populates="purchase", cascade="all, delete-orphan"

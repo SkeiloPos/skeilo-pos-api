@@ -25,8 +25,12 @@ class UnitMeasure(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
 
+    # spec 140: única DENTRO del grupo (índice compuesto `(group_id, upper(abbreviation))`,
+    # migración `f1a2b3c4d5e6`), no en todo el negocio -- dos grupos distintos pueden
+    # reutilizar la misma abreviatura (ej. "BOL" en dos grupos que no se relacionan entre
+    # sí). `index=True` se mantiene por el lookup simple; ya no es `unique=True` a secas.
     abbreviation: Mapped[str] = mapped_column(
-        String(50), nullable=False, unique=True, index=True
+        String(50), nullable=False, index=True
     )
 
     factor_to_base: Mapped[Decimal] = mapped_column(

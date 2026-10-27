@@ -19,6 +19,7 @@ from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
 from app.models.inventory_item import InventoryItem
 from app.models.purchase import PurchaseItem
+from app.models.unit_measure import UnitMeasure
 from app.api.v1.inventory.schemas import SupplierItemCreate, SupplierItemUpdate
 
 
@@ -38,13 +39,15 @@ def _format_decimal(value: Decimal) -> str:
 def _equivalence(relation: SupplierItem, unit_abbreviation: str) -> Optional[str]:
     # spec 138: una relación creada por import de inventario puede no tener
     # presentación/factor todavía -- sin factor no hay equivalencia que mostrar.
-    if relation.last_cost is None or relation.conversion_factor is None:
+    factor = relation.effective_conversion_factor
+    presentation = relation.effective_presentation
+    if relation.last_cost is None or factor is None or presentation is None:
         return None
-    cost_per_unit = (relation.last_cost / relation.conversion_factor).quantize(
+    cost_per_unit = (relation.last_cost / factor).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
     return (
-        f"1 {relation.presentation} = {_format_decimal(relation.conversion_factor)} "
+        f"1 {presentation} = {_format_decimal(factor)} "
         f"{unit_abbreviation} · ${_format_decimal(cost_per_unit)}/{unit_abbreviation}"
     )
 
@@ -58,8 +61,11 @@ def to_response(db: Session, relation: SupplierItem, was_preferred: bool = False
         "supplier_name": supplier.name if supplier else "",
         "inventory_item_id": relation.inventory_item_id,
         "inventory_item_name": item.name if item else "",
-        "presentation": relation.presentation,
-        "conversion_factor": relation.conversion_factor,
+        "unit_measure_id": relation.unit_measure_id,
+        # spec 140: valores efectivos -- en vivo desde `unit_measure` cuando la relación está
+        # vinculada a una, o los legados si no (ver `SupplierItem.effective_*`).
+        "presentation": relation.effective_presentation,
+        "conversion_factor": relation.effective_conversion_factor,
         "last_cost": relation.last_cost,
         "last_cost_at": relation.last_cost_at,
         "active": relation.active,
@@ -97,6 +103,23 @@ def _reject_if_factor_invalid(factor: Decimal, item: InventoryItem) -> None:
         )
 
 
+def _resolve_unit_for_item(db: Session, unit_measure_id: UUID, item: InventoryItem) -> UnitMeasure:
+    """spec 140: la "presentación" se elige entre las `UnitMeasure` del mismo grupo que la
+    unidad base del insumo (incluida la base misma) -- nunca de otro grupo ni inactiva."""
+    unit = get_or_404(db, UnitMeasure, unit_measure_id, "Unidad de medida no encontrada")
+    if not unit.active:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La unidad de medida no está activa",
+        )
+    if unit.group_id != item.unit_measure.group_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La unidad debe pertenecer al mismo grupo que la unidad base del insumo",
+        )
+    return unit
+
+
 def create_or_reactivate(
     db: Session,
     *,
@@ -104,20 +127,35 @@ def create_or_reactivate(
     inventory_item_id: UUID,
     body: SupplierItemCreate,
 ) -> tuple[SupplierItem, int]:
-    """FR-001/FR-004/FR-005/FR-012/FR-013. Devuelve (relación, status_code)."""
+    """FR-001/FR-004/FR-005/FR-012/FR-013. Devuelve (relación, status_code).
+
+    spec 140: dos modos mutuamente excluyentes (`SupplierItemCreate._exactly_one_mode` ya
+    garantiza que `body` trae uno u otro) -- `unit_measure_id` (nuevo, vincula una
+    `UnitMeasure` del mismo grupo que la base del insumo) o `presentation`/
+    `conversion_factor` (legado, texto libre + factor a mano)."""
     supplier = get_or_404(db, Supplier, supplier_id, "Proveedor no encontrado")
     item = get_or_404(db, InventoryItem, inventory_item_id, "Insumo no encontrado")
     _reject_if_system_supplier(supplier)
-    _reject_if_factor_invalid(body.conversion_factor, item)
 
-    existing = db.execute(
-        select(SupplierItem).where(
-            SupplierItem.supplier_id == supplier_id,
-            SupplierItem.inventory_item_id == inventory_item_id,
-            func.lower(func.trim(SupplierItem.presentation))
-            == body.presentation.strip().lower(),
-        )
-    ).scalar_one_or_none()
+    if body.unit_measure_id is not None:
+        unit = _resolve_unit_for_item(db, body.unit_measure_id, item)
+        existing = db.execute(
+            select(SupplierItem).where(
+                SupplierItem.supplier_id == supplier_id,
+                SupplierItem.inventory_item_id == inventory_item_id,
+                SupplierItem.unit_measure_id == unit.id,
+            )
+        ).scalar_one_or_none()
+    else:
+        _reject_if_factor_invalid(body.conversion_factor, item)
+        existing = db.execute(
+            select(SupplierItem).where(
+                SupplierItem.supplier_id == supplier_id,
+                SupplierItem.inventory_item_id == inventory_item_id,
+                func.lower(func.trim(SupplierItem.presentation))
+                == body.presentation.strip().lower(),
+            )
+        ).scalar_one_or_none()
 
     if existing is not None and existing.active:
         raise HTTPException(
@@ -131,8 +169,14 @@ def create_or_reactivate(
 
     if existing is not None and not existing.active:
         existing.active = True
-        existing.presentation = body.presentation
-        existing.conversion_factor = body.conversion_factor
+        if body.unit_measure_id is not None:
+            existing.unit_measure_id = body.unit_measure_id
+            existing.presentation = None
+            existing.conversion_factor = None
+        else:
+            existing.unit_measure_id = None
+            existing.presentation = body.presentation
+            existing.conversion_factor = body.conversion_factor
         if body.last_cost is not None:
             existing.last_cost = body.last_cost
             existing.last_cost_at = utc_now_naive()
@@ -143,8 +187,9 @@ def create_or_reactivate(
     relation = SupplierItem(
         supplier_id=supplier_id,
         inventory_item_id=inventory_item_id,
-        presentation=body.presentation,
-        conversion_factor=body.conversion_factor,
+        unit_measure_id=body.unit_measure_id,
+        presentation=None if body.unit_measure_id is not None else body.presentation,
+        conversion_factor=None if body.unit_measure_id is not None else body.conversion_factor,
         last_cost=body.last_cost,
         last_cost_at=utc_now_naive() if body.last_cost is not None else None,
     )
@@ -187,17 +232,28 @@ def _apply_preferred_swap(db: Session, relation: SupplierItem) -> None:
 
 
 def update(db: Session, relation_id: UUID, body: SupplierItemUpdate) -> tuple[SupplierItem, bool]:
-    """FR-006/FR-010/FR-011/FR-014. Devuelve (relación, was_preferred)."""
-    relation = _get_or_404(db, relation_id)
+    """FR-006/FR-010/FR-011/FR-014. Devuelve (relación, was_preferred).
 
-    if body.conversion_factor is not None:
-        if _factor_is_locked(db, relation_id):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Esta relación ya se usó en una compra; no se puede cambiar su "
-                       "factor. Crea una presentación nueva en su lugar.",
-            )
-        item = get_or_404(db, InventoryItem, relation.inventory_item_id, "Insumo no encontrado")
+    spec 140: cambiar el "factor" ahora significa, según el modo, vincular una
+    `UnitMeasure` distinta (`unit_measure_id`) o editar el factor legado a mano
+    (`conversion_factor`) -- ambos bloqueados por el mismo candado FR-014 una vez usada
+    la relación en una compra. Elegir `unit_measure_id` cambia la relación al modo nuevo
+    (limpia `presentation`/`conversion_factor`); elegir `presentation`/`conversion_factor`
+    la vuelve al modo legado (limpia `unit_measure_id`)."""
+    relation = _get_or_404(db, relation_id)
+    changes_factor = body.unit_measure_id is not None or body.conversion_factor is not None
+    if changes_factor and _factor_is_locked(db, relation_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Esta relación ya se usó en una compra; no se puede cambiar su "
+                   "factor. Crea una presentación nueva en su lugar.",
+        )
+
+    item = get_or_404(db, InventoryItem, relation.inventory_item_id, "Insumo no encontrado")
+    resolved_unit = None
+    if body.unit_measure_id is not None:
+        resolved_unit = _resolve_unit_for_item(db, body.unit_measure_id, item)
+    elif body.conversion_factor is not None:
         _reject_if_factor_invalid(body.conversion_factor, item)
 
     will_be_active = body.active if body.active is not None else relation.active
@@ -212,10 +268,16 @@ def update(db: Session, relation_id: UUID, body: SupplierItemUpdate) -> tuple[Su
 
     was_preferred = bool(body.active is False and relation.preferred)
 
-    if body.presentation is not None:
-        relation.presentation = body.presentation
-    if body.conversion_factor is not None:
-        relation.conversion_factor = body.conversion_factor
+    if resolved_unit is not None:
+        relation.unit_measure_id = resolved_unit.id
+        relation.presentation = None
+        relation.conversion_factor = None
+    elif body.presentation is not None or body.conversion_factor is not None:
+        relation.unit_measure_id = None
+        if body.presentation is not None:
+            relation.presentation = body.presentation
+        if body.conversion_factor is not None:
+            relation.conversion_factor = body.conversion_factor
     if body.last_cost is not None:
         relation.last_cost = body.last_cost
         relation.last_cost_at = utc_now_naive()
@@ -311,11 +373,14 @@ def preferred_relations_by_item(db: Session, item_ids) -> dict[UUID, dict]:
         select(
             SupplierItem.inventory_item_id,
             Supplier.name,
-            SupplierItem.presentation,
-            SupplierItem.conversion_factor,
+            # spec 140: valores efectivos (en vivo desde la `UnitMeasure` vinculada, o
+            # legados), mismo criterio que `effective_presentation`/`effective_conversion_factor`.
+            func.coalesce(UnitMeasure.name, SupplierItem.presentation),
+            func.coalesce(UnitMeasure.factor_to_base, SupplierItem.conversion_factor),
             SupplierItem.last_cost,
         )
         .join(Supplier, Supplier.id == SupplierItem.supplier_id)
+        .outerjoin(UnitMeasure, UnitMeasure.id == SupplierItem.unit_measure_id)
         .where(
             SupplierItem.inventory_item_id.in_(item_ids),
             SupplierItem.preferred.is_(True),
@@ -344,8 +409,11 @@ def attach_conversion_factors(db: Session, purchase_items) -> None:
         for pi in purchase_items:
             pi.conversion_factor = None
         return
+    # spec 140: `func.coalesce` entrega el factor en vivo de la `UnitMeasure` vinculada si la
+    # relación está en ese modo, o el legado si no -- mismo criterio que `effective_conversion_factor`.
     rows = db.execute(
-        select(SupplierItem.id, SupplierItem.conversion_factor)
+        select(SupplierItem.id, func.coalesce(UnitMeasure.factor_to_base, SupplierItem.conversion_factor))
+        .outerjoin(UnitMeasure, UnitMeasure.id == SupplierItem.unit_measure_id)
         .where(SupplierItem.id.in_(relation_ids))
     ).all()
     factor_by_relation = {relation_id: factor for relation_id, factor in rows}
