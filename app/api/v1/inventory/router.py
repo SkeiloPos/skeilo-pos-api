@@ -1,4 +1,3 @@
-from datetime import date
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -12,7 +11,7 @@ from app.core.dependencies import get_current_user, require_tenant_admin
 from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import require_module_access
-from app.core.timezone import utc_now
+from app.core.timezone import business_today, utc_now_naive
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
 from app.models.inventory_import_job import InventoryImportJob
@@ -30,7 +29,7 @@ from app.api.v1.inventory.schemas import (
     AdjustmentIn, MovementResponse,
     SupplierCreate, SupplierUpdate, SupplierResponse,
     SupplierItemCreate, SupplierItemUpdate, SupplierItemResponse,
-    PurchaseCreate, PurchaseResponse, PurchaseReceiveIn,
+    PurchaseCreate, PurchaseOrderCreate, PurchaseResponse, PurchaseReceiveIn,
     LowStockResponse, InventoryImportJobResponse,
 )
 
@@ -81,13 +80,15 @@ def low_stock(
 @router.get("/items/export", summary="Exportar el inventario completo a .xlsx")
 def export_items(
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     _: User = Depends(require_tenant_admin),
 ):
     items = service.list_all_items_for_export(db)
     unit_measures_by_id = {u.id: u for u in db.execute(select(UnitMeasure)).scalars().all()}
     preferred_by_item = supplier_items.preferred_relations_by_item(db, [i.id for i in items])
     buffer = build_inventory_excel(items, unit_measures_by_id, preferred_by_item)
-    filename = f"inventario_{date.today().isoformat()}.xlsx"
+    # spec 138 (A-147): el día del nombre es el día local del tenant, no el del servidor.
+    filename = f"inventario_{business_today(tenant).isoformat()}.xlsx"
     return Response(
         content=buffer.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -206,7 +207,7 @@ def cancel_import_job(
             f"El job {job_id} ya no está en curso (status: {job.status})",
         )
     job.status = "interrumpido"
-    job.finished_at = utc_now().replace(tzinfo=None)
+    job.finished_at = utc_now_naive()
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -278,8 +279,18 @@ def update_item(
     if body.name is not None and body.name != item.name:
         ensure_unique(db, InventoryItem, InventoryItem.name, body.name, "Inventory item name already exists")
         item.name = body.name
-    if body.unit_measure_id is not None:
+    if body.unit_measure_id is not None and body.unit_measure_id != item.unit_measure_id:
         get_or_404(db, UnitMeasure, body.unit_measure_id, "Unit measure not found")
+        has_movements = db.execute(
+            select(InventoryMovement.id)
+            .where(InventoryMovement.inventory_item_id == item.id)
+            .limit(1)
+        ).first() is not None
+        if has_movements:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "No se puede cambiar la unidad base de un insumo con movimientos registrados",
+            )
         item.unit_measure_id = body.unit_measure_id
     if body.type is not None:
         item.type = body.type.value
@@ -467,9 +478,10 @@ def list_purchases(
 def create_purchase(
     body: PurchaseCreate,
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     user: User = Depends(require_tenant_admin),
 ):
-    purchase = service.create_purchase(db, body, user_id=user.id)
+    purchase = service.create_purchase(db, body, user_id=user.id, tenant=tenant)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
 
@@ -480,11 +492,46 @@ def create_purchase(
     dependencies=[Depends(require_module_access("compras"))],
 )
 def create_purchase_order(
-    body: PurchaseCreate,
+    body: PurchaseOrderCreate,
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     user: User = Depends(require_tenant_admin),
 ):
-    purchase = service.create_purchase_order(db, body, user_id=user.id)
+    purchase = service.create_purchase_order(db, body, user_id=user.id, tenant=tenant)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
+
+
+@router.put(
+    "/purchases/{purchase_id}", response_model=PurchaseResponse,
+    summary="Registrar compra editando un borrador/orden existente (convierte en recibida) — spec 140",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def update_purchase(
+    purchase_id: UUID,
+    body: PurchaseCreate,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    user: User = Depends(require_tenant_admin),
+):
+    purchase = service.update_purchase(db, purchase_id, body, user_id=user.id, tenant=tenant)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
+
+
+@router.put(
+    "/purchases/{purchase_id}/order", response_model=PurchaseResponse,
+    summary="Actualizar una orden de compra / borrador existente (sin alta de stock) — spec 140",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def update_purchase_order(
+    purchase_id: UUID,
+    body: PurchaseOrderCreate,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    user: User = Depends(require_tenant_admin),
+):
+    purchase = service.update_purchase_order(db, purchase_id, body, user_id=user.id, tenant=tenant)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
 
@@ -503,3 +550,31 @@ def receive_purchase(
     purchase = service.receive_purchase(db, purchase_id, body, user_id=user.id)
     supplier_items.attach_conversion_factors(db, purchase.items)
     return purchase
+
+
+@router.post(
+    "/purchases/{purchase_id}/void", response_model=PurchaseResponse,
+    summary="Anular una compra confirmada (spec 134)",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def void_purchase(
+    purchase_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_tenant_admin),
+):
+    purchase = service.void_purchase(db, purchase_id, user_id=user.id)
+    supplier_items.attach_conversion_factors(db, purchase.items)
+    return purchase
+
+
+@router.delete(
+    "/purchases/{purchase_id}", status_code=status.HTTP_204_NO_CONTENT,
+    summary="Eliminar una orden de compra / borrador pendiente (hard-delete) — spec 140",
+    dependencies=[Depends(require_module_access("compras"))],
+)
+def delete_purchase(
+    purchase_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    service.delete_purchase(db, purchase_id)

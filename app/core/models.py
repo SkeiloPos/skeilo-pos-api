@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import Integer,String,Column,DateTime, UniqueConstraint,func,Boolean,MetaData,ForeignKey,Index,CheckConstraint,text
 from sqlalchemy.dialects.postgresql import UUID
@@ -83,9 +82,11 @@ class Tenant(Base,TimestampMixin):
     # NULL = sin prefijo, numeración corrida.
     invoice_prefix:Mapped[Optional[str]] = mapped_column("invoice_prefix", String(20), nullable=True)
 
-    # Zona horaria IANA del negocio de este tenant (spec 030, A-46). Sin
-    # pantalla de autoservicio: se fija vía `app/scripts/set_tenant_timezone.py`.
-    # `America/Bogota` cubre a todo tenant existente vía server_default.
+    # Zona horaria IANA del negocio de este tenant (spec 030, A-46). Nace en el alta
+    # (`tenant_create`, spec 138: el Super Admin la elige de una lista curada) y, para un tenant
+    # ya creado, solo se cambia vía `app/scripts/set_tenant_timezone.py` (sin pantalla de edición).
+    # `America/Bogota` cubre a todo tenant existente y al alta por API/script vía server_default.
+    # Un disparador de `shared.tenants` aplica la misma regla de validez en la base de datos.
     timezone:Mapped[str] = mapped_column(
         "timezone", String(255), nullable=False, server_default="America/Bogota"
     )
@@ -98,6 +99,12 @@ class Tenant(Base,TimestampMixin):
         "notification_retention_days", Integer, nullable=False, server_default="90"
     )
 
+    # Permite capturar una línea de compra en una unidad distinta de la base del insumo
+    # (spec 134, FR-016). `true` preserva el comportamiento de todo tenant existente.
+    unit_conversion_enabled:Mapped[bool] = mapped_column(
+        "unit_conversion_enabled", Boolean, nullable=False, server_default="true", default=True
+    )
+
     users: Mapped[list["User"]] = relationship(
             back_populates="tenant",
             cascade="all, delete-orphan"
@@ -107,11 +114,12 @@ class Tenant(Base,TimestampMixin):
 
     @validates("timezone")
     def _validate_timezone(self, key, value):
-        try:
-            ZoneInfo(value)
-        except ZoneInfoNotFoundError:
-            raise ValueError(f"Zona horaria inválida: {value!r} no es un nombre IANA reconocido.")
-        return value
+        # Import diferido: `app.core.timezone` importa `Tenant` de este módulo a nivel de módulo.
+        from app.core.timezone import validate_iana_timezone
+
+        # Regla común a todos los caminos (spec 138, FR-010): zona reconocida Y forma `Área/Lugar` o `UTC`
+        # (rechaza `localtime`, `Factory`…, que `ZoneInfo` aceptaba).
+        return validate_iana_timezone(value)
 
 class Role(UUIDPrimaryKeyMixin,TimestampMixin,Base):
     __tablename__ = "roles"    

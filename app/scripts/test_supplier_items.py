@@ -233,6 +233,11 @@ def main():
             purchase_item = PurchaseItem(
                 purchase_id=purchase.id, inventory_item_id=item.id,
                 supplier_item_id=rel.id, quantity=Decimal("1"), unit_cost=Decimal("8000"),
+                # spec 134: columnas nuevas NOT NULL -- plumbing, no cambia ninguna aserción
+                # de este script (mismos valores que ya calculaba _resolve_purchase_line
+                # para esta ruta: factor 1, quantity_base/cost_base = quantity/unit_cost).
+                unit_measure_id=item.unit_measure_id, conversion_factor_applied=Decimal("1"),
+                quantity_base=Decimal("1"), cost_base=Decimal("8000"),
             )
             db.add(purchase_item)
             db.commit()

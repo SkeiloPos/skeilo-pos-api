@@ -11,6 +11,7 @@ import logging
 import re
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from types import SimpleNamespace
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -20,15 +21,19 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
+from app.core import units
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_import_job import InventoryImportJob
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
+from app.models.unit_measure import UnitMeasure
 from app.models.purchase import Purchase, PurchaseItem
 from app.api.v1.inventory import supplier_items
 from app.api.v1.inventory.stock import record_movement
-from app.api.v1.inventory.schemas import PurchaseCreate, PurchaseItemIn, PurchaseReceiveIn
+from app.api.v1.inventory.schemas import (
+    PurchaseCreate, PurchaseItemIn, PurchaseOrderCreate, PurchaseOrderItemIn, PurchaseReceiveIn,
+)
 from app.core import inventory_reasons as reasons
 
 logger = logging.getLogger(__name__)
@@ -47,7 +52,7 @@ def find_blocking_import_job(db: Session) -> InventoryImportJob | None:
     candidatos = db.execute(
         select(InventoryImportJob).where(InventoryImportJob.status == "procesando")
     ).scalars().all()
-    ahora = utc_now().replace(tzinfo=None)
+    ahora = utc_now_naive()
     for job in candidatos:
         if ahora - job.started_at > IMPORT_JOB_TIMEOUT:
             job.status = "interrumpido"
@@ -162,14 +167,16 @@ def resolve_or_create_by_code(
 
 
 def _resolve_purchase_line(
-    db: Session, purchase: Purchase, it: PurchaseItemIn,
+    db: Session, purchase: Purchase, it: PurchaseItemIn, tenant,
 ) -> tuple[PurchaseItem, Decimal, InventoryItem]:
-    """Resuelve una línea de alta directa u orden (spec 107): si trae `supplier_item_id`,
-    calcula `quantity`/`unit_cost` en unidad base a partir de la presentación (FR-003/FR-004),
-    conserva lo capturado originalmente (`presentation_quantity`, snapshot de
-    `presentation_label`) y aplica RN-15; si no, se comporta exactamente igual que antes de
-    esta spec (FR-007). Devuelve el `PurchaseItem` sin persistir todavía, el total de la línea
-    con los valores originales (FR-005), y el `InventoryItem` ya cargado."""
+    """Resuelve una línea de alta directa u orden: si trae `supplier_item_id`, calcula
+    `quantity`/`unit_cost` en unidad base a partir de la presentación (spec 106/107,
+    FR-003/FR-004), conserva lo capturado originalmente (`presentation_quantity`, snapshot de
+    `presentation_label`) y aplica RN-15; si trae `unit_measure_id`, resuelve el factor de
+    conversión hacia la unidad base del insumo (spec 134, FR-008); si no trae ninguno de los
+    dos, se comporta exactamente igual que antes de esta spec (FR-007). Devuelve el
+    `PurchaseItem` sin persistir todavía, el total de la línea con los valores originales
+    (FR-005), y el `InventoryItem` ya cargado."""
     item = get_or_404(db, InventoryItem, it.inventory_item_id, "Inventory item not found")
 
     if it.supplier_item_id is not None:
@@ -186,9 +193,21 @@ def _resolve_purchase_line(
             raise HTTPException(
                 422, "La presentación elegida no corresponde al proveedor de esta compra",
             )
+        # spec 140: el factor real puede venir en vivo de una `UnitMeasure` vinculada o,
+        # en modo legado, del número guardado en la propia relación -- ver
+        # `SupplierItem.effective_conversion_factor`/`effective_presentation`.
+        factor = relation.effective_conversion_factor
+        if factor is None:
+            # spec 138: una relación creada por import de inventario puede no tener
+            # presentación/factor todavía -- no se puede usar en una compra hasta
+            # completarla desde el módulo de proveedores.
+            raise HTTPException(
+                422, "Esta relación todavía no tiene un factor de conversión asignado; "
+                     "complétala desde el módulo de proveedores antes de usarla en una compra",
+            )
 
-        quantity = it.presentation_quantity * relation.conversion_factor
-        unit_cost = (it.presentation_unit_cost / relation.conversion_factor).quantize(
+        quantity = it.presentation_quantity * factor
+        unit_cost = (it.presentation_unit_cost / factor).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP,
         )
         line_total = it.presentation_quantity * it.presentation_unit_cost
@@ -200,22 +219,65 @@ def _resolve_purchase_line(
             unit_cost=unit_cost,
             supplier_item_id=relation.id,
             presentation_quantity=it.presentation_quantity,
-            presentation_label=relation.presentation,
+            presentation_label=relation.effective_presentation,
+            # La conversión de esta ruta la gobierna el factor efectivo de arriba, no esta
+            # spec: se guarda la unidad base del insumo con factor 1 (research.md D5).
+            unit_measure_id=item.unit_measure_id,
+            conversion_factor_applied=Decimal("1"),
+            quantity_base=quantity,
+            cost_base=unit_cost,
         )
         supplier_items.apply_purchase_cost(db, relation, it.presentation_unit_cost)
+    elif it.unit_measure_id is not None:
+        chosen_unit = get_or_404(db, UnitMeasure, it.unit_measure_id, "Unit measure not found")
+        if not chosen_unit.active:
+            raise HTTPException(422, "La unidad de medida no está activa")
+        base_unit = get_or_404(db, UnitMeasure, item.unit_measure_id, "Unit measure not found")
+        if (
+            tenant is not None
+            and not tenant.unit_conversion_enabled
+            and chosen_unit.id != base_unit.id
+        ):
+            raise HTTPException(
+                422,
+                "La conversión de unidades está desactivada para este negocio; "
+                "usa la unidad base del insumo",
+            )
+
+        conversion_factor_applied = units.convert(Decimal("1"), chosen_unit, base_unit)
+        quantity_base = it.quantity * conversion_factor_applied
+        cost_base = it.unit_cost / conversion_factor_applied
+        line_total = it.quantity * it.unit_cost
+
+        purchase_item = PurchaseItem(
+            purchase_id=purchase.id,
+            inventory_item_id=it.inventory_item_id,
+            quantity=it.quantity,
+            unit_cost=it.unit_cost,
+            unit_measure_id=chosen_unit.id,
+            conversion_factor_applied=conversion_factor_applied,
+            quantity_base=quantity_base,
+            cost_base=cost_base,
+        )
     else:
         purchase_item = PurchaseItem(
             purchase_id=purchase.id,
             inventory_item_id=it.inventory_item_id,
             quantity=it.quantity,
             unit_cost=it.unit_cost,
+            unit_measure_id=item.unit_measure_id,
+            conversion_factor_applied=Decimal("1"),
+            quantity_base=it.quantity,
+            cost_base=it.unit_cost,
         )
         line_total = it.quantity * it.unit_cost
 
     return purchase_item, line_total, item
 
 
-def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> Purchase:
+def create_purchase(
+    db: Session, data: PurchaseCreate, user_id: UUID | None, tenant=None,
+) -> Purchase:
     if data.supplier_id is not None:
         get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
 
@@ -231,16 +293,17 @@ def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> 
 
         total = Decimal("0")
         for it in data.items:
-            purchase_item, line_total, item = _resolve_purchase_line(db, purchase, it)
+            purchase_item, line_total, item = _resolve_purchase_line(db, purchase, it, tenant)
             purchase_item.received_quantity = purchase_item.quantity  # alta directa: recibida por completo
             db.add(purchase_item)
-            # Alta de stock + kardex + actualización del costo unitario.
+            # Alta de stock + kardex + actualización del costo unitario, en unidad base
+            # (spec 134: `quantity_base`/`cost_base` ya resueltos por `_resolve_purchase_line`).
             record_movement(
-                db, item.id, type="in", quantity=purchase_item.quantity,
+                db, item.id, type="in", quantity=purchase_item.quantity_base,
                 reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE, reference_id=purchase.id,
                 user_id=user_id,
             )
-            item.unit_cost = purchase_item.unit_cost
+            item.unit_cost = purchase_item.cost_base
             total += line_total
 
         purchase.status = "received"
@@ -257,21 +320,130 @@ def create_purchase(db: Session, data: PurchaseCreate, user_id: UUID | None) -> 
     return purchase
 
 
-def create_purchase_order(db: Session, data: PurchaseCreate, user_id: UUID | None) -> Purchase:
+def update_purchase(
+    db: Session, purchase_id: UUID, data: PurchaseCreate, user_id: UUID | None, tenant=None,
+) -> Purchase:
+    """Registrar compra editando un borrador/orden existente (spec 140): reemplaza sus
+    líneas y la convierte en recibida (alta de stock total), igual que `create_purchase`
+    pero sobre el mismo registro en vez de uno nuevo."""
+    purchase = _only_editable_draft(db, purchase_id)
+    if data.supplier_id is not None:
+        get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
+    try:
+        _replace_purchase_items(db, purchase)
+        purchase.supplier_id = data.supplier_id
+        purchase.invoice_number = data.invoice_number
+        purchase.is_incomplete = False
+
+        total = Decimal("0")
+        for it in data.items:
+            purchase_item, line_total, item = _resolve_purchase_line(db, purchase, it, tenant)
+            purchase_item.received_quantity = purchase_item.quantity
+            db.add(purchase_item)
+            record_movement(
+                db, item.id, type="in", quantity=purchase_item.quantity_base,
+                reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE, reference_id=purchase.id,
+                user_id=user_id,
+            )
+            item.unit_cost = purchase_item.cost_base
+            total += line_total
+
+        purchase.status = "received"
+        purchase.total = total
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("Error registrando compra (editando borrador)")
+        raise
+    db.refresh(purchase)
+    return purchase
+
+
+def _only_editable_draft(db: Session, purchase_id: UUID) -> Purchase:
+    """spec 140: reabrir un borrador/orden pendiente y guardar de nuevo actualiza ESE mismo
+    registro -- nunca crea uno nuevo que el usuario tendría que borrar a mano. Solo se puede
+    editar mientras sigue en `status='draft'` (sin ninguna recepción todavía); una vez
+    recibida -- parcial o totalmente -- es historial inmutable (Principio VII) y debe
+    anularse (`void_purchase`), no editarse."""
+    purchase = get_or_404(db, Purchase, purchase_id, "Purchase not found")
+    if purchase.status != "draft":
+        raise HTTPException(
+            409, "Solo se puede editar una orden de compra o un borrador mientras no se haya recibido nada",
+        )
+    return purchase
+
+
+def _replace_purchase_items(db: Session, purchase: Purchase) -> None:
+    for old_item in list(purchase.items):
+        db.delete(old_item)
+    db.flush()
+
+
+def _fill_incomplete_line_defaults(it: PurchaseOrderItemIn) -> PurchaseItemIn | SimpleNamespace:
+    """spec 140 (FR-013, "Guardar borrador"): una línea de un borrador incompleto puede
+    llegar sin `quantity`/`unit_cost`/ningún modo resuelto -- `_resolve_purchase_line` sigue
+    exigiendo una `quantity` positiva (CHECK `ck_purchase_item_qty_positive`, sin cambios de
+    esquema, data-model.md), así que se completa con un placeholder mínimo (`quantity=1`,
+    `unit_cost=0`) cuando la línea no trae lo suficiente para ningún modo -- nunca se bloquea
+    el guardado de un borrador por datos faltantes."""
+    if it.supplier_item_id is not None and it.presentation_quantity is not None:
+        return SimpleNamespace(
+            inventory_item_id=it.inventory_item_id,
+            quantity=None,
+            unit_cost=Decimal("0"),
+            supplier_item_id=it.supplier_item_id,
+            presentation_quantity=it.presentation_quantity,
+            presentation_unit_cost=it.presentation_unit_cost if it.presentation_unit_cost is not None else Decimal("0"),
+            unit_measure_id=None,
+        )
+    if it.unit_measure_id is not None and it.quantity is not None:
+        return SimpleNamespace(
+            inventory_item_id=it.inventory_item_id,
+            quantity=it.quantity,
+            unit_cost=it.unit_cost if it.unit_cost is not None else Decimal("0"),
+            supplier_item_id=None,
+            presentation_quantity=None,
+            presentation_unit_cost=None,
+            unit_measure_id=it.unit_measure_id,
+        )
+    return SimpleNamespace(
+        inventory_item_id=it.inventory_item_id,
+        quantity=it.quantity if (it.quantity is not None and it.quantity > 0) else Decimal("1"),
+        unit_cost=it.unit_cost if it.unit_cost is not None else Decimal("0"),
+        supplier_item_id=None,
+        presentation_quantity=None,
+        presentation_unit_cost=None,
+        unit_measure_id=None,
+    )
+
+
+def create_purchase_order(
+    db: Session, data: PurchaseOrderCreate, user_id: UUID | None, tenant=None,
+) -> Purchase:
     """Crea una orden de compra en estado `draft` SIN dar alta de stock (RF-022).
-    El stock se suma luego con `receive_purchase` (parcial o total)."""
+    El stock se suma luego con `receive_purchase` (parcial o total).
+
+    spec 140: `data.allow_incomplete=True` (nuevo, "Guardar borrador", User Story 3) persiste
+    la captura aunque no tenga ninguna línea o traiga líneas sin cantidad/costo/unidad --
+    `PurchaseOrderCreate` ya validó que esto solo ocurre cuando se pidió explícitamente
+    (`allow_incomplete`); `False`/ausente conserva el comportamiento actual (User Story 2)."""
     if data.supplier_id is not None:
         get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
     try:
         purchase = Purchase(
             supplier_id=data.supplier_id, invoice_number=data.invoice_number,
-            user_id=user_id, status="draft", total=Decimal("0"),
+            user_id=user_id, status="draft", is_incomplete=data.allow_incomplete,
+            total=Decimal("0"),
         )
         db.add(purchase)
         db.flush()
         total = Decimal("0")
         for it in data.items:
-            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, it)
+            line = _fill_incomplete_line_defaults(it) if data.allow_incomplete else it
+            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, line, tenant)
             purchase_item.received_quantity = Decimal("0")
             db.add(purchase_item)
             total += line_total
@@ -281,6 +453,39 @@ def create_purchase_order(db: Session, data: PurchaseCreate, user_id: UUID | Non
         db.rollback(); raise
     except Exception:
         db.rollback(); logger.exception("Error creando orden de compra"); raise
+    db.refresh(purchase)
+    return purchase
+
+
+def update_purchase_order(
+    db: Session, purchase_id: UUID, data: PurchaseOrderCreate, user_id: UUID | None, tenant=None,
+) -> Purchase:
+    """Actualizar una orden de compra / borrador existente sin dar alta de stock (spec 140):
+    reemplaza sus líneas sobre el mismo registro -- igual que `create_purchase_order` pero
+    sin crear uno nuevo. `data.allow_incomplete` decide si queda como orden pendiente
+    validada (`false`) o como borrador incompleto (`true`), igual que al crearla."""
+    purchase = _only_editable_draft(db, purchase_id)
+    if data.supplier_id is not None:
+        get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
+    try:
+        _replace_purchase_items(db, purchase)
+        purchase.supplier_id = data.supplier_id
+        purchase.invoice_number = data.invoice_number
+        purchase.is_incomplete = data.allow_incomplete
+
+        total = Decimal("0")
+        for it in data.items:
+            line = _fill_incomplete_line_defaults(it) if data.allow_incomplete else it
+            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, line, tenant)
+            purchase_item.received_quantity = Decimal("0")
+            db.add(purchase_item)
+            total += line_total
+        purchase.total = total
+        db.commit()
+    except HTTPException:
+        db.rollback(); raise
+    except Exception:
+        db.rollback(); logger.exception("Error actualizando orden de compra"); raise
     db.refresh(purchase)
     return purchase
 
@@ -316,7 +521,7 @@ def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
                     db, SupplierItem, pi.supplier_item_id,
                     "Relación proveedor-insumo no encontrada",
                 )
-                quantity_received = r.presentation_quantity * relation.conversion_factor
+                quantity_received = r.presentation_quantity * relation.effective_conversion_factor
             else:
                 if r.quantity is None:
                     raise HTTPException(
@@ -330,15 +535,18 @@ def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
                     422,
                     f"Recepción {quantity_received} excede lo pendiente ({remaining}) del ítem {pi.id}",
                 )
+            # `quantity_received` está en la unidad capturada de la línea (`pi.unit_measure_id`,
+            # spec 134); el stock/kardex se mueven en unidad base del insumo.
+            quantity_received_base = quantity_received * Decimal(pi.conversion_factor_applied)
             record_movement(
-                db, pi.inventory_item_id, type="in", quantity=quantity_received,
+                db, pi.inventory_item_id, type="in", quantity=quantity_received_base,
                 reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE,
                 reference_id=purchase.id, user_id=user_id,
             )
             pi.received_quantity = Decimal(pi.received_quantity) + quantity_received
             inv = db.get(InventoryItem, pi.inventory_item_id)
             if inv is not None:
-                inv.unit_cost = pi.unit_cost
+                inv.unit_cost = pi.cost_base
 
         fully = all(Decimal(i.received_quantity) >= Decimal(i.quantity) for i in purchase.items)
         any_received = any(Decimal(i.received_quantity) > 0 for i in purchase.items)
@@ -348,5 +556,54 @@ def receive_purchase(db: Session, purchase_id: UUID, data: PurchaseReceiveIn,
         db.rollback(); raise
     except Exception:
         db.rollback(); logger.exception("Error recibiendo compra"); raise
+    db.refresh(purchase)
+    return purchase
+
+
+def delete_purchase(db: Session, purchase_id: UUID) -> None:
+    """Eliminar una orden de compra / borrador pendiente (spec 140): a diferencia de
+    `void_purchase` (que revierte stock ya dado de alta), esto es un hard-delete -- solo
+    válido mientras `status='draft'`, es decir, mientras nunca se le ha dado alta de stock a
+    ninguna línea (ni parcial), así que no hay nada que revertir ni historial que proteger
+    (Principio VII solo aplica a compras ya recibidas)."""
+    purchase = get_or_404(db, Purchase, purchase_id, "Purchase not found")
+    if purchase.status != "draft":
+        raise HTTPException(
+            409, "Solo se puede eliminar una orden de compra o un borrador mientras no se haya recibido nada",
+        )
+    try:
+        for pi in list(purchase.items):
+            db.delete(pi)
+        db.delete(purchase)
+        db.commit()
+    except HTTPException:
+        db.rollback(); raise
+    except Exception:
+        db.rollback(); logger.exception("Error eliminando compra"); raise
+
+
+def void_purchase(db: Session, purchase_id: UUID, user_id: UUID | None) -> Purchase:
+    """Anula una compra confirmada (spec 134, US3, FR-012/FR-013): revierte el stock
+    exactamente en la cantidad base guardada en cada línea (`quantity_base`), nunca
+    recalculada con el factor de conversión vigente -- `conversion_factor_applied` es
+    inmutable por diseño (FR-010). Rechaza una segunda anulación de la misma compra."""
+    purchase = get_or_404(db, Purchase, purchase_id, "Purchase not found")
+    if purchase.voided_at is not None:
+        raise HTTPException(409, "La compra ya fue anulada")
+
+    try:
+        for pi in purchase.items:
+            record_movement(
+                db, pi.inventory_item_id, type="out", quantity=pi.quantity_base,
+                reason=reasons.AJUSTE, reference_type=reasons.REF_PURCHASE_VOID,
+                reference_id=purchase.id, user_id=user_id,
+            )
+        purchase.voided_at = utc_now_naive()
+        purchase.voided_by = user_id
+        db.commit()
+    except HTTPException:
+        db.rollback(); raise
+    except Exception:
+        db.rollback(); logger.exception("Error anulando compra"); raise
     db.refresh(purchase)
     return purchase

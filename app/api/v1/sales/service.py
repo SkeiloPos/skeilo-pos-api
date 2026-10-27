@@ -13,7 +13,7 @@ from sqlalchemy.sql import Select
 
 from app.core.asset_refs import ImageDecision, resolve_image_change
 from app.core.crud import ensure_unique, get_or_404
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core.storage import FOLDER_PAYMENT_METHODS, normalize_asset_ref
 from app.core.timezone import local_day_bounds_utc, resolve_timezone
 from app.models.invoice import Invoice
@@ -319,7 +319,10 @@ def list_available_payment_methods(db: Session) -> list[PaymentMethod]:
     ).scalars().all()
 
 
-def checkout(db: Session, data: SaleCreate, cashier: User, *, invoice_prefix: str = "") -> Sale:
+def checkout(
+    db: Session, data: SaleCreate, cashier: User, *, invoice_prefix: str = "",
+    tenant: Tenant | None = None,
+) -> Sale:
     """Venta de mostrador: arma la venta, descuenta inventario y emite factura.
 
     Usa `build_sale` —el mismo constructor que el cobro de mesa— para no volver a
@@ -370,7 +373,8 @@ def checkout(db: Session, data: SaleCreate, cashier: User, *, invoice_prefix: st
 
         # 2. Descuento automático (RF-012): motor por conjunto de variantes
         #    (spec 063). Se suma al descuento manual que haya escrito el cajero.
-        promo_discount, final_promotion_id, applied = orders_checkout.auto_discount(db, lines, now)
+        # spec 138 (FR-006): la vigencia se evalúa en la zona del tenant, no en la global de respaldo.
+        promo_discount, final_promotion_id, applied = orders_checkout.auto_discount(db, lines, now, tenant)
 
         sale = build_sale(
             db,

@@ -1,4 +1,3 @@
-from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional
@@ -8,6 +7,7 @@ from pydantic import AliasPath, BaseModel, ConfigDict, Field, field_validator, m
 
 from app.api.v1.sales.schemas import PaymentMethodType
 from app.core.reserved_hosts import is_reserved_subdomain
+from app.core.timezone import UtcDatetime, validate_iana_timezone
 
 
 class PaymentMethodFieldFormat(str, Enum):
@@ -74,8 +74,8 @@ class PaymentMethodCatalogResponse(BaseModel):
     type: str
     active: bool
     fields: list[PaymentMethodFieldDefinition]
-    created_at: datetime
-    updated_at: datetime | None = None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -89,6 +89,11 @@ class TenantResponse(BaseModel):
         examples=["tenant_acme"],
     )
     host: str = Field(..., description="Host asociado al tenant.", examples=["acme.localhost"])
+    # spec 138 (FR-008): el Super Admin no pertenece a ningún tenant; para mostrar «Vence» en la zona de
+    # CADA negocio la lista entrega la zona de cada fila.
+    timezone: str = Field(
+        ..., description="Zona horaria IANA del tenant (spec 138).", examples=["America/Bogota"]
+    )
     plan_id: UUID = Field(..., description="Plan de suscripción vigente del tenant.")
     plan_name: Optional[str] = Field(
         None, description="Nombre del plan vigente (spec 033).", validation_alias=AliasPath("plan", "name")
@@ -96,11 +101,11 @@ class TenantResponse(BaseModel):
     ciclo_facturacion: Optional[Literal["mensual", "anual"]] = Field(
         None, description="Ciclo de facturación de la asignación vigente (spec 033)."
     )
-    plan_vence_en: Optional[datetime] = Field(
+    plan_vence_en: Optional[UtcDatetime] = Field(
         None, description="Vencimiento de la asignación vigente; `null` = sin vencimiento (spec 033)."
     )
-    created_at: datetime = Field(..., description="Fecha de creación del registro.")
-    updated_at: datetime | None = Field(None, description="Fecha de la última actualización.")
+    created_at: UtcDatetime = Field(..., description="Fecha de creación del registro.")
+    updated_at: UtcDatetime | None = Field(None, description="Fecha de la última actualización.")
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -183,8 +188,8 @@ class PlanResponse(BaseModel):
     precio_mensual: Optional[Decimal] = None
     precio_anual: Optional[Decimal] = None
 
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    created_at: UtcDatetime
+    updated_at: Optional[UtcDatetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -215,3 +220,15 @@ class TenantCreateWithUser(BaseModel):
     # vencimiento", no un valor implícito, research.md Decisión 15).
     plan_id: UUID
     ciclo_facturacion: Optional[Literal["mensual", "anual"]]
+
+    # spec 138, FR-010: zona horaria IANA del negocio. Opcional a propósito (aditivo): la pantalla siempre la
+    # envía, pero la API y los scripts que no la mandan siguen creando el tenant en `America/Bogota`
+    # (`server_default`). Si viene, se valida ANTES de crear nada (⇒ 422).
+    timezone: str | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_iana_timezone(value)

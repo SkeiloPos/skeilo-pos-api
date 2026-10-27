@@ -10,7 +10,10 @@ import html
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from app.core.config import settings
+from app.core.timezone import ZONAS_CURADAS, etiqueta_zona_correo
+
+#: Zona de respaldo: usuario sin tenant (p. ej. Super Admin) y el envoltorio de Bogotá.
+ZONA_RESPALDO = "America/Bogota"
 
 
 class ErrorDePlantillaDeCorreo(ValueError):
@@ -49,11 +52,15 @@ def escapar_valores(**valores: str) -> dict[str, str]:
     return {nombre: html.escape(valor, quote=True) for nombre, valor in valores.items()}
 
 
-def formatear_fecha_hora_colombia(momento: datetime) -> str:
-    """FR-036: `dd/mm/aaaa · hh:mm a. m./p. m. (hora de Colombia)`, hora de
+def formatear_fecha_hora(momento: datetime, zona: str) -> str:
+    """FR-036 y spec 138 (FR-011): `dd/mm/aaaa · hh:mm a. m./p. m. (hora de {zona})`, hora de
     12 con cero inicial, construido a mano sin `%p` ni `setlocale`
     (research.md Decisión 7) — `%p` depende del locale del proceso y
     produciría "PM" en vez de "p. m." fuera de un locale español.
+
+    `zona` es la IANA del tenant. El paréntesis final: una zona de la lista curada usa su nombre
+    («hora de Colombia», «hora de Ciudad de México»…); una zona válida fuera de la lista usa su
+    desfase sin «hora de» («UTC−3», «UTC+5:30»).
 
     `momento` se interpreta siempre como UTC: si llega *naive* (el caso
     real de los dos llamantes) se le fija `timezone.utc` antes de
@@ -62,9 +69,20 @@ def formatear_fecha_hora_colombia(momento: datetime) -> str:
     (la trampa que data-model.md señala)."""
     if momento.tzinfo is None:
         momento = momento.replace(tzinfo=timezone.utc)
-    local = momento.astimezone(ZoneInfo(settings.TENANT_TIMEZONE))
+    local = momento.astimezone(ZoneInfo(zona))
     hora_12 = local.hour % 12 or 12
     sufijo = "a. m." if local.hour < 12 else "p. m."
     fecha = local.strftime("%d/%m/%Y")
     minutos = local.strftime("%M")
-    return f"{fecha} · {hora_12:02d}:{minutos} {sufijo} (hora de Colombia)"
+    etiqueta = etiqueta_zona_correo(zona, momento)
+    es_nombre = any(curada.iana == zona for curada in ZONAS_CURADAS)
+    parentesis = f"(hora de {etiqueta})" if es_nombre else f"({etiqueta})"
+    return f"{fecha} · {hora_12:02d}:{minutos} {sufijo} {parentesis}"
+
+
+def formatear_fecha_hora_colombia(momento: datetime) -> str:
+    """Envoltorio de Bogotá: devuelve EXACTAMENTE el texto de siempre
+    («… (hora de Colombia)»). Se conserva porque tres archivos de caracterización de
+    correo lo llaman y fijan su salida (Principio III); el correo real usa `formatear_fecha_hora`
+    con la zona del tenant."""
+    return formatear_fecha_hora(momento, ZONA_RESPALDO)

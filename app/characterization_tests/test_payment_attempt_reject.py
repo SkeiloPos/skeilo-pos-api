@@ -10,6 +10,7 @@ Ejecutar solo este módulo:
 
     python -m unittest app.characterization_tests.test_payment_attempt_reject -v
 """
+from datetime import datetime, timezone
 from decimal import Decimal
 import unittest
 
@@ -17,6 +18,8 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.characterization_tests import orders_fixtures as fx
+from app.characterization_tests.cart_fixtures import frozen_now
+from app.characterization_tests.fixtures import tenant_en
 from app.api.v1.orders import checkout
 from app.api.v1.orders.schemas import PaymentAttemptRejectIn
 from app.models.audit_log import AuditLog
@@ -104,6 +107,79 @@ class TestTableRepeatRejection(unittest.TestCase):
         self.assertEqual(marks[0].entity, "dining_tables")
         self.assertEqual(marks[0].entity_id, table.id)
         self.assertEqual(marks[0].payload["rejection_count_today"], 2)
+
+
+class TestSegundoRechazoEnElDiaLocal(unittest.TestCase):
+    """spec 138, Historia 3 (FR-007, A-147): «el día» del segundo rechazo es el día LOCAL del tenant.
+
+    Antes la ventana era el día UTC (`utc_now().date()`): entre las 19:00 y las 24:00 de Bogotá el día
+    UTC ya es el siguiente, la ventana quedaba vacía y la marca no se escribía (la suite del backend
+    fallaba a diario a esa hora). Cada intento se siembra y se rechaza con el reloj central fijado en su
+    instante, así que la prueba no depende de la hora a la que se ejecute."""
+
+    def _sembrar_y_rechazar(self, db, ts, metodo, instante, tenant):
+        with frozen_now(instante, module="app.core.timezone"):
+            participant = fx.make_participant(db, table_session=ts)
+            product = fx.make_product(db, category=fx.make_category(db))
+            variant = fx.make_variant(db, product=product, price=PRECIO)
+            order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+            fx.make_order_item(db, order, variant, estado_cocina="pendiente")
+            attempt = fx.make_payment_attempt(db, order, metodo, status="pendiente")  # created_at = instante
+            db.commit()
+            checkout.reject_payment_attempt(
+                db, attempt.id, "monto_no_coincide", fx.make_user_double(), tenant=tenant
+            )
+
+    def _marcas(self, db):
+        return db.execute(
+            select(AuditLog).where(AuditLog.action == "payment.table_repeat_rejection")
+        ).scalars().all()
+
+    def _dos_rechazos(self, zona, primero, segundo):
+        db = fx.new_session()
+        table = fx.make_dining_table(db)
+        ts = fx.make_table_session(db, table=table)
+        nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
+        db.commit()
+        tenant = tenant_en(zona)
+        self._sembrar_y_rechazar(db, ts, nequi, primero, tenant)
+        self._sembrar_y_rechazar(db, ts, nequi, segundo, tenant)
+        return db, table
+
+    def test_segundo_rechazo_deja_la_marca_a_cualquier_hora_del_dia_local(self):
+        utc = timezone.utc
+        casos = [
+            # (descripción, zona, primer rechazo, segundo rechazo)
+            ("Bogotá 20:00 y 21:00 (el defecto: el día UTC ya era el siguiente)", "America/Bogota",
+             datetime(2026, 10, 26, 1, 0, tzinfo=utc), datetime(2026, 10, 26, 2, 0, tzinfo=utc)),
+            ("Bogotá 12:00 y 13:00 (control: ya pasaba antes)", "America/Bogota",
+             datetime(2026, 10, 25, 17, 0, tzinfo=utc), datetime(2026, 10, 25, 18, 0, tzinfo=utc)),
+            ("Ciudad de México 20:00 y 21:00", "America/Mexico_City",
+             datetime(2026, 10, 26, 2, 0, tzinfo=utc), datetime(2026, 10, 26, 3, 0, tzinfo=utc)),
+            ("Madrid 00:10 y 00:40 del 26/10 (el día UTC todavía es el 25)", "Europe/Madrid",
+             datetime(2026, 10, 25, 23, 10, tzinfo=utc), datetime(2026, 10, 25, 23, 40, tzinfo=utc)),
+        ]
+        for descripcion, zona, primero, segundo in casos:
+            with self.subTest(caso=descripcion):
+                db, table = self._dos_rechazos(zona, primero, segundo)
+                marcas = self._marcas(db)
+                self.assertEqual(len(marcas), 1)
+                self.assertEqual(marcas[0].entity_id, table.id)
+                self.assertEqual(marcas[0].payload["rejection_count_today"], 2)
+
+    def test_dos_rechazos_en_dias_locales_distintos_no_dejan_la_marca(self):
+        """Control: dos rechazos a ambos lados de la medianoche LOCAL son dos días de negocio distintos."""
+        utc = timezone.utc
+        casos = [
+            # 23:30 del 24/10 y 00:30 del 25/10 en Bogotá (comparten el día UTC, 25/10).
+            ("America/Bogota", datetime(2026, 10, 25, 4, 30, tzinfo=utc), datetime(2026, 10, 25, 5, 30, tzinfo=utc)),
+            # 23:30 del 24/11 y 00:30 del 25/11 en Madrid (UTC+1; el día UTC es el 24 en los dos).
+            ("Europe/Madrid", datetime(2026, 11, 24, 22, 30, tzinfo=utc), datetime(2026, 11, 24, 23, 30, tzinfo=utc)),
+        ]
+        for zona, primero, segundo in casos:
+            with self.subTest(zona=zona):
+                db, _ = self._dos_rechazos(zona, primero, segundo)
+                self.assertEqual(self._marcas(db), [])
 
 
 if __name__ == "__main__":

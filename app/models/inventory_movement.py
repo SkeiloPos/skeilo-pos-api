@@ -23,7 +23,9 @@ class InventoryMovement(UUIDPrimaryKeyMixin, Base):
 
     type: Mapped[str] = mapped_column(String(20), nullable=False)
 
-    quantity: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
+    # Numeric(18,6) (spec 134, research.md D4): consistente con InventoryItem.current_stock,
+    # que alimenta con conversiones de unidad que pueden tener más de 3 decimales.
+    quantity: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
 
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 

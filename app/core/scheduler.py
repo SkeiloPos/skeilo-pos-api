@@ -29,7 +29,7 @@ Dos detalles que no son opcionales:
   mismas filas.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
@@ -38,6 +38,7 @@ from app.core import events
 from app.core.config import settings
 from app.core.db import with_db
 from app.core.redis import token_blocklist as redis
+from app.core.timezone import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) ->
     #: sesiones realmente cerradas, para publicar los eventos tras el COMMIT.
     cerradas: list[tuple] = []
     with with_db(schema) as db:
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = utc_now_naive()
 
         # Dos criterios distintos, no uno con dos umbrales:
         #  - mesas abandonadas sin pedir → ventana corta (30 min);
@@ -187,7 +188,7 @@ def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) ->
 
 def sweep_orphan_sessions() -> int:
     """Recorre todos los tenants cerrando sesiones de mesa vencidas."""
-    corte = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+    corte = utc_now_naive() - timedelta(
         hours=settings.TABLE_SESSION_MAX_HOURS
     )
     total = 0

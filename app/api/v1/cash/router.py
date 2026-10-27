@@ -14,7 +14,7 @@ from app.core.dependencies import get_current_user, require_tenant_admin
 from app.core.models import Tenant, User
 from app.core.pagination import Page
 from app.core.plan_limits import enforce_plan_limit
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.cash_movement import CashMovement
@@ -183,7 +183,7 @@ def close_shift(
 
     shift.close_note = body.close_note
     shift.status = "closed"
-    shift.closed_at = utc_now()
+    shift.closed_at = utc_now_naive()
     # spec 121 (D-5, A-134, FR-029): quién confirma el conteo (puede no ser quien abrió).
     shift.closed_by_user_id = user.id
     shift.closed_by_user_name = user.name

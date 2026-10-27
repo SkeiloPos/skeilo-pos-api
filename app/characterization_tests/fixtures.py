@@ -62,6 +62,7 @@ from app.models.variant_option_group import VariantOptionGroup
 from app.models.recipe_item import RecipeItem
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
+from app.models.unit_measure_group import UnitMeasureGroup
 from app.models.presentation import Presentation
 from app.models.category_presentation import CategoryPresentation
 from app.models.supplier import Supplier
@@ -79,6 +80,7 @@ _TABLE_NAMES = [
     "inventory_items",
     "inventory_movements",
     "unit_measures",
+    "unit_measure_groups",
     # spec 083: catálogo de presentaciones + asociación categoría<->presentación.
     "presentations",
     "category_presentations",
@@ -127,11 +129,26 @@ def _uid() -> uuid.UUID:
     return uuid.uuid4()
 
 
-def make_unit(db: Session, **kw) -> UnitMeasure:
+def make_unit_measure_group(db: Session, **kw) -> UnitMeasureGroup:
+    kw.setdefault("id", _uid())
+    kw.setdefault("name", f"grupo-unidad-{kw['id']}")
+    obj = UnitMeasureGroup(**kw)
+    db.add(obj)
+    db.flush()
+    return obj
+
+
+def make_unit(db: Session, group: UnitMeasureGroup | None = None, **kw) -> UnitMeasure:
+    if "group_id" not in kw:
+        if group is None:
+            group = make_unit_measure_group(db)
+        kw["group_id"] = group.id
     kw.setdefault("id", _uid())
     kw.setdefault("name", f"unidad-{kw['id']}")
     kw.setdefault("abbreviation", str(kw["id"])[:10])
     kw.setdefault("active", True)
+    kw.setdefault("is_base", True)
+    kw.setdefault("factor_to_base", Decimal("1"))
     obj = UnitMeasure(**kw)
     db.add(obj)
     db.flush()
@@ -302,6 +319,17 @@ def make_tenant_stub(**kw):
     # spec 088: las escrituras de imagen validan la key contra `tenant.schema`.
     kw.setdefault("schema", "heladeria3")
     return SimpleNamespace(**kw)
+
+
+# spec 138 (FR-012): las pruebas de reglas que dependen de la hora se parametrizan con tres zonas
+# de tenant —Bogotá (UTC−5, sin horario de verano), Ciudad de México (UTC−6) y Madrid (UTC+1/+2)—
+# para que ninguna pase solo porque el desarrollo, el servidor y el tenant compartan la zona.
+ZONAS_DE_PRUEBA = ("America/Bogota", "America/Mexico_City", "Europe/Madrid")
+
+
+def tenant_en(zona: str):
+    """`tenant` mínimo con la zona dada: `resolve_timezone` solo lee `tenant.timezone`."""
+    return make_tenant_stub(timezone=zona)
 
 
 def make_option(db: Session, group: OptionGroup | None = None, **kw) -> Option:

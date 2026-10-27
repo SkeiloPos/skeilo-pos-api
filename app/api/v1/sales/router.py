@@ -123,7 +123,7 @@ def create_sale(
     cashier: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    sale = service.checkout(db, body, cashier, invoice_prefix=tenant.invoice_prefix or "")
+    sale = service.checkout(db, body, cashier, invoice_prefix=tenant.invoice_prefix or "", tenant=tenant)
     return _load_sale(db, sale.id)
 
 

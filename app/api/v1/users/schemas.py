@@ -1,8 +1,8 @@
 from enum import Enum
 from uuid import UUID
-from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from app.core.timezone import UtcDatetime
 
 
 class RoleName(str, Enum):
@@ -37,7 +37,7 @@ class UserResponse(BaseModel):
     role_name: str | None = Field(None, description="Nombre del rol del usuario.")
     tenant_id: int | None = Field(None, description="Identificador del tenant al que pertenece.")
     tenant_name: str | None = Field(None, description="Nombre del tenant al que pertenece.")
-    created_at: datetime = Field(..., description="Fecha de creación del registro.")
-    updated_at: datetime | None = Field(None, description="Fecha de la última actualización.")
+    created_at: UtcDatetime = Field(..., description="Fecha de creación del registro.")
+    updated_at: UtcDatetime | None = Field(None, description="Fecha de la última actualización.")
 
     model_config = ConfigDict(from_attributes=True)

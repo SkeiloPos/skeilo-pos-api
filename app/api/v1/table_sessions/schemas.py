@@ -1,4 +1,3 @@
-from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from uuid import UUID
@@ -24,7 +23,7 @@ class ParticipantResponse(BaseModel):
     display_label: str | None = None
     status: str
     joined_at: UtcDatetime
-    expires_at: datetime | None = None
+    expires_at: UtcDatetime | None = None
     closed_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)

@@ -196,8 +196,9 @@ def merge_orders(
 def group_bill(
     group_id: UUID,
     db: Session = Depends(get_db), _: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
-    return tables_advanced.group_bill(db, group_id)
+    return tables_advanced.group_bill(db, group_id, tenant=tenant)
 
 
 @router.get(
@@ -291,11 +292,13 @@ def list_payment_attempts(
 def approve_payment_attempt(
     attempt_id: UUID, body: PaymentAttemptApproveIn, request: Request = None,
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     return checkout.approve_payment_attempt(
         db, attempt_id, body.cash_shift_id, user,
         request_id=current_request_id(request),
         receipt_file_url=body.receipt_file_url,
+        tenant=tenant,
     )
 
 
@@ -323,10 +326,12 @@ def reject_payment_attempt(
 def adjust_split_payment_attempt(
     attempt_id: UUID, body: PaymentAttemptAdjustSplitIn,
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     return checkout.adjust_split_payment_attempt(
         db, attempt_id, body.cash_amount, body.transfer_amount,
         body.transfer_method_id, body.payment_method_id, user,
+        tenant=tenant,
     )
 
 
@@ -349,10 +354,12 @@ def list_payment_events(
 def confirm_cash_payment_attempt(
     attempt_id: UUID, body: PaymentAttemptConfirmCashIn, request: Request = None,
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
 ):
     return checkout.confirm_cash_payment_attempt(
         db, attempt_id, body.amount_received, body.cash_shift_id, user,
         request_id=current_request_id(request),
+        tenant=tenant,
     )
 
 

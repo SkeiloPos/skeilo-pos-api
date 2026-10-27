@@ -1,6 +1,6 @@
 from uuid import UUID
-from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
+from app.core.timezone import UtcDatetime
 
 
 class PresentationCreate(BaseModel):
@@ -28,7 +28,7 @@ class PresentationResponse(BaseModel):
     id: UUID = Field(..., description="Identificador único de la presentación.")
     name: str = Field(..., description="Nombre de la presentación.", examples=["Pequeño"])
     active: bool = Field(..., description="Indica si la presentación está activa.", examples=[True])
-    created_at: datetime = Field(..., description="Fecha de creación del registro.")
-    updated_at: datetime | None = Field(None, description="Fecha de la última actualización.")
+    created_at: UtcDatetime = Field(..., description="Fecha de creación del registro.")
+    updated_at: UtcDatetime | None = Field(None, description="Fecha de la última actualización.")
 
     model_config = ConfigDict(from_attributes=True)
