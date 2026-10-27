@@ -18,7 +18,7 @@ from app.core.audit import record_audit
 from app.core.crud import get_or_404
 from app.core.models import Tenant, User
 from app.core.plan_limits import ensure_module_access
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.core.asset_refs import (
     ImageDecision,
     delete_if_unreferenced,
@@ -173,7 +173,7 @@ class ProductService:
             )
         previous = product.available
         product.available = available
-        product.available_changed_at = utc_now().replace(tzinfo=None)
+        product.available_changed_at = utc_now_naive()
         product.available_changed_by_name = user.name
         record_audit(
             db,

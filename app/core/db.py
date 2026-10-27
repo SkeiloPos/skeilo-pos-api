@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from fastapi import Depends,Request,HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import create_engine,MetaData,schema as sch,inspect,text
+from sqlalchemy import create_engine,event,MetaData,schema as sch,inspect,text
 
 from typing import Optional
 
@@ -19,7 +19,7 @@ import bcrypt
 from app.core.config import settings
 from app.core.models import Tenant, User, convention, Base
 import app.models  # registra modelos tenant en Base.metadata
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.plan import Plan
 from app.models.denomination_catalog import seed_default_denominations
 from psycopg.errors import UniqueViolation
@@ -38,6 +38,39 @@ alembic_config = Config("alembic.ini")
 
 engine = create_engine(settings.DATABASE_URL,echo=False,future=True)
 logger = logging.getLogger(__name__)
+
+
+def force_utc_session(dbapi_connection, connection_record) -> None:
+    """Fija la zona de la sesión de PostgreSQL en UTC al abrir cada conexión (spec 138, FR-004).
+
+    Las 39 columnas sin zona con `server_default=now()` y cualquier `now()` de una consulta
+    cruda guardan lo que dice la zona de la SESIÓN, que hereda de `PGTZ` o del rol. Con la
+    sesión en `America/Bogota` unas 17:00 UTC se guardarían como 12:00.
+
+    Tiene que ser un evento `connect` y no `connect_args={"options": "-c timezone=UTC"}`:
+    `options` pierde contra `PGTZ` (medido, research.md Decisión 1). Se ejecuta en autocommit
+    para que un `rollback` posterior no lo deshaga, y deja `autocommit` como estaba."""
+    autocommit_previo = dbapi_connection.autocommit
+    dbapi_connection.autocommit = True
+    try:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET TIME ZONE 'UTC'")
+        finally:
+            cursor.close()
+    finally:
+        dbapi_connection.autocommit = autocommit_previo
+
+
+def install_force_utc_session(target_engine) -> None:
+    """Registra `force_utc_session` solo sobre PostgreSQL: las suites usan SQLite, que no
+    entiende `SET TIME ZONE`."""
+    if target_engine.dialect.name == "postgresql":
+        event.listen(target_engine, "connect", force_utc_session)
+
+
+# Un solo `engine` cubre API, worker de Celery, scheduler, Alembic y scripts.
+install_force_utc_session(engine)
 
 @contextmanager
 def with_db(tenant_schema: Optional[str]):
@@ -82,7 +115,7 @@ def tenant_create(
                 raise HTTPException(status_code=404, detail=f"El plan '{plan_id}' no existe")
             validate_billing_cycle_price(plan, ciclo_facturacion)
 
-            plan_iniciado_en = utc_now().replace(tzinfo=None)
+            plan_iniciado_en = utc_now_naive()
             plan_vence_en = calculate_plan_vencimiento(plan_iniciado_en, ciclo_facturacion)
 
             tenant = Tenant(

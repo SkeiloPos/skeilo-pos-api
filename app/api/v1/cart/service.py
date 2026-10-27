@@ -80,6 +80,7 @@ from app.api.v1.cart.schemas import (
     SessionOpenResponse,
     SessionTableInfo,
 )
+from app.core.timezone import utc_now_naive
 
 #: Estados no terminales de `CustomerOrder` — mientras el comensal tenga una
 #: orden en alguno de estos, no puede crear otra (spec 024, FR-005/FR-006;
@@ -91,7 +92,7 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return utc_now_naive()
 
 
 # --------------------------------------------------------------- Apertura sesión

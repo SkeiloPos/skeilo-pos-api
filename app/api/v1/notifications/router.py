@@ -5,7 +5,6 @@ no exige `require_tenant_admin` (contracts/notifications-api.md).
 Ningún endpoint acepta un identificador de tenant como parámetro: el tenant
 sale siempre de `Depends(get_tenant)`, y las consultas ORM corren bajo el
 `schema_translate_map` de ese tenant (NFR-003)."""
-from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -25,6 +24,7 @@ from app.core.dependencies import get_current_user
 from app.core.models import User
 from app.models.notification_event import NotificationEvent
 from app.models.push_subscription import PushSubscription
+from app.core.timezone import utc_now_naive
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -85,7 +85,7 @@ def create_push_subscription(
         select(PushSubscription).where(PushSubscription.endpoint == body.endpoint)
     ).scalar_one_or_none()
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
     if existente is not None:
         # UPSERT por endpoint (único): un endpoint de push es global al
         # dispositivo/navegador, así que se reasigna al usuario/tenant
@@ -149,7 +149,7 @@ def attend_notification(
     # igual (FR-006 clarificado) — "compartido" significa una sola marca por
     # tenant, no una por usuario.
     if notification.attended_at is None:
-        notification.attended_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        notification.attended_at = utc_now_naive()
         notification.attended_by_user_id = user.id
         db.commit()
 

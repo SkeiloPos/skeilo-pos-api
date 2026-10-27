@@ -4,7 +4,7 @@ from celery import Celery
 
 from app.core.db import with_db
 from app.core.mail import send_email, create_message
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.api.v1.inventory.import_ import procesar_archivo_importacion
 from app.models.inventory_import_job import InventoryImportJob
 
@@ -38,7 +38,7 @@ def import_inventory_task(tenant_schema: str, job_id: str, filas: list[list]):
             db.rollback()
             job = db.get(InventoryImportJob, UUID(job_id))
             job.status = "interrumpido"
-            job.finished_at = utc_now().replace(tzinfo=None)
+            job.finished_at = utc_now_naive()
             db.commit()
             raise
     print(f"Import {job_id} finalizado")

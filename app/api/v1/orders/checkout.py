@@ -25,7 +25,7 @@ from app.core.order_audit import (
     hash_sensitive_or_none,
     record_order_audit_event,
 )
-from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now
+from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now, utc_now_naive
 from app.models.audit_log import AuditLog
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
@@ -981,7 +981,7 @@ def cancel_order(
             # (sin pérdida de información, Principio VII).
             pending_attempt.rejection_reason = "transferencia_no_completada"
             pending_attempt.resolved_by_user_id = actor_id
-            pending_attempt.resolved_at = utc_now()
+            pending_attempt.resolved_at = utc_now_naive()
 
         if perdidos:
             # La pérdida no genera movimiento de inventario (ya está descontada);
@@ -1050,7 +1050,7 @@ def close_participants(db: Session, ts: TableSession) -> int:
     que cobrar: no interesa que nadie siga pidiendo con un token viejo, pero cerrar
     la sesión dejaría la mesa sin forma de cobrarse.
     """
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
 
     participants = db.execute(
         select(SessionParticipant).where(
@@ -1081,7 +1081,7 @@ def close_table_sessions(
     pendientes — eso es responsabilidad de quien llama (`release_table`, el cierre
     con `billing_mode`, o el job de sesiones huérfanas, que pasa `closed_by=None`).
     """
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
 
     sessions = db.execute(
         select(TableSession).where(
@@ -1266,7 +1266,7 @@ def approve_payment_attempt(
 
         attempt.status = "confirmado"
         attempt.resolved_by_user_id = user.id
-        attempt.resolved_at = utc_now()
+        attempt.resolved_at = utc_now_naive()
         # spec 132 (FR-019, data-model.md § AuditLog): historial consultable
         # del pedido, vía `GET /orders/{order_id}/payment-events` — distinto
         # del evento solo-Sentry de spec 074 de más abajo (research.md
@@ -1399,7 +1399,7 @@ def reject_payment_attempt(
         attempt.status = "rechazado"
         attempt.rejection_reason = reason
         attempt.resolved_by_user_id = user.id
-        attempt.resolved_at = utc_now()
+        attempt.resolved_at = utc_now_naive()
         # spec 132 (FR-019/T045, data-model.md § AuditLog): historial
         # consultable del pedido — distinto del evento solo-Sentry de spec
         # 074 de más abajo (research.md Decisión 3).
@@ -1624,7 +1624,7 @@ def _confirm_cash_portion_of_mixed_attempt(
         # `cash_amount` desde `submit_cart` — esta llamada no recibe ni valida
         # ningún `amount_received` nuevo, y no calcula cambio (el pago mixto no
         # calcula cambio, ver edge cases de `spec.md`).
-        attempt.cash_confirmed_at = utc_now()
+        attempt.cash_confirmed_at = utc_now_naive()
         # spec 132 (FR-019, data-model.md § AuditLog): historial consultable.
         record_audit(
             db,
@@ -1778,7 +1778,7 @@ def confirm_cash_payment_attempt(
         attempt.change_amount = amount_received - total
         attempt.status = "confirmado"
         attempt.resolved_by_user_id = user.id
-        attempt.resolved_at = utc_now()
+        attempt.resolved_at = utc_now_naive()
         # spec 132 (FR-019, data-model.md § AuditLog): historial consultable.
         record_audit(
             db,

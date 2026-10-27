@@ -12,7 +12,7 @@ from app.core.dependencies import get_current_user, require_tenant_admin
 from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import require_module_access
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
 from app.models.inventory_import_job import InventoryImportJob
@@ -206,7 +206,7 @@ def cancel_import_job(
             f"El job {job_id} ya no está en curso (status: {job.status})",
         )
     job.status = "interrumpido"
-    job.finished_at = utc_now().replace(tzinfo=None)
+    job.finished_at = utc_now_naive()
     db.add(job)
     db.commit()
     db.refresh(job)

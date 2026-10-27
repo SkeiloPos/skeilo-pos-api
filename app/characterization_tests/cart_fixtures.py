@@ -456,7 +456,7 @@ class frozen_now:
     def __init__(self, instant: datetime, module: str = "app.api.v1.cart.service"):
         self._instant = instant
         self._module = module
-        self._patcher = None
+        self._patchers: list = []
 
     def __enter__(self) -> "frozen_now":
         instant = self._instant
@@ -466,12 +466,20 @@ class frozen_now:
             def now(cls, tz=None):
                 return instant
 
-        self._patcher = mock.patch(f"{self._module}.datetime", FixedDatetime)
-        self._patcher.start()
+        # spec 138: `utc_now()`/`utc_now_naive()` viven en `app.core.timezone` y son la única
+        # forma de pedir "ahora" (p. ej. `cart/service.py::_now` delega en ellos). El reloj fijado
+        # también tiene que cubrirlos, o el módulo parcheado y el central discreparían.
+        modulos = [self._module]
+        if self._module != "app.core.timezone":
+            modulos.append("app.core.timezone")
+        self._patchers = [mock.patch(f"{m}.datetime", FixedDatetime) for m in modulos]
+        for patcher in self._patchers:
+            patcher.start()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        self._patcher.stop()
+        for patcher in reversed(self._patchers):
+            patcher.stop()
         return False
 
 
