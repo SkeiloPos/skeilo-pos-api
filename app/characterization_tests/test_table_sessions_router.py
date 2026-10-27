@@ -37,6 +37,7 @@ from app.api.v1.table_sessions.schemas import (
     ParticipantCreateIn, SessionBillResponse, TableSessionResponse,
 )
 from app.api.v1.sales.schemas import PaymentIn
+from app.core.timezone import utc_now_naive
 
 PRECIO = Decimal("10000")
 
@@ -467,7 +468,9 @@ class TestSessionClosedNotifications(unittest.TestCase):
         # un segundo comensal abierto evita que `_abandon_expired` cierre la sesión
         from app.characterization_tests import cart_fixtures as cf
         cf.make_participant(db, table_session=ts, display_name="Beto")
-        ana.expires_at = datetime.now() - timedelta(minutes=5)
+        # Las columnas de instante se guardan en UTC: `datetime.now()` (hora local de la máquina) fallaba
+        # con `TZ=Asia/Tokyo` (spec 138, FR-012).
+        ana.expires_at = utc_now_naive() - timedelta(minutes=5)
         db.commit()
         with self._open(db, ana, ts) as qr:
             exc = self._401(qr)
@@ -476,7 +479,7 @@ class TestSessionClosedNotifications(unittest.TestCase):
 
     def test_401_por_duracion_maxima_no_lleva_la_cabecera(self):
         db, table, ts, ana = self._seed(comensal_cerrado=False)
-        ts.opened_at = datetime.now() - timedelta(days=3)
+        ts.opened_at = utc_now_naive() - timedelta(days=3)
         db.commit()
         with self._open(db, ana, ts) as qr:
             exc = self._401(qr)
