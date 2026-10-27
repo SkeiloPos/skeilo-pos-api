@@ -23,7 +23,7 @@ from app.core.timezone import utc_now_naive
 from app.models.plan import Plan
 from app.models.denomination_catalog import seed_default_denominations
 from psycopg.errors import UniqueViolation
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 
 # Import diferido (dentro de tenant_create) de app.core.plan_limits: ese
 # módulo importa get_db/get_tenant de este mismo fichero (app.core.db) para
@@ -96,7 +96,13 @@ def tenant_create(
     admin_password: str,
     plan_id: uuid.UUID,
     ciclo_facturacion: Optional[str],
+    timezone: Optional[str] = None,
 ) -> None:
+    """Crea el tenant, su esquema, el catálogo inicial y su primer administrador, todo en una transacción.
+
+    `timezone` (spec 138, FR-010): zona IANA del negocio. Con valor se asigna al `Tenant` antes del `flush`
+    (el `@validates` actúa); con `None` NO se asigna y rige el `server_default='America/Bogota'` (API y
+    scripts que no la envían)."""
     from app.core.plan_limits import calculate_plan_vencimiento, validate_billing_cycle_price
 
     with with_db(schema) as db:
@@ -118,7 +124,7 @@ def tenant_create(
             plan_iniciado_en = utc_now_naive()
             plan_vence_en = calculate_plan_vencimiento(plan_iniciado_en, ciclo_facturacion)
 
-            tenant = Tenant(
+            tenant_fields = dict(
                 name=name,
                 host=host,
                 schema=schema,
@@ -127,6 +133,9 @@ def tenant_create(
                 plan_iniciado_en=plan_iniciado_en if ciclo_facturacion is not None else None,
                 plan_vence_en=plan_vence_en,
             )
+            if timezone is not None:
+                tenant_fields["timezone"] = timezone
+            tenant = Tenant(**tenant_fields)
             db.add(tenant)
             db.flush()
 
@@ -173,6 +182,18 @@ def tenant_create(
             db.rollback()
             raise
 
+        except DataError as e:
+            # spec 138 (FR-010): el disparador de `shared.tenants` rechaza una zona que PostgreSQL no conoce
+            # (p. ej. el alias heredado `Asia/Calcutta`, que Python sí acepta) con SQLSTATE 22023. El
+            # `flush()` del `Tenant` ocurre ANTES de `CreateSchema`, en la misma transacción: no queda nada creado.
+            db.rollback()
+            zona_invalida = _http_error_for_timezone_rejection(e)
+            if zona_invalida is not None:
+                logger.warning("Alta de tenant rechazada por zona horaria inválida: schema='%s'", schema)
+                raise zona_invalida
+            logger.exception("DataError inesperado durante tenant_create")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
         except Exception as e:
             db.rollback()
             logger.exception("Unexpected error creating tenant"+str(e))
@@ -181,6 +202,22 @@ def tenant_create(
                 detail="Internal server error"
             )
     
+
+
+#: SQLSTATE con el que el disparador `trg_tenants_validate_timezone` rechaza una zona (`invalid_parameter_value`).
+SQLSTATE_INVALID_PARAMETER_VALUE = "22023"
+
+
+def _http_error_for_timezone_rejection(exc: Exception) -> Optional[HTTPException]:
+    """422 si `exc` es el rechazo del disparador de zona horaria (SQLSTATE 22023); `None` en cualquier otro caso.
+    Función pura, probable sin PostgreSQL."""
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate != SQLSTATE_INVALID_PARAMETER_VALUE:
+        return None
+    return HTTPException(
+        status_code=422,
+        detail="Zona horaria inválida: la base de datos no la reconoce. Elige una zona de la lista.",
+    )
 
 
 def get_shared_metadata():

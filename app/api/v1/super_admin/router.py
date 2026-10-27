@@ -135,6 +135,7 @@ def create_tenant(body: TenantCreateWithUser):
         admin_password=password,
         plan_id=body.plan_id,
         ciclo_facturacion=body.ciclo_facturacion,
+        timezone=body.timezone,
     )
 
     if settings.ENVIRONMENT == "prod":
