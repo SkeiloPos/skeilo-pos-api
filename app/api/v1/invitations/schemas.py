@@ -1,4 +1,3 @@
-from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -6,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.api.v1.users.schemas import RoleName
 from app.core.person_name import normalize_full_name
+from app.core.timezone import UtcDatetime
 
 
 class InvitationCreate(BaseModel):
@@ -45,6 +45,6 @@ class InvitationResponse(BaseModel):
         None, description="Nombre completo de la persona invitada; nulo en invitaciones anteriores."
     )
     role_name: str = Field(..., description="Nombre del rol asignado.")
-    sent_at: datetime = Field(..., description="Fecha del último envío (creación o reenvío).")
+    sent_at: UtcDatetime = Field(..., description="Fecha del último envío (creación o reenvío).")
 
     model_config = ConfigDict(from_attributes=True)

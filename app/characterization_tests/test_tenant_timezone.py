@@ -65,11 +65,14 @@ class TestZonaEnLasRespuestas(unittest.TestCase):
         dumped = MenuBusinessResponse.model_validate(_tenant("America/Mexico_City")).model_dump()
         self.assertEqual(dumped["timezone"], "America/Mexico_City")
 
-    def test_la_respuesta_de_tenant_incluye_la_zona(self):
+    def test_la_respuesta_de_tenant_incluye_la_zona_y_el_vencimiento_con_offset(self):
         tenant = _tenant("Asia/Tokyo")
         tenant.created_at = datetime(2026, 10, 25, 17, 0)
+        tenant.plan_vence_en = datetime(2026, 11, 1, 16, 0)
         dumped = TenantResponse.model_validate(tenant).model_dump(mode="json")
         self.assertEqual(dumped["timezone"], "Asia/Tokyo")
+        self.assertEqual(dumped["plan_vence_en"], "2026-11-01T16:00:00+00:00")
+        self.assertEqual(dumped["created_at"], "2026-10-25T17:00:00+00:00")
 
     def test_cada_fila_de_la_lista_lleva_su_propia_zona(self):
         zonas = ["America/Bogota", "America/Mexico_City", "Europe/Madrid"]

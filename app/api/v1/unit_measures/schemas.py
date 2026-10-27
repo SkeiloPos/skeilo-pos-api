@@ -1,7 +1,7 @@
 from uuid import UUID
-from datetime import datetime
 from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field
+from app.core.timezone import UtcDatetime
 
 
 class UnitMeasureCreate(BaseModel):
@@ -43,8 +43,8 @@ class UnitMeasureResponse(BaseModel):
     active: bool
     group_id: UUID
     is_base: bool
-    created_at: datetime
-    updated_at: datetime | None = None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -55,6 +55,6 @@ class FactorChangeResponse(BaseModel):
     old_factor: Decimal
     new_factor: Decimal
     changed_by: UUID
-    changed_at: datetime
+    changed_at: UtcDatetime
 
     model_config = ConfigDict(from_attributes=True)

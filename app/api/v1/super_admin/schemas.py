@@ -1,4 +1,3 @@
-from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional
@@ -75,8 +74,8 @@ class PaymentMethodCatalogResponse(BaseModel):
     type: str
     active: bool
     fields: list[PaymentMethodFieldDefinition]
-    created_at: datetime
-    updated_at: datetime | None = None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -102,11 +101,11 @@ class TenantResponse(BaseModel):
     ciclo_facturacion: Optional[Literal["mensual", "anual"]] = Field(
         None, description="Ciclo de facturación de la asignación vigente (spec 033)."
     )
-    plan_vence_en: Optional[datetime] = Field(
+    plan_vence_en: Optional[UtcDatetime] = Field(
         None, description="Vencimiento de la asignación vigente; `null` = sin vencimiento (spec 033)."
     )
-    created_at: datetime = Field(..., description="Fecha de creación del registro.")
-    updated_at: datetime | None = Field(None, description="Fecha de la última actualización.")
+    created_at: UtcDatetime = Field(..., description="Fecha de creación del registro.")
+    updated_at: UtcDatetime | None = Field(None, description="Fecha de la última actualización.")
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -189,8 +188,8 @@ class PlanResponse(BaseModel):
     precio_mensual: Optional[Decimal] = None
     precio_anual: Optional[Decimal] = None
 
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    created_at: UtcDatetime
+    updated_at: Optional[UtcDatetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
