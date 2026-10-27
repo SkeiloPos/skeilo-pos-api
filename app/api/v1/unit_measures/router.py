@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.core.db import get_db
 from app.core.dependencies import get_current_user
-from app.core.crud import get_or_404, ensure_unique
+from app.core.crud import get_or_404, ensure_unique_ci
 from app.core.models import User
 from app.core.plan_limits import require_module_access
 from app.models.unit_measure import UnitMeasure
@@ -75,11 +75,11 @@ def get_unit_measure(
     response_model=UnitMeasureResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Crear una unidad de medida",
-    description="Crea una nueva unidad de medida. La abreviatura debe ser única.",
+    description="Crea una nueva unidad de medida. El nombre debe ser único.",
     response_description="La unidad de medida creada.",
     responses={
         401: {"description": "No autenticado o token inválido."},
-        409: {"description": "Ya existe una unidad de medida con esa abreviatura."},
+        409: {"description": "Ya existe una unidad de medida con ese nombre."},
         422: {"description": "Datos de entrada inválidos."},
     },
 )
@@ -91,8 +91,8 @@ def create_unit_measure(
     # Retirado del flujo normal (spec 137, contracts/unit-measures-api.md): toda unidad
     # nace en un grupo; se mantiene por compatibilidad con integraciones existentes.
     group = get_or_404(db, UnitMeasureGroup, body.group_id, "Unit measure group not found")
-    ensure_unique(db, UnitMeasure, UnitMeasure.name, body.name, "Unit measure name already exists")
-    ensure_unique(db, UnitMeasure, UnitMeasure.abbreviation, body.abbreviation, "Unit measure abbreviation already exists")
+    # spec 140: solo el nombre es único (la abreviatura puede repetirse libremente).
+    ensure_unique_ci(db, UnitMeasure, UnitMeasure.name, body.name, "Unit measure name already exists")
 
     unit_measure = UnitMeasure(
         name=body.name,
@@ -116,7 +116,7 @@ def create_unit_measure(
     responses={
         401: {"description": "No autenticado o token inválido."},
         404: {"description": "La unidad de medida no existe."},
-        409: {"description": "Ya existe una unidad de medida con esa abreviatura."},
+        409: {"description": "Ya existe una unidad de medida con ese nombre, o está en uso y se intentó renombrar."},
         422: {"description": "Datos de entrada inválidos."},
     },
 )
@@ -141,11 +141,11 @@ def update_unit_measure(
         )
 
     if body.abbreviation is not None and body.abbreviation != unit_measure.abbreviation:
-        ensure_unique(db, UnitMeasure, UnitMeasure.abbreviation, body.abbreviation, "Unit measure abbreviation already exists")
+        # spec 140: la abreviatura puede repetirse libremente -- sin chequeo de unicidad.
         unit_measure.abbreviation = body.abbreviation
 
     if body.name is not None:
-        ensure_unique(db, UnitMeasure, UnitMeasure.name, body.name, "Unit measure name already exists", exclude_id=unit_measure.id)
+        ensure_unique_ci(db, UnitMeasure, UnitMeasure.name, body.name, "Unit measure name already exists", exclude_id=unit_measure.id)
         unit_measure.name = body.name
 
     # Cambiar factor_to_base exige rol ADMIN (spec 134, FR-011a): se evalúa primero la

@@ -129,15 +129,35 @@ class SupplierItemCreate(BaseModel):
 
     Las dos rutas de creación (desde el insumo o desde el proveedor) fijan uno de los dos
     ids por la URL; el que falte aquí se completa con el de la ruta.
-    """
+
+    spec 140: la "presentación" de compra ahora se elige entre las `UnitMeasure` del mismo
+    grupo que la unidad base del insumo (`unit_measure_id`) -- ya no se captura como texto
+    libre + factor escrito a mano. Se conserva el modo legado (`presentation` +
+    `conversion_factor`) solo para no romper integraciones existentes; el formulario de la
+    app ya no lo usa para crear relaciones nuevas."""
     supplier_id: UUID | None = None
     inventory_item_id: UUID | None = None
-    presentation: str = Field(..., min_length=1, max_length=100, examples=["Bolsa x 500 g"])
-    conversion_factor: Decimal = Field(..., max_digits=12, decimal_places=3)
+    unit_measure_id: UUID | None = None
+    presentation: str | None = Field(None, min_length=1, max_length=100, examples=["Bolsa x 500 g"])
+    conversion_factor: Decimal | None = Field(None, max_digits=12, decimal_places=3)
     last_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _exactly_one_mode(self):
+        has_unit = self.unit_measure_id is not None
+        has_legacy = self.presentation is not None or self.conversion_factor is not None
+        if has_unit and has_legacy:
+            raise ValueError("indica unit_measure_id o presentation/conversion_factor, no ambos")
+        if not has_unit:
+            if self.presentation is None:
+                raise ValueError("presentation es obligatorio cuando no se indica unit_measure_id")
+            if self.conversion_factor is None:
+                raise ValueError("conversion_factor es obligatorio cuando no se indica unit_measure_id")
+        return self
 
 
 class SupplierItemUpdate(BaseModel):
+    unit_measure_id: UUID | None = None
     presentation: str | None = Field(None, min_length=1, max_length=100)
     conversion_factor: Decimal | None = Field(None, max_digits=12, decimal_places=3)
     last_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
@@ -151,6 +171,10 @@ class SupplierItemResponse(BaseModel):
     supplier_name: str
     inventory_item_id: UUID
     inventory_item_name: str
+    # spec 140: cuando la relación está vinculada a una `UnitMeasure`, estos dos campos
+    # reflejan sus valores EN VIVO (nombre/factor_to_base), no un texto/número guardado
+    # aparte -- ver `SupplierItem.effective_presentation`/`effective_conversion_factor`.
+    unit_measure_id: UUID | None = None
     # Opcionales (spec 138): una relación creada por import de inventario desde la columna
     # Proveedor preferido no trae presentación/factor -- el admin la completa después.
     presentation: str | None = None
@@ -213,6 +237,57 @@ class PurchaseCreate(BaseModel):
     items: list[PurchaseItemIn] = Field(..., min_length=1)
 
 
+class PurchaseOrderItemIn(BaseModel):
+    """Como `PurchaseItemIn`, pero sin su `model_validator`: cuando el padre
+    (`PurchaseOrderCreate`) trae `allow_incomplete=True` (spec 140, FR-013, "Guardar
+    borrador"), una línea puede llegar sin `quantity`, sin `unit_cost` o sin ningún modo
+    (`supplier_item_id`/`unit_measure_id`) resuelto todavía -- la validación de "exactamente
+    un modo" se reaplica en `PurchaseOrderCreate` solo cuando `allow_incomplete=False`."""
+    inventory_item_id: UUID
+    quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
+    unit_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+    supplier_item_id: UUID | None = None
+    presentation_quantity: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=3)
+    presentation_unit_cost: Decimal | None = Field(None, ge=0, max_digits=12, decimal_places=2)
+    unit_measure_id: UUID | None = None
+
+
+class PurchaseOrderCreate(BaseModel):
+    """`POST /purchases/order` (spec 140 MODIFICADO): `allow_incomplete` es aditivo y
+    retrocompatible -- ausente o `false` conserva exactamente el comportamiento de
+    `PurchaseCreate` (User Story 2, orden de compra pendiente); `true` permite guardar una
+    captura parcial, incluso sin ninguna línea (User Story 3, "Guardar borrador")."""
+    supplier_id: UUID | None = None
+    invoice_number: str | None = Field(None, max_length=100)
+    items: list[PurchaseOrderItemIn] = Field(default_factory=list)
+    allow_incomplete: bool = False
+
+    @model_validator(mode="after")
+    def _validate_unless_incomplete(self):
+        if self.allow_incomplete:
+            return self
+        if len(self.items) < 1:
+            raise ValueError("items debe tener al menos 1 elemento")
+        for it in self.items:
+            if it.supplier_item_id is not None:
+                if it.presentation_quantity is None:
+                    raise ValueError(
+                        "presentation_quantity es obligatorio cuando se indica supplier_item_id"
+                    )
+                if it.quantity is not None:
+                    raise ValueError("no se puede indicar quantity junto con supplier_item_id")
+                if it.unit_measure_id is not None:
+                    raise ValueError("no se puede indicar unit_measure_id junto con supplier_item_id")
+            elif it.unit_measure_id is not None:
+                if it.quantity is None:
+                    raise ValueError("quantity es obligatorio cuando se indica unit_measure_id")
+                if it.unit_cost is None or it.unit_cost <= 0:
+                    raise ValueError("La cantidad debe ser mayor que cero")
+            elif it.quantity is None:
+                raise ValueError("quantity es obligatorio cuando no se indica supplier_item_id")
+        return self
+
+
 class PurchaseItemResponse(BaseModel):
     id: UUID
     inventory_item_id: UUID
@@ -240,6 +315,7 @@ class PurchaseResponse(BaseModel):
     supplier_id: UUID | None = None
     invoice_number: str | None = None
     status: str
+    is_incomplete: bool = False
     total: Decimal
     purchased_at: UtcDatetime
     voided_at: UtcDatetime | None = None
