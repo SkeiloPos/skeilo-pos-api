@@ -66,6 +66,8 @@ def _dispatch_password_changed_email(user: User, when) -> None:
             url_ingreso=_build_login_url_for_user(user),
             es_super_admin=user.tenant_id is None,
             nombre_negocio=user.tenant_name,
+            # spec 138 (FR-011): la hora del aviso en la zona del negocio, no siempre en Bogotá.
+            zona_horaria=user.tenant.timezone if user.tenant_id is not None else None,
         )
         send_email_task.delay(
             recipients=[user.email],
