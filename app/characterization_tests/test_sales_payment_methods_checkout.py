@@ -110,6 +110,27 @@ class TestSalesPaymentMethodsCheckout(unittest.TestCase):
 
         self.assertEqual(service.list_available_payment_methods(db), [])
 
+    # ---------------------------------------------------------- spec 140
+
+    def test_pago_mixto_no_aparece_disponible_para_cobrar_en_caja(self):
+        """spec 140: el panel de cobro de caja y "Registrar ingreso" de Cajas
+        consumen esta misma consulta (`available=true`) y ya arman un pago
+        mixto agregando varias líneas de método real -- una fila "Pago
+        mixto" ahí no aporta nada. El menú QR usa otro endpoint
+        (`GET /cart/payment-methods`) y no se ve afectado por este filtro."""
+        db = fx.new_session()
+        fx.make_payment_method(
+            db, name="Efectivo", type="cash", is_cash=True, is_complete=True, active=True,
+        )
+        fx.make_payment_method(
+            db, name="Pago mixto", type="mixed", is_cash=False, is_complete=True, active=True,
+        )
+        db.commit()
+
+        names = {m.name for m in service.list_available_payment_methods(db)}
+        self.assertEqual(names, {"Efectivo"})
+        self.assertNotIn("Pago mixto", names)
+
 
 if __name__ == "__main__":
     unittest.main()
