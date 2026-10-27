@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import io
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
 from uuid import UUID
@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
 from app.characterization_tests import fixtures as f
+from app.characterization_tests.cart_fixtures import frozen_now
 from app.characterization_tests import plan_fixtures as pf
 from app.api.v1.inventory.router import router as inventory_router
 from app.api.v1.inventory import import_ as import_service
@@ -738,6 +739,37 @@ class ImportPreferredSupplierTests(unittest.TestCase):
         )
         self.assertFalse(resultado["ok"])
         self.assertIn("más de una relación", resultado["motivo"])
+
+
+class ExportFilenameDiaLocalTests(unittest.TestCase):
+    """spec 138, Historia 3 (FR-007, A-147): el día del nombre del archivo es el día LOCAL del tenant,
+    no el del servidor (`date.today()`) ni el UTC. A las 20:00 de Bogotá el día UTC ya es el siguiente."""
+
+    def setUp(self):
+        self.db = _new_session()
+        self.tenant = _con_modulo_inventario(self.db)
+        self.admin = pf.make_user(self.db, self.tenant, role_name="ADMIN")
+        self.db.commit()
+        self.client = _build_client(self.db, self.tenant, self.admin)
+
+    def _nombre_del_archivo(self, zona: str, instante: datetime) -> str:
+        self.tenant.timezone = zona
+        with frozen_now(instante, module="app.core.timezone"):
+            resp = self.client.get("/api/v1/inventory/items/export")
+        self.assertEqual(resp.status_code, 200)
+        return resp.headers["content-disposition"]
+
+    def test_el_nombre_lleva_el_dia_local_del_tenant(self):
+        # 2026-10-26 01:00Z = 20:00 del 25/10 en Bogotá y 02:00 del 26/10 en Madrid (UTC+1).
+        instante = datetime(2026, 10, 26, 1, 0, tzinfo=timezone.utc)
+        self.assertIn('filename="inventario_2026-10-25.xlsx"', self._nombre_del_archivo("America/Bogota", instante))
+        self.assertIn('filename="inventario_2026-10-25.xlsx"', self._nombre_del_archivo("America/Mexico_City", instante))
+        self.assertIn('filename="inventario_2026-10-26.xlsx"', self._nombre_del_archivo("Europe/Madrid", instante))
+
+    def test_no_depende_de_la_hora_a_la_que_se_ejecute_la_prueba(self):
+        # A mediodía de Bogotá el día UTC y el local coinciden: el nombre es el mismo en ambos enfoques.
+        instante = datetime(2026, 10, 25, 17, 0, tzinfo=timezone.utc)
+        self.assertIn('filename="inventario_2026-10-25.xlsx"', self._nombre_del_archivo("America/Bogota", instante))
 
 
 if __name__ == "__main__":

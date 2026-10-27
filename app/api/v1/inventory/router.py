@@ -1,4 +1,3 @@
-from datetime import date
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -12,7 +11,7 @@ from app.core.dependencies import get_current_user, require_tenant_admin
 from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import require_module_access
-from app.core.timezone import utc_now_naive
+from app.core.timezone import business_today, utc_now_naive
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
 from app.models.inventory_import_job import InventoryImportJob
@@ -81,13 +80,15 @@ def low_stock(
 @router.get("/items/export", summary="Exportar el inventario completo a .xlsx")
 def export_items(
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     _: User = Depends(require_tenant_admin),
 ):
     items = service.list_all_items_for_export(db)
     unit_measures_by_id = {u.id: u for u in db.execute(select(UnitMeasure)).scalars().all()}
     preferred_by_item = supplier_items.preferred_relations_by_item(db, [i.id for i in items])
     buffer = build_inventory_excel(items, unit_measures_by_id, preferred_by_item)
-    filename = f"inventario_{date.today().isoformat()}.xlsx"
+    # spec 138 (A-147): el día del nombre es el día local del tenant, no el del servidor.
+    filename = f"inventario_{business_today(tenant).isoformat()}.xlsx"
     return Response(
         content=buffer.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

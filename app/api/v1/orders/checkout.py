@@ -25,7 +25,7 @@ from app.core.order_audit import (
     hash_sensitive_or_none,
     record_order_audit_event,
 )
-from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now, utc_now_naive
+from app.core.timezone import business_today, local_day_bounds_utc, resolve_timezone, utc_now, utc_now_naive
 from app.models.audit_log import AuditLog
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
@@ -1422,7 +1422,9 @@ def reject_payment_attempt(
         dining_table_id = order.dining_table_id if order is not None else None
         if dining_table_id is not None:
             tz = resolve_timezone(tenant)
-            start_utc, end_utc = local_day_bounds_utc(utc_now().date(), tz)
+            # spec 138 (A-147): «el día» es el día LOCAL del tenant; `utc_now().date()` ya era el día
+            # siguiente entre las 19:00 y las 24:00 de Bogotá y dejaba la ventana vacía.
+            start_utc, end_utc = local_day_bounds_utc(business_today(tenant), tz)
             rejection_count_today = db.execute(
                 select(func.count(OrderPaymentAttempt.id))
                 .join(CustomerOrder, CustomerOrder.id == OrderPaymentAttempt.order_id)
