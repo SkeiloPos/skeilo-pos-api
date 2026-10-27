@@ -31,7 +31,9 @@ from sqlalchemy import case, func, insert, select, union_all
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import ColumnElement, Select
 
-from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now
+# `business_today` vive en `app.core.timezone` desde la spec 138; se reimporta aquí para que
+# `cash/router.py` y `_period_bounds` sigan llamándola como `reports.business_today(tenant)`.
+from app.core.timezone import business_today, local_day_bounds_utc, resolve_timezone
 from app.models.cash_shift import CashShift
 from app.models.category import Category
 from app.models.payment import Payment, PaymentMethod
@@ -366,12 +368,6 @@ def _category_breakdown(db: Session, selector: ShiftSelector) -> list[dict]:
         }
         for cid, nm, units, rev in rows
     ]
-
-
-def business_today(tenant) -> date:
-    """"Hoy" en la zona horaria del tenant (mismo mecanismo central de
-    `app/core/timezone.py` que usa `reports/service.py`)."""
-    return utc_now().astimezone(resolve_timezone(tenant)).date()
 
 
 def _week_bounds(day: date) -> tuple[date, date]:

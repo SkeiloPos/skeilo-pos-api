@@ -321,6 +321,17 @@ def make_tenant_stub(**kw):
     return SimpleNamespace(**kw)
 
 
+# spec 138 (FR-012): las pruebas de reglas que dependen de la hora se parametrizan con tres zonas
+# de tenant —Bogotá (UTC−5, sin horario de verano), Ciudad de México (UTC−6) y Madrid (UTC+1/+2)—
+# para que ninguna pase solo porque el desarrollo, el servidor y el tenant compartan la zona.
+ZONAS_DE_PRUEBA = ("America/Bogota", "America/Mexico_City", "Europe/Madrid")
+
+
+def tenant_en(zona: str):
+    """`tenant` mínimo con la zona dada: `resolve_timezone` solo lee `tenant.timezone`."""
+    return make_tenant_stub(timezone=zona)
+
+
 def make_option(db: Session, group: OptionGroup | None = None, **kw) -> Option:
     if group is None:
         group = make_option_group(db)
