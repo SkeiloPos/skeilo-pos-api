@@ -89,6 +89,7 @@ _CATALOG_TABLE_NAMES = [
     "inventory_items",
     "inventory_movements",
     "unit_measures",
+    "unit_measure_groups",  # FK obligatoria de `unit_measures.group_id` (grupos de unidades)
 ]
 
 _CART_TABLE_NAMES = [

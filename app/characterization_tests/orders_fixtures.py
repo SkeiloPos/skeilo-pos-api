@@ -102,6 +102,7 @@ _CATALOG_TABLE_NAMES = [
     "inventory_items",
     "inventory_movements",
     "unit_measures",
+    "unit_measure_groups",  # `unit_measures.group_id` es FK obligatoria desde la spec 137 (grupos de unidades)
 ]
 
 # data-model.md §Esquema SQLite: cierre transitivo real de lo que las 23
