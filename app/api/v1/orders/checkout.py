@@ -1216,6 +1216,7 @@ def approve_payment_attempt(
     user: User,
     request_id: str | None = None,
     receipt_file_url: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """Aprueba un comprobante de transferencia (US2, Acceptance Scenario 4).
 
@@ -1302,7 +1303,8 @@ def approve_payment_attempt(
             # congelado del pedido (el flujo QR también lo congela — research.md D2).
             instant = promotion_evaluation_instant([order], now=utc_now())
             lines = order_sale_lines(db, order.id)
-            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+            # spec 138 (FR-006): la vigencia se evalúa en la zona del tenant dueño del cobro.
+            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
             # Spec 056, research.md Decisión 5: el domicilio debe quedar incluido
             # en el ÚNICO pago que se autogenera aquí — de lo contrario queda
             # corto exactamente en ese valor y el propio chequeo `paid < total`
@@ -1479,6 +1481,7 @@ def adjust_split_payment_attempt(
     transfer_method_id: UUID | None,
     payment_method_id: UUID | None,
     user: User,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """Reajusta la división efectivo/transferencia de un intento `pendiente`
     al confirmar (spec 132, FR-013/014), incluyendo convertir un intento 100%
@@ -1495,7 +1498,8 @@ def adjust_split_payment_attempt(
     transfer_amount = Decimal(transfer_amount)
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
-        total = compute_checkout_preview(db, attempt.order_id).total
+        # spec 138 (FR-006): el mismo total (con promoción en la zona del tenant) que mostró la vista previa.
+        total = compute_checkout_preview(db, attempt.order_id, tenant).total
         if cash_amount + transfer_amount != total:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -1590,6 +1594,7 @@ def _confirm_cash_portion_of_mixed_attempt(
     cash_shift_id: UUID,
     user: User,
     request_id: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """`POST /payment-attempts/{id}/confirm-cash` sobre un intento mixto
     (spec 130, research.md Decisión 4). Fija `cash_confirmed_at` en vez de
@@ -1647,7 +1652,7 @@ def _confirm_cash_portion_of_mixed_attempt(
 
             instant = promotion_evaluation_instant([order], now=utc_now())
             lines = order_sale_lines(db, order.id)
-            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
             delivery_fee = order.delivery_fee or Decimal("0")
             total = (
                 sum((line.line_total for line in lines), Decimal("0"))
@@ -1711,6 +1716,7 @@ def confirm_cash_payment_attempt(
     cash_shift_id: UUID,
     user: User,
     request_id: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """Confirma un pago en efectivo y calcula el cambio (FR-009/FR-010,
     US3). FR-010a: impide confirmar si `amount_received < total_orden`.
@@ -1748,7 +1754,7 @@ def confirm_cash_payment_attempt(
         select(OrderPaymentAttempt.cash_amount).where(OrderPaymentAttempt.id == attempt_id)
     ).scalar_one_or_none() is not None
     if is_mixed:
-        return _confirm_cash_portion_of_mixed_attempt(db, attempt_id, cash_shift_id, user, request_id)
+        return _confirm_cash_portion_of_mixed_attempt(db, attempt_id, cash_shift_id, user, request_id, tenant)
 
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
@@ -1762,7 +1768,7 @@ def confirm_cash_payment_attempt(
         # spec 073, US7 (FR-023, research.md D13): el `Total` real con descuento
         # por promoción (instante congelado) y domicilio — la misma cuenta
         # autoritativa que el panel muestra y que `build_sale` registrará.
-        total = compute_checkout_preview(db, attempt.order_id).total
+        total = compute_checkout_preview(db, attempt.order_id, tenant).total
         if amount_received < total:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1799,7 +1805,7 @@ def confirm_cash_payment_attempt(
         # congelado del pedido.
         instant = promotion_evaluation_instant([order], now=utc_now())
         lines = order_sale_lines(db, order.id)
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
 
         build_sale(
             db,

@@ -392,11 +392,15 @@ def make_payment_method(db: Session, **kw) -> PaymentMethod:
 
 # --------------------------------------------------------- Dobles de prueba (router)
 
-def make_tenant_double(*, id: int = 1, invoice_prefix: str = "") -> SimpleNamespace:
+def make_tenant_double(
+    *, id: int = 1, invoice_prefix: str = "", timezone: str = "America/Bogota",
+) -> SimpleNamespace:
     """No es el modelo `Tenant` real (schema `shared`, fuera de las tablas creadas
-    por este fixture) — basta con los dos atributos que `table_sessions/router.py`
-    y `service.py` leen de él (research.md §1)."""
-    return SimpleNamespace(id=id, invoice_prefix=invoice_prefix)
+    por este fixture) — basta con los atributos que `table_sessions/router.py`
+    y `service.py` leen de él (research.md §1). `timezone` (spec 138, FR-006): el cobro ahora
+    reenvía el tenant al motor de promociones (`resolve_timezone`), que lee este atributo; un
+    `Tenant` real siempre lo tiene (mismo precedente que `build_session_context`, spec 127)."""
+    return SimpleNamespace(id=id, invoice_prefix=invoice_prefix, timezone=timezone)
 
 
 def make_user_double(*, id=None, name: str = "Cajero de prueba") -> SimpleNamespace:
