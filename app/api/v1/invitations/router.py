@@ -14,7 +14,7 @@ from app.core.mail_templates import ErrorDePlantillaDeCorreo, construir_correo_i
 from app.core.models import Role, Tenant, User, UserInvitation
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import enforce_plan_limit
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.core.utils import generate_passwd_hash, generate_random_password
 from app.api.v1.invitations.schemas import InvitationCreate, InvitationResponse
 
@@ -244,7 +244,7 @@ def resend_invitation(
         )
 
     invitation.password_hash = generate_passwd_hash(password)
-    invitation.sent_at = utc_now().replace(tzinfo=None)
+    invitation.sent_at = utc_now_naive()
     db.commit()
     db.refresh(invitation)
     return invitation
@@ -271,7 +271,7 @@ def cancel_invitation(
     invitation = _get_pending_invitation_for_tenant(db, admin, invitation_id)
 
     invitation.status = "cancelled"
-    invitation.cancelled_at = utc_now().replace(tzinfo=None)
+    invitation.cancelled_at = utc_now_naive()
     db.commit()
     db.refresh(invitation)
     return invitation

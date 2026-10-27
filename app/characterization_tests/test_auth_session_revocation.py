@@ -8,7 +8,7 @@ contraseña exitoso — por cualquiera de los dos flujos.
 """
 import asyncio
 import unittest
-from datetime import timedelta
+from datetime import timedelta, timezone
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -101,7 +101,9 @@ class AuthSessionRevocationTests(unittest.TestCase):
         # Token con el mismo `iat` (segundo) que tokens_valid_after, pero
         # microsegundos antes en el reloj real — simulable fijando `iat` a mano.
         claims = self._claims()
-        claims["iat"] = int(now.timestamp())
+        # `now` es un naive en UTC: `now.timestamp()` lo leería como hora LOCAL de la máquina (con
+        # `TZ=Asia/Tokyo` daba un `iat` 9 h en el pasado). Se fija su zona UTC antes de convertir (spec 138, FR-012).
+        claims["iat"] = int(now.replace(tzinfo=timezone.utc).timestamp())
 
         user = get_current_user(token_data=claims, db=self.db, tenant=self.tenant)
         self.assertEqual(user.id, self.user.id)

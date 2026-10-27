@@ -1,6 +1,5 @@
 from enum import Enum
 from uuid import UUID
-from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -11,6 +10,7 @@ from app.api.v1.catalog.schemas import (
     RecipeItemResponse,
     VariantOptionGroupResponse,
 )
+from app.core.timezone import UtcDatetime
 
 
 class PreparationType(str, Enum):
@@ -139,15 +139,15 @@ class ProductResponse(BaseModel):
     # spec 093 (FR-013, data-model.md): quién marcó/desmarcó `available` por última
     # vez y cuándo. `None` = nunca se tocó el interruptor dedicado (incluye todo
     # producto creado antes de esta spec).
-    available_changed_at: datetime | None = None
+    available_changed_at: UtcDatetime | None = None
     available_changed_by_name: str | None = None
     tracks_inventory: bool
     # spec 129: valores ya resueltos (nunca `null`) -- el default calculado de
     # `visible_en_qr` se aplica en servicio antes de llegar a esta respuesta.
     is_topping: bool = False
     visible_en_qr: bool = True
-    created_at: datetime
-    updated_at: datetime | None = None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

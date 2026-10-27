@@ -1,6 +1,6 @@
 from uuid import UUID
-from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
+from app.core.timezone import UtcDatetime
 
 
 class PresentationSummary(BaseModel):
@@ -81,8 +81,8 @@ class CategoryResponse(BaseModel):
         ..., description="Indica si la categoría es visible en el menú QR.", examples=[True],
     )
     display_order: int = Field(..., description="Posición en el filtro del menú QR.", examples=[10])
-    created_at: datetime = Field(..., description="Fecha de creación del registro.")
-    updated_at: datetime | None = Field(None, description="Fecha de la última actualización.")
+    created_at: UtcDatetime = Field(..., description="Fecha de creación del registro.")
+    updated_at: UtcDatetime | None = Field(None, description="Fecha de la última actualización.")
     presentations: list[PresentationSummary] = Field(
         default_factory=list,
         description="Presentaciones del catálogo global asociadas actualmente a esta categoría (spec 083, FR-004).",

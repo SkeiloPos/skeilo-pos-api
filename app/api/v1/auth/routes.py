@@ -19,7 +19,7 @@ from app.core.dependencies import RefreshTokenBearer,AccessTokenBearer, get_auth
 from app.core.dependencies import get_shared_db, _reject_if_session_revoked
 from app.core.rate_limit import enforce_sliding_window
 from app.core.mail_templates import construir_correo_contrasena_cambiada, construir_correo_restablecimiento
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.celery_task import send_email_task
 from app.api.v1.auth.schemas import (
     LoginRequest,
@@ -66,6 +66,8 @@ def _dispatch_password_changed_email(user: User, when) -> None:
             url_ingreso=_build_login_url_for_user(user),
             es_super_admin=user.tenant_id is None,
             nombre_negocio=user.tenant_name,
+            # spec 138 (FR-011): la hora del aviso en la zona del negocio, no siempre en Bogotá.
+            zona_horaria=user.tenant.timezone if user.tenant_id is not None else None,
         )
         send_email_task.delay(
             recipients=[user.email],
@@ -110,7 +112,7 @@ def _resolve_reset_token(db: Session, raw_token: str, *, lock: bool = False):
         return row, user, "invalid"
     if user is None or user.email != row.email_snapshot:
         return row, user, "invalid"
-    if utc_now().replace(tzinfo=None) >= row.expires_at:
+    if utc_now_naive() >= row.expires_at:
         return row, user, "expired"
 
     return row, user, None
@@ -149,7 +151,7 @@ def _consume_invitation_if_valid(db: Session, tenant: Tenant, email: str, passwo
     )
     db.add(new_user)
     invitation.status = "consumed"
-    invitation.consumed_at = utc_now().replace(tzinfo=None)
+    invitation.consumed_at = utc_now_naive()
     db.commit()
     db.refresh(new_user)
     return new_user
@@ -281,7 +283,7 @@ async def forgot_password(
     if not user:
         return JSONResponse(content=_FORGOT_PASSWORD_GENERIC_MESSAGE)
 
-    now = utc_now().replace(tzinfo=None)
+    now = utc_now_naive()
 
     # Un enlace nuevo invalida de inmediato cualquier enlace vigente anterior
     # de la misma cuenta (FR-005) — a lo sumo un `vigente` por cuenta.
@@ -362,7 +364,7 @@ def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_shared_
             detail="La nueva contraseña debe ser distinta de la actual",
         )
 
-    now = utc_now().replace(tzinfo=None)
+    now = utc_now_naive()
     user.password_hash = generate_passwd_hash(body.new_password)
     user.must_change_password = False  # mismo criterio que RN-AUTH-02
     user.tokens_valid_after = now  # cierra TODAS las sesiones de la cuenta (FR-009)
@@ -392,7 +394,7 @@ def change_password(
             detail="La nueva contraseña debe ser distinta de la actual",
         )
 
-    now = utc_now().replace(tzinfo=None)
+    now = utc_now_naive()
     user.password_hash = generate_passwd_hash(body.new_password)
     user.must_change_password = False
     # Cierra todas las sesiones de la cuenta excepto la de origen (FR-017): el

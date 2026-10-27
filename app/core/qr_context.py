@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.db import resolve_tenant_by_id, with_db
 from app.core.models import Tenant
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.core.qr_token import (
     QrTokenError,
     SessionExpiredError,
@@ -88,7 +88,7 @@ def close_participant(db: Session, participant) -> None:
 
     participant.status = "closed"
     if participant.closed_at is None:
-        participant.closed_at = utc_now().replace(tzinfo=None)
+        participant.closed_at = utc_now_naive()
     for cart in db.execute(
         select(Cart).where(
             Cart.participant_id == participant.id, Cart.status == "abierto"
@@ -191,7 +191,7 @@ def open_session_context(token: str, *, touch: bool = True) -> Iterator[SessionC
                 headers={SESSION_STATE_HEADER: "closed"},
             )
 
-        now = utc_now().replace(tzinfo=None)
+        now = utc_now_naive()
 
         if participant.expires_at is not None and participant.expires_at <= now:
             _abandon_expired(db, participant, tenant)

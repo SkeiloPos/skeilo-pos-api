@@ -5,6 +5,7 @@ La apertura no tiene endpoint propio: una sesión de mesa nace cuando el primer
 comensal escanea el QR (`POST /cart/sessions`). Aquí se consulta, se cobra y se
 cierra.
 """
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -100,7 +101,7 @@ def set_assignments(
     """Devuelve la cuenta ya recalculada: el POS necesita el desglose nuevo justo
     después de repartir, y pedirlo aparte abriría una ventana de inconsistencia."""
     return service.set_assignments(db, table_session_id, body.assignments,
-                                   tenant_id=tenant.id)
+                                   tenant_id=tenant.id, tenant=tenant)
 
 
 @router.get(
@@ -112,10 +113,13 @@ def session_bill(
     table_session_id: UUID,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
+    # `Annotated` + `None` (no `= Depends(...)`): `test_session_bill_endpoint_delega_en_compute_bill`
+    # (CONGELA) invoca esta función directo, sin `tenant`; por HTTP FastAPI resuelve la dependencia.
+    tenant: Annotated[Tenant, Depends(get_tenant)] = None,
 ):
     """El desglose sale de `order_items.participant_id`, que es asignación por
     ítem: el reparto es exacto aunque un pedido mezcle comensales."""
-    return service.compute_bill(db, table_session_id)
+    return service.compute_bill(db, table_session_id, tenant)
 
 
 @router.post(
@@ -136,6 +140,7 @@ def close_session(
         db, table_session_id, body, user,
         invoice_prefix=tenant.invoice_prefix or "",
         tenant_id=tenant.id,
+        tenant=tenant,
     )
 
 

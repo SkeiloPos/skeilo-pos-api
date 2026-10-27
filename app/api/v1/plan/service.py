@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 
 from app.core.models import Tenant
 from app.core.plan_limits import RESOURCE_CONFIG, count_resource_usage
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.plan import Plan
 
 
@@ -21,7 +21,7 @@ def build_plan_summary(db: Session, tenant: Tenant) -> dict:
             "limit": getattr(plan, config.limit_column),
         }
 
-    vencido = tenant.plan_vence_en is not None and tenant.plan_vence_en < utc_now().replace(tzinfo=None)
+    vencido = tenant.plan_vence_en is not None and tenant.plan_vence_en < utc_now_naive()
 
     return {
         "plan_name": plan.name,

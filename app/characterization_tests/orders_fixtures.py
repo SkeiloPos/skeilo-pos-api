@@ -64,6 +64,7 @@ __all__ = [
 from app.core.models import Base
 import app.models  # noqa: F401 - ya registrado vía fixtures.py; se repite por claridad
 
+from app.core.timezone import utc_now_naive
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
 from app.models.session_participant import SessionParticipant
@@ -102,6 +103,7 @@ _CATALOG_TABLE_NAMES = [
     "inventory_items",
     "inventory_movements",
     "unit_measures",
+    "unit_measure_groups",  # `unit_measures.group_id` es FK obligatoria desde la spec 137 (grupos de unidades)
 ]
 
 # data-model.md §Esquema SQLite: cierre transitivo real de lo que las 23
@@ -535,7 +537,9 @@ def make_payment_attempt(
     kw.setdefault("order_id", order.id)
     kw.setdefault("payment_method_id", method.id)
     kw.setdefault("status", "pendiente")
-    kw.setdefault("created_at", datetime.now())
+    # spec 138: UTC como en producción (antes `datetime.now()`, la hora LOCAL de la máquina), y por el
+    # reloj central para que `frozen_now(instante, module="app.core.timezone")` también fije este valor.
+    kw.setdefault("created_at", utc_now_naive())
     obj = OrderPaymentAttempt(**kw)
     db.add(obj)
     db.flush()

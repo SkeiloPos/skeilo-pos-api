@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
 from app.core.crud import get_or_404
+from app.core.models import Tenant
 from app.models.dining_table import DiningTable
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import EN_CURSO
@@ -129,7 +130,7 @@ def merge_orders(db: Session, order_ids: list[UUID]) -> dict:
     return {"merged_group_id": group_id, "order_ids": [o.id for o in orders]}
 
 
-def group_bill(db: Session, group_id: UUID) -> dict:
+def group_bill(db: Session, group_id: UUID, *, tenant: Tenant | None = None) -> dict:
     """Cuenta consolidada de un grupo de mesas fusionadas — corrige A-01 camino C
     (`registro-de-anomalias.md`, RN-ORD-64): excluye órdenes `pagada`/`cancelada`
     del cálculo y aplica promociones/combos vigentes, igual que
@@ -158,7 +159,8 @@ def group_bill(db: Session, group_id: UUID) -> dict:
             # que el desglose consolidado debe coincidir con el cobro
             # pedido-por-pedido (research.md D3).
             instant = checkout.promotion_evaluation_instant([o], now=now)
-            promo_discount, _, _ = checkout.auto_discount(db, lines, instant)
+            # spec 138 (FR-006): la vigencia se evalúa en la zona del tenant dueño de las mesas.
+            promo_discount, _, _ = checkout.auto_discount(db, lines, instant, tenant)
             sub = raw - promo_discount
             total += sub
         per_order.append({

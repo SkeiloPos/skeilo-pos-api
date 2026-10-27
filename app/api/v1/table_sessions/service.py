@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core import events
 from app.core.crud import get_or_404
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core.notifications.dispatch import notify_payment_completed
 from app.core.timezone import utc_now
 from app.models.customer_order import CustomerOrder
@@ -200,7 +200,9 @@ def _billable_orders(db: Session, table_session_id: UUID) -> list[CustomerOrder]
     ).scalars().all()
 
 
-def compute_bill(db: Session, table_session_id: UUID) -> SessionBillResponse:
+def compute_bill(
+    db: Session, table_session_id: UUID, tenant: Tenant | None = None,
+) -> SessionBillResponse:
     """Cuenta de la sesión, ya con descuentos automáticos (promociones/combos)
     aplicados — mismo cálculo por comensal que usa `_close_split` al cobrar, para
     que este preview coincida con lo que realmente se cobrará."""
@@ -232,7 +234,8 @@ def compute_bill(db: Session, table_session_id: UUID) -> SessionBillResponse:
         raw_subtotal = sum((line.line_total for line in lines), Decimal("0"))
         # spec 063: el motor por conjunto agrupa el subconjunto de líneas
         # evaluadas juntas — aquí, por comensal (research.md D7).
-        promo_discount, _, _ = checkout.auto_discount(db, lines, instant)
+        # spec 138 (FR-006): la vigencia se evalúa en la zona del tenant dueño de la mesa.
+        promo_discount, _, _ = checkout.auto_discount(db, lines, instant, tenant)
         subtotal = raw_subtotal - promo_discount
         total += subtotal
         split.append(SessionBillLine(
@@ -308,7 +311,7 @@ def _assert_closable(db: Session, orders: list[CustomerOrder]) -> None:
 
 def close_session(
     db: Session, table_session_id: UUID, data: CloseSessionIn, cashier: User,
-    *, invoice_prefix: str = "", tenant_id: int | None = None,
+    *, invoice_prefix: str = "", tenant_id: int | None = None, tenant: Tenant | None = None,
 ) -> CloseSessionResponse:
     """Cobra y cierra la sesión de mesa. Solo staff (el comensal anónimo no puede).
 
@@ -338,9 +341,9 @@ def close_session(
 
     try:
         if data.billing_mode is BillingMode.UNIFIED:
-            sales = [_close_unified(db, ts, orders, data, shift, cashier, invoice_prefix)]
+            sales = [_close_unified(db, ts, orders, data, shift, cashier, invoice_prefix, tenant)]
         else:
-            sales = _close_split(db, ts, orders, data, shift, cashier, invoice_prefix)
+            sales = _close_split(db, ts, orders, data, shift, cashier, invoice_prefix, tenant)
 
         for order in orders:
             order.status = "pagada"
@@ -585,7 +588,7 @@ def remove_participant(
 
 def set_assignments(
     db: Session, table_session_id: UUID, assignments: list,
-    *, tenant_id: int | None = None,
+    *, tenant_id: int | None = None, tenant: Tenant | None = None,
 ) -> SessionBillResponse:
     """Reparte líneas entre comensales, en una sola transacción.
 
@@ -695,7 +698,7 @@ def set_assignments(
 
     db.commit()
     _notify_bill_changed(ts, tenant_id)
-    return compute_bill(db, ts.id)
+    return compute_bill(db, ts.id, tenant)
 
 
 def _notify_bill_changed(ts: TableSession, tenant_id: int | None) -> None:
@@ -739,6 +742,7 @@ def _nombre_cuenta(
 def _close_unified(
     db: Session, ts: TableSession, orders: list[CustomerOrder],
     data: CloseSessionIn, shift, cashier: User, invoice_prefix: str = "",
+    tenant: Tenant | None = None,
 ) -> Sale:
     """Una sola venta con las líneas de todos los pedidos de la sesión."""
     if not data.payments:
@@ -755,7 +759,7 @@ def _close_unified(
     # del pedido más antiguo pendiente (o la hora del cobro si ninguno está
     # congelado).
     instant = checkout.promotion_evaluation_instant(orders, now=utc_now())
-    promo_discount, final_promotion_id, applied = checkout.auto_discount(db, lines, instant)
+    promo_discount, final_promotion_id, applied = checkout.auto_discount(db, lines, instant, tenant)
 
     sale = build_sale(
         db,
@@ -786,6 +790,7 @@ def _close_unified(
 def _close_split(
     db: Session, ts: TableSession, orders: list[CustomerOrder],
     data: CloseSessionIn, shift, cashier: User, invoice_prefix: str = "",
+    tenant: Tenant | None = None,
 ) -> list[Sale]:
     """Una venta por comensal. Se exige un bloque de pago por cada comensal con
     consumo: si falta uno, la mesa quedaría medio cobrada."""
@@ -865,7 +870,7 @@ def _close_split(
         # snapshot de la Sale/Invoice (FR-021). El `CustomerOrder` no se toca en
         # split: una orden puede abarcar a varios comensales, su descuento por
         # orden no está definido — la Sale y la Invoice son las autoritativas.
-        _, final_promotion_id, applied = checkout.auto_discount(db, lines, instant)
+        _, final_promotion_id, applied = checkout.auto_discount(db, lines, instant, tenant)
 
         sales.append(build_sale(
             db,

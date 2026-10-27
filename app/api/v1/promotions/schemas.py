@@ -12,6 +12,7 @@ from datetime import datetime, time
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.core.timezone import UtcDatetime
 
 
 class PromotionType(str, Enum):
@@ -243,13 +244,16 @@ class PromotionResponse(BaseModel):
     name: str
     description: str | None = None
     status: str
+    # spec 138 (FR-002): ÚNICA excepción al offset UTC explícito de la API. Son la hora de pared local del
+    # tenant (vigencia de la promoción), no un instante absoluto: se guardan y se devuelven sin offset a
+    # propósito. Debe coincidir con `INSTANTES_SIN_OFFSET_PERMITIDOS` de `test_contrato_instantes_api.py`.
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     days_of_week: str | None = None
     start_time: time | None = None
     end_time: time | None = None
     # spec 063: marca de "finalizada por la migración" (FR-025).
-    closed_by_refactor_at: datetime | None = None
+    closed_by_refactor_at: UtcDatetime | None = None
     # spec 063 (revisión 2026-09-01, FR-001): reemplaza type/value/min_qty/
     # condition_text/variants sueltos — cada regla lleva los suyos.
     rules: list[PromotionRuleResponse] = Field(default_factory=list)

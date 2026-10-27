@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from fastapi import Depends,Request,HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import create_engine,MetaData,schema as sch,inspect,text
+from sqlalchemy import create_engine,event,MetaData,schema as sch,inspect,text
 
 from typing import Optional
 
@@ -19,11 +19,11 @@ import bcrypt
 from app.core.config import settings
 from app.core.models import Tenant, User, convention, Base
 import app.models  # registra modelos tenant en Base.metadata
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.plan import Plan
 from app.models.denomination_catalog import seed_default_denominations
 from psycopg.errors import UniqueViolation
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 
 # Import diferido (dentro de tenant_create) de app.core.plan_limits: ese
 # módulo importa get_db/get_tenant de este mismo fichero (app.core.db) para
@@ -38,6 +38,39 @@ alembic_config = Config("alembic.ini")
 
 engine = create_engine(settings.DATABASE_URL,echo=False,future=True)
 logger = logging.getLogger(__name__)
+
+
+def force_utc_session(dbapi_connection, connection_record) -> None:
+    """Fija la zona de la sesión de PostgreSQL en UTC al abrir cada conexión (spec 138, FR-004).
+
+    Las 39 columnas sin zona con `server_default=now()` y cualquier `now()` de una consulta
+    cruda guardan lo que dice la zona de la SESIÓN, que hereda de `PGTZ` o del rol. Con la
+    sesión en `America/Bogota` unas 17:00 UTC se guardarían como 12:00.
+
+    Tiene que ser un evento `connect` y no `connect_args={"options": "-c timezone=UTC"}`:
+    `options` pierde contra `PGTZ` (medido, research.md Decisión 1). Se ejecuta en autocommit
+    para que un `rollback` posterior no lo deshaga, y deja `autocommit` como estaba."""
+    autocommit_previo = dbapi_connection.autocommit
+    dbapi_connection.autocommit = True
+    try:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET TIME ZONE 'UTC'")
+        finally:
+            cursor.close()
+    finally:
+        dbapi_connection.autocommit = autocommit_previo
+
+
+def install_force_utc_session(target_engine) -> None:
+    """Registra `force_utc_session` solo sobre PostgreSQL: las suites usan SQLite, que no
+    entiende `SET TIME ZONE`."""
+    if target_engine.dialect.name == "postgresql":
+        event.listen(target_engine, "connect", force_utc_session)
+
+
+# Un solo `engine` cubre API, worker de Celery, scheduler, Alembic y scripts.
+install_force_utc_session(engine)
 
 @contextmanager
 def with_db(tenant_schema: Optional[str]):
@@ -63,7 +96,13 @@ def tenant_create(
     admin_password: str,
     plan_id: uuid.UUID,
     ciclo_facturacion: Optional[str],
+    timezone: Optional[str] = None,
 ) -> None:
+    """Crea el tenant, su esquema, el catálogo inicial y su primer administrador, todo en una transacción.
+
+    `timezone` (spec 138, FR-010): zona IANA del negocio. Con valor se asigna al `Tenant` antes del `flush`
+    (el `@validates` actúa); con `None` NO se asigna y rige el `server_default='America/Bogota'` (API y
+    scripts que no la envían)."""
     from app.core.plan_limits import calculate_plan_vencimiento, validate_billing_cycle_price
 
     with with_db(schema) as db:
@@ -82,10 +121,10 @@ def tenant_create(
                 raise HTTPException(status_code=404, detail=f"El plan '{plan_id}' no existe")
             validate_billing_cycle_price(plan, ciclo_facturacion)
 
-            plan_iniciado_en = utc_now().replace(tzinfo=None)
+            plan_iniciado_en = utc_now_naive()
             plan_vence_en = calculate_plan_vencimiento(plan_iniciado_en, ciclo_facturacion)
 
-            tenant = Tenant(
+            tenant_fields = dict(
                 name=name,
                 host=host,
                 schema=schema,
@@ -94,6 +133,9 @@ def tenant_create(
                 plan_iniciado_en=plan_iniciado_en if ciclo_facturacion is not None else None,
                 plan_vence_en=plan_vence_en,
             )
+            if timezone is not None:
+                tenant_fields["timezone"] = timezone
+            tenant = Tenant(**tenant_fields)
             db.add(tenant)
             db.flush()
 
@@ -140,6 +182,18 @@ def tenant_create(
             db.rollback()
             raise
 
+        except DataError as e:
+            # spec 138 (FR-010): el disparador de `shared.tenants` rechaza una zona que PostgreSQL no conoce
+            # (p. ej. el alias heredado `Asia/Calcutta`, que Python sí acepta) con SQLSTATE 22023. El
+            # `flush()` del `Tenant` ocurre ANTES de `CreateSchema`, en la misma transacción: no queda nada creado.
+            db.rollback()
+            zona_invalida = _http_error_for_timezone_rejection(e)
+            if zona_invalida is not None:
+                logger.warning("Alta de tenant rechazada por zona horaria inválida: schema='%s'", schema)
+                raise zona_invalida
+            logger.exception("DataError inesperado durante tenant_create")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
         except Exception as e:
             db.rollback()
             logger.exception("Unexpected error creating tenant"+str(e))
@@ -148,6 +202,22 @@ def tenant_create(
                 detail="Internal server error"
             )
     
+
+
+#: SQLSTATE con el que el disparador `trg_tenants_validate_timezone` rechaza una zona (`invalid_parameter_value`).
+SQLSTATE_INVALID_PARAMETER_VALUE = "22023"
+
+
+def _http_error_for_timezone_rejection(exc: Exception) -> Optional[HTTPException]:
+    """422 si `exc` es el rechazo del disparador de zona horaria (SQLSTATE 22023); `None` en cualquier otro caso.
+    Función pura, probable sin PostgreSQL."""
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate != SQLSTATE_INVALID_PARAMETER_VALUE:
+        return None
+    return HTTPException(
+        status_code=422,
+        detail="Zona horaria inválida: la base de datos no la reconoce. Elige una zona de la lista.",
+    )
 
 
 def get_shared_metadata():

@@ -9,12 +9,12 @@ contra la retención *actual* del tenant, solo filtra `purge_at < now()`.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 from sqlalchemy import delete, text
 
 from app.core.db import with_db
 from app.models.notification_event import NotificationEvent
+from app.core.timezone import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 def purge_expired_notifications() -> int:
     """Borra, en todos los tenants, las `NotificationEvent` con `purge_at`
     vencido. Devuelve cuántas filas se purgaron en total."""
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
 
     with with_db(None) as db:
         schemas = [r[0] for r in db.execute(text("SELECT schema FROM shared.tenants")).fetchall()]

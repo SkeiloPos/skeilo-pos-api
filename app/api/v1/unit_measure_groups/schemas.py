@@ -1,7 +1,7 @@
 from uuid import UUID
-from datetime import datetime
 from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field
+from app.core.timezone import UtcDatetime
 
 
 class UnitMeasureGroupUnitCreate(BaseModel):
@@ -59,8 +59,8 @@ class UnitMeasureGroupResponse(BaseModel):
     id: UUID
     name: str
     units: list[UnitInGroupResponse]
-    created_at: datetime
-    updated_at: datetime | None = None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

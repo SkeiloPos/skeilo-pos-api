@@ -25,7 +25,7 @@ from app.core.order_audit import (
     hash_sensitive_or_none,
     record_order_audit_event,
 )
-from app.core.timezone import local_day_bounds_utc, resolve_timezone, utc_now
+from app.core.timezone import business_today, local_day_bounds_utc, resolve_timezone, utc_now, utc_now_naive
 from app.models.audit_log import AuditLog
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
@@ -981,7 +981,7 @@ def cancel_order(
             # (sin pérdida de información, Principio VII).
             pending_attempt.rejection_reason = "transferencia_no_completada"
             pending_attempt.resolved_by_user_id = actor_id
-            pending_attempt.resolved_at = utc_now()
+            pending_attempt.resolved_at = utc_now_naive()
 
         if perdidos:
             # La pérdida no genera movimiento de inventario (ya está descontada);
@@ -1050,7 +1050,7 @@ def close_participants(db: Session, ts: TableSession) -> int:
     que cobrar: no interesa que nadie siga pidiendo con un token viejo, pero cerrar
     la sesión dejaría la mesa sin forma de cobrarse.
     """
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
 
     participants = db.execute(
         select(SessionParticipant).where(
@@ -1081,7 +1081,7 @@ def close_table_sessions(
     pendientes — eso es responsabilidad de quien llama (`release_table`, el cierre
     con `billing_mode`, o el job de sesiones huérfanas, que pasa `closed_by=None`).
     """
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
 
     sessions = db.execute(
         select(TableSession).where(
@@ -1216,6 +1216,7 @@ def approve_payment_attempt(
     user: User,
     request_id: str | None = None,
     receipt_file_url: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """Aprueba un comprobante de transferencia (US2, Acceptance Scenario 4).
 
@@ -1266,7 +1267,7 @@ def approve_payment_attempt(
 
         attempt.status = "confirmado"
         attempt.resolved_by_user_id = user.id
-        attempt.resolved_at = utc_now()
+        attempt.resolved_at = utc_now_naive()
         # spec 132 (FR-019, data-model.md § AuditLog): historial consultable
         # del pedido, vía `GET /orders/{order_id}/payment-events` — distinto
         # del evento solo-Sentry de spec 074 de más abajo (research.md
@@ -1302,7 +1303,8 @@ def approve_payment_attempt(
             # congelado del pedido (el flujo QR también lo congela — research.md D2).
             instant = promotion_evaluation_instant([order], now=utc_now())
             lines = order_sale_lines(db, order.id)
-            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+            # spec 138 (FR-006): la vigencia se evalúa en la zona del tenant dueño del cobro.
+            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
             # Spec 056, research.md Decisión 5: el domicilio debe quedar incluido
             # en el ÚNICO pago que se autogenera aquí — de lo contrario queda
             # corto exactamente en ese valor y el propio chequeo `paid < total`
@@ -1399,7 +1401,7 @@ def reject_payment_attempt(
         attempt.status = "rechazado"
         attempt.rejection_reason = reason
         attempt.resolved_by_user_id = user.id
-        attempt.resolved_at = utc_now()
+        attempt.resolved_at = utc_now_naive()
         # spec 132 (FR-019/T045, data-model.md § AuditLog): historial
         # consultable del pedido — distinto del evento solo-Sentry de spec
         # 074 de más abajo (research.md Decisión 3).
@@ -1420,7 +1422,9 @@ def reject_payment_attempt(
         dining_table_id = order.dining_table_id if order is not None else None
         if dining_table_id is not None:
             tz = resolve_timezone(tenant)
-            start_utc, end_utc = local_day_bounds_utc(utc_now().date(), tz)
+            # spec 138 (A-147): «el día» es el día LOCAL del tenant; `utc_now().date()` ya era el día
+            # siguiente entre las 19:00 y las 24:00 de Bogotá y dejaba la ventana vacía.
+            start_utc, end_utc = local_day_bounds_utc(business_today(tenant), tz)
             rejection_count_today = db.execute(
                 select(func.count(OrderPaymentAttempt.id))
                 .join(CustomerOrder, CustomerOrder.id == OrderPaymentAttempt.order_id)
@@ -1479,6 +1483,7 @@ def adjust_split_payment_attempt(
     transfer_method_id: UUID | None,
     payment_method_id: UUID | None,
     user: User,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """Reajusta la división efectivo/transferencia de un intento `pendiente`
     al confirmar (spec 132, FR-013/014), incluyendo convertir un intento 100%
@@ -1495,7 +1500,8 @@ def adjust_split_payment_attempt(
     transfer_amount = Decimal(transfer_amount)
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
-        total = compute_checkout_preview(db, attempt.order_id).total
+        # spec 138 (FR-006): el mismo total (con promoción en la zona del tenant) que mostró la vista previa.
+        total = compute_checkout_preview(db, attempt.order_id, tenant).total
         if cash_amount + transfer_amount != total:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -1590,6 +1596,7 @@ def _confirm_cash_portion_of_mixed_attempt(
     cash_shift_id: UUID,
     user: User,
     request_id: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """`POST /payment-attempts/{id}/confirm-cash` sobre un intento mixto
     (spec 130, research.md Decisión 4). Fija `cash_confirmed_at` en vez de
@@ -1624,7 +1631,7 @@ def _confirm_cash_portion_of_mixed_attempt(
         # `cash_amount` desde `submit_cart` — esta llamada no recibe ni valida
         # ningún `amount_received` nuevo, y no calcula cambio (el pago mixto no
         # calcula cambio, ver edge cases de `spec.md`).
-        attempt.cash_confirmed_at = utc_now()
+        attempt.cash_confirmed_at = utc_now_naive()
         # spec 132 (FR-019, data-model.md § AuditLog): historial consultable.
         record_audit(
             db,
@@ -1647,7 +1654,7 @@ def _confirm_cash_portion_of_mixed_attempt(
 
             instant = promotion_evaluation_instant([order], now=utc_now())
             lines = order_sale_lines(db, order.id)
-            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
             delivery_fee = order.delivery_fee or Decimal("0")
             total = (
                 sum((line.line_total for line in lines), Decimal("0"))
@@ -1711,6 +1718,7 @@ def confirm_cash_payment_attempt(
     cash_shift_id: UUID,
     user: User,
     request_id: str | None = None,
+    tenant: Tenant | None = None,
 ) -> OrderPaymentAttempt:
     """Confirma un pago en efectivo y calcula el cambio (FR-009/FR-010,
     US3). FR-010a: impide confirmar si `amount_received < total_orden`.
@@ -1748,7 +1756,7 @@ def confirm_cash_payment_attempt(
         select(OrderPaymentAttempt.cash_amount).where(OrderPaymentAttempt.id == attempt_id)
     ).scalar_one_or_none() is not None
     if is_mixed:
-        return _confirm_cash_portion_of_mixed_attempt(db, attempt_id, cash_shift_id, user, request_id)
+        return _confirm_cash_portion_of_mixed_attempt(db, attempt_id, cash_shift_id, user, request_id, tenant)
 
     try:
         attempt = _load_pending_attempt_for_update(db, attempt_id)
@@ -1762,7 +1770,7 @@ def confirm_cash_payment_attempt(
         # spec 073, US7 (FR-023, research.md D13): el `Total` real con descuento
         # por promoción (instante congelado) y domicilio — la misma cuenta
         # autoritativa que el panel muestra y que `build_sale` registrará.
-        total = compute_checkout_preview(db, attempt.order_id).total
+        total = compute_checkout_preview(db, attempt.order_id, tenant).total
         if amount_received < total:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1778,7 +1786,7 @@ def confirm_cash_payment_attempt(
         attempt.change_amount = amount_received - total
         attempt.status = "confirmado"
         attempt.resolved_by_user_id = user.id
-        attempt.resolved_at = utc_now()
+        attempt.resolved_at = utc_now_naive()
         # spec 132 (FR-019, data-model.md § AuditLog): historial consultable.
         record_audit(
             db,
@@ -1799,7 +1807,7 @@ def confirm_cash_payment_attempt(
         # congelado del pedido.
         instant = promotion_evaluation_instant([order], now=utc_now())
         lines = order_sale_lines(db, order.id)
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant)
+        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
 
         build_sale(
             db,

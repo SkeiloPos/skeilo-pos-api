@@ -1,5 +1,4 @@
 from uuid import UUID
-from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -7,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.api.v1.catalog.schemas import OptionSelectionIn, ToppingSelectionIn
 from app.core.schema_types import AssetUrl
 from app.core.storage import asset_display_url
+from app.core.timezone import UtcDatetime
 
 
 # ---------- Apertura de sesión (por QR token) ----------
@@ -33,7 +33,7 @@ class SessionOpenResponse(BaseModel):
     display_name: str
     # Nombre desambiguado que ven cocina y staff ("Ana (2)" si ya había una Ana).
     display_label: str | None = None
-    expires_at: datetime | None = None
+    expires_at: UtcDatetime | None = None
     table: SessionTableInfo
     cart_id: UUID
     # Token que el frontend debe enviar en `x-session-token` para operar el carrito.
@@ -201,12 +201,12 @@ class DinerPaymentAttempt(BaseModel):
     # spec 088 (FR-008): la columna guarda la key; se ensambla la URL de visualización al
     # serializar (una fila histórica con URL absoluta se sigue viendo, tolerancia de lectura).
     receipt_file_url: AssetUrl = None
-    created_at: datetime
+    created_at: UtcDatetime
     # Pago mixto (spec 130, FR-008): `None` en cualquier intento no mixto —
     # alimenta el desglose de "Mis pedidos" y de la confirmación.
     cash_amount: Decimal | None = None
     transfer_amount: Decimal | None = None
-    cash_confirmed_at: datetime | None = None
+    cash_confirmed_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

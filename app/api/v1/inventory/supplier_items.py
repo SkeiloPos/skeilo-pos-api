@@ -13,7 +13,7 @@ from sqlalchemy import select, update as sa_update, func, text
 from sqlalchemy.orm import Session
 
 from app.core.crud import get_or_404
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.api.v1.inventory.stock import lock_items
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
@@ -135,7 +135,7 @@ def create_or_reactivate(
         existing.conversion_factor = body.conversion_factor
         if body.last_cost is not None:
             existing.last_cost = body.last_cost
-            existing.last_cost_at = utc_now()
+            existing.last_cost_at = utc_now_naive()
         db.commit()
         db.refresh(existing)
         return existing, status.HTTP_200_OK
@@ -146,7 +146,7 @@ def create_or_reactivate(
         presentation=body.presentation,
         conversion_factor=body.conversion_factor,
         last_cost=body.last_cost,
-        last_cost_at=utc_now() if body.last_cost is not None else None,
+        last_cost_at=utc_now_naive() if body.last_cost is not None else None,
     )
     db.add(relation)
     db.commit()
@@ -218,7 +218,7 @@ def update(db: Session, relation_id: UUID, body: SupplierItemUpdate) -> tuple[Su
         relation.conversion_factor = body.conversion_factor
     if body.last_cost is not None:
         relation.last_cost = body.last_cost
-        relation.last_cost_at = utc_now()
+        relation.last_cost_at = utc_now_naive()
     if body.active is not None:
         relation.active = body.active
         if body.active is False:
@@ -358,4 +358,4 @@ def apply_purchase_cost(db: Session, relation: SupplierItem, cost_per_presentati
     Sin commit propio -- el llamador (create_purchase/create_purchase_order) decide cuándo
     cerrar la transacción, mismo patrón que _apply_preferred_swap."""
     relation.last_cost = cost_per_presentation
-    relation.last_cost_at = utc_now()
+    relation.last_cost_at = utc_now_naive()

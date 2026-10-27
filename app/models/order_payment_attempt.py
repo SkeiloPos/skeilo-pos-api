@@ -6,8 +6,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import mapped_column, Mapped, relationship
 from typing import Optional, TYPE_CHECKING
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
+from app.core.timezone import utc_now_naive
 
 if TYPE_CHECKING:
     from .customer_order import CustomerOrder
@@ -104,7 +105,7 @@ class OrderPaymentAttempt(UUIDPrimaryKeyMixin, Base):
     # spec 024 US5) empatarían sin este default de mayor resolución.
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+        default=utc_now_naive,
         server_default=func.now(),
         nullable=False,
     )

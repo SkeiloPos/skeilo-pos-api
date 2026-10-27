@@ -15,7 +15,7 @@ en `cart/router.py`/`orders/router.py`/`table_sessions/service.py`.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Mapping
 from uuid import UUID
@@ -30,6 +30,7 @@ from app.core.notifications.channels.browser_push import BrowserPushChannel
 from app.core.notifications.channels.in_app import InAppChannel
 from app.models.notification_channel_pref import NotificationChannelPreference
 from app.models.notification_event import NotificationEvent
+from app.core.timezone import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def _dispatch(
     related_entity_id: UUID,
     payload: Mapping[str, Any],
 ) -> NotificationEvent:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utc_now_naive()
     event = NotificationEvent(
         event_type=event_type,
         related_entity_type=related_entity_type,

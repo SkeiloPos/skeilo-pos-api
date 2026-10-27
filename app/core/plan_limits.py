@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db, get_tenant
 from app.core.dependencies import get_current_user
 from app.core.models import Tenant, User, UserInvitation
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.cash_register import CashRegister
 from app.models.dining_table import DiningTable
 from app.models.payment import PaymentMethod
@@ -87,7 +87,7 @@ def ensure_plan_not_expired(tenant: Tenant) -> None:
     Decisión 14): ningún router necesita invocarla por su cuenta."""
     if tenant.plan_vence_en is None:
         return
-    if tenant.plan_vence_en < utc_now().replace(tzinfo=None):
+    if tenant.plan_vence_en < utc_now_naive():
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Tu plan venció. Debe renovarse para seguir usando el sistema.",

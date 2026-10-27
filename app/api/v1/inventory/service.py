@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.core import units
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_import_job import InventoryImportJob
@@ -49,7 +49,7 @@ def find_blocking_import_job(db: Session) -> InventoryImportJob | None:
     candidatos = db.execute(
         select(InventoryImportJob).where(InventoryImportJob.status == "procesando")
     ).scalars().all()
-    ahora = utc_now().replace(tzinfo=None)
+    ahora = utc_now_naive()
     for job in candidatos:
         if ahora - job.started_at > IMPORT_JOB_TIMEOUT:
             job.status = "interrumpido"
@@ -429,7 +429,7 @@ def void_purchase(db: Session, purchase_id: UUID, user_id: UUID | None) -> Purch
                 reason=reasons.AJUSTE, reference_type=reasons.REF_PURCHASE_VOID,
                 reference_id=purchase.id, user_id=user_id,
             )
-        purchase.voided_at = utc_now().replace(tzinfo=None)
+        purchase.voided_at = utc_now_naive()
         purchase.voided_by = user_id
         db.commit()
     except HTTPException:

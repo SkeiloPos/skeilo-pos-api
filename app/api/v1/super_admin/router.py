@@ -10,7 +10,7 @@ from app.core.dependencies import get_shared_db, get_current_super_admin
 from app.core.pagination import Page, paginate
 from app.core.models import User, Tenant
 from app.core.plan_limits import calculate_plan_vencimiento, validate_billing_cycle_price
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.plan import Plan
 from app.api.v1.users.schemas import UserResponse
 from app.api.v1.super_admin.schemas import TenantPlanUpdate, TenantResponse,TenantCreateWithUser
@@ -110,7 +110,7 @@ def update_tenant_plan(
     tenant.plan_id = plan.id
     tenant.ciclo_facturacion = body.ciclo_facturacion
     if body.ciclo_facturacion is not None:
-        tenant.plan_iniciado_en = utc_now().replace(tzinfo=None)
+        tenant.plan_iniciado_en = utc_now_naive()
         tenant.plan_vence_en = calculate_plan_vencimiento(tenant.plan_iniciado_en, body.ciclo_facturacion)
     else:
         tenant.plan_iniciado_en = None
@@ -135,6 +135,7 @@ def create_tenant(body: TenantCreateWithUser):
         admin_password=password,
         plan_id=body.plan_id,
         ciclo_facturacion=body.ciclo_facturacion,
+        timezone=body.timezone,
     )
 
     if settings.ENVIRONMENT == "prod":

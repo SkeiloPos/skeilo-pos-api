@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
-from app.core.timezone import utc_now
+from app.core.timezone import utc_now_naive
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
 from app.models.unit_measure_group import UnitMeasureGroup
@@ -317,5 +317,5 @@ def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> No
         db.commit()
 
     job.status = "finalizado"
-    job.finished_at = utc_now().replace(tzinfo=None)
+    job.finished_at = utc_now_naive()
     db.commit()

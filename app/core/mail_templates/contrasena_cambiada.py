@@ -10,7 +10,7 @@ from datetime import datetime
 
 from . import _layout as layout
 from . import _marca as marca
-from ._campos import ErrorDePlantillaDeCorreo, escapar_valores, formatear_fecha_hora_colombia, validar_campos_obligatorios
+from ._campos import ZONA_RESPALDO, ErrorDePlantillaDeCorreo, escapar_valores, formatear_fecha_hora, validar_campos_obligatorios
 
 _ASUNTO = "Tu contraseña de SkeiloPOS fue cambiada"
 
@@ -28,7 +28,10 @@ def construir_correo_contrasena_cambiada(
     url_ingreso: str,
     es_super_admin: bool,
     nombre_negocio: str | None = None,
+    zona_horaria: str | None = None,
 ):
+    """`zona_horaria`: IANA del tenant para mostrar la hora (spec 138, FR-011); `None` (Super Admin,
+    usuario sin tenant) ⇒ `America/Bogota`."""
     from . import EmailContent
 
     if momento is None:
@@ -52,7 +55,7 @@ def construir_correo_contrasena_cambiada(
         crudos["nombre_negocio"] = nombre_negocio_normalizado
     e = escapar_valores(**crudos)
 
-    fecha_hora = formatear_fecha_hora_colombia(momento)
+    fecha_hora = formatear_fecha_hora(momento, zona_horaria or ZONA_RESPALDO)
 
     filas_html = layout.fila_dato("CUENTA", e["correo"], primera=True)
     if not es_super_admin:
