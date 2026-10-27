@@ -306,13 +306,21 @@ def list_available_payment_methods(db: Session) -> list[PaymentMethod]:
     backfill, FR-016) no debe desaparecer de caja solo por no tener catálogo
     asignado — sigue disponible mientras sea `active`/`is_complete` (default
     `true` hasta que el backfill la procese). Solo se excluye por causa del
-    catálogo cuando SÍ tiene `catalog_id` y ese catálogo está inactivo."""
+    catálogo cuando SÍ tiene `catalog_id` y ese catálogo está inactivo.
+
+    spec 140: excluye `type == 'mixed'` ("Pago mixto") -- el panel de cobro de
+    caja y "Registrar ingreso" de Cajas ya arman un pago mixto agregando
+    varias líneas de método real (`app-payment-input`, "Agregar otro
+    método"); una fila "Pago mixto" ahí sería un método sin desglose, además
+    de duplicar esa capacidad. El menú QR (`GET /cart/payment-methods`, otro
+    endpoint) no pasa por aquí y sigue mostrándola sin cambios."""
     return db.execute(
         select(PaymentMethod)
         .outerjoin(PaymentMethodCatalog, PaymentMethod.catalog_id == PaymentMethodCatalog.id)
         .where(
             PaymentMethod.active.is_(True),
             PaymentMethod.is_complete.is_(True),
+            PaymentMethod.type != "mixed",
             (PaymentMethod.catalog_id.is_(None)) | (PaymentMethodCatalog.active.is_(True)),
         )
         .order_by(PaymentMethod.name)
