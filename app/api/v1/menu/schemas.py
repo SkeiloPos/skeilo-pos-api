@@ -179,5 +179,8 @@ class MenuBusinessResponse(BaseModel):
     # spec 080: key en base de datos, URL ensamblada contra ASSETS_BASE_URL al
     # serializar (FR-005/FR-006).
     logo_url: AssetUrl = None
+    # spec 138 (FR-008): zona IANA del negocio. El comensal es anónimo y no puede llamar a `GET /tenant`:
+    # esta es la única vía por la que su navegador conoce la hora del negocio (hora de cada pedido).
+    timezone: str
 
     model_config = ConfigDict(from_attributes=True)

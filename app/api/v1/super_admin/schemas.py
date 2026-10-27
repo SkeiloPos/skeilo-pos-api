@@ -90,6 +90,11 @@ class TenantResponse(BaseModel):
         examples=["tenant_acme"],
     )
     host: str = Field(..., description="Host asociado al tenant.", examples=["acme.localhost"])
+    # spec 138 (FR-008): el Super Admin no pertenece a ningún tenant; para mostrar «Vence» en la zona de
+    # CADA negocio la lista entrega la zona de cada fila.
+    timezone: str = Field(
+        ..., description="Zona horaria IANA del tenant (spec 138).", examples=["America/Bogota"]
+    )
     plan_id: UUID = Field(..., description="Plan de suscripción vigente del tenant.")
     plan_name: Optional[str] = Field(
         None, description="Nombre del plan vigente (spec 033).", validation_alias=AliasPath("plan", "name")
