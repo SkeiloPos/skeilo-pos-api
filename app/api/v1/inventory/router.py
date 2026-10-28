@@ -16,7 +16,9 @@ from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
 from app.models.inventory_import_job import InventoryImportJob
 from app.models.unit_measure import UnitMeasure
+from app.models.unit_measure_group import UnitMeasureGroup
 from app.models.supplier import Supplier
+from app.models.supplier_item import SupplierItem
 from app.models.purchase import Purchase
 from app.api.v1.inventory import service
 from app.api.v1.inventory import supplier_items
@@ -77,16 +79,37 @@ def low_stock(
     ).scalars().all()
 
 
-@router.get("/items/export", summary="Exportar el inventario completo a .xlsx")
+@router.get("/items/export", summary="Exportar el inventario a .xlsx")
 def export_items(
+    supplier_id: UUID | None = Query(None, description="Filtrar por proveedor (solo relaciones activas)"),
+    type_: InventoryItemType | None = Query(None, description="Filtrar por tipo de insumo"),
     db: Session = Depends(get_db),
     tenant: Tenant = Depends(get_tenant),
     _: User = Depends(require_tenant_admin),
 ):
-    items = service.list_all_items_for_export(db)
+    items = db.execute(
+        service.list_items_query(
+            type_=type_.value if type_ is not None else None,
+            supplier_id=supplier_id,
+        )
+    ).scalars().all()
     unit_measures_by_id = {u.id: u for u in db.execute(select(UnitMeasure)).scalars().all()}
-    preferred_by_item = supplier_items.preferred_relations_by_item(db, [i.id for i in items])
-    buffer = build_inventory_excel(items, unit_measures_by_id, preferred_by_item)
+    groups_by_id = {g.id: g for g in db.execute(select(UnitMeasureGroup)).scalars().all()}
+    item_ids = [i.id for i in items]
+    preferred_by_item = supplier_items.preferred_relations_by_item(db, item_ids)
+    purchase_unit_rows = db.execute(
+        select(SupplierItem.inventory_item_id, UnitMeasure.abbreviation, UnitMeasure.factor_to_base)
+        .join(UnitMeasure, UnitMeasure.id == SupplierItem.unit_measure_id)
+        .where(
+            SupplierItem.inventory_item_id.in_(item_ids),
+            SupplierItem.preferred.is_(True),
+            SupplierItem.active.is_(True),
+        )
+    ).all()
+    purchase_unit_by_item = {item_id: (abbr, factor) for item_id, abbr, factor in purchase_unit_rows}
+    buffer = build_inventory_excel(
+        items, unit_measures_by_id, preferred_by_item, groups_by_id, purchase_unit_by_item,
+    )
     # spec 138 (A-147): el día del nombre es el día local del tenant, no el del servidor.
     filename = f"inventario_{business_today(tenant).isoformat()}.xlsx"
     return Response(
@@ -129,6 +152,7 @@ def import_items(
     problemas = import_service.validar_estructura(headers)
     if problemas:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "; ".join(problemas))
+    filas = import_service.normalizar_filas(headers, filas)
 
     en_curso = service.find_blocking_import_job(db)
     if en_curso is not None:

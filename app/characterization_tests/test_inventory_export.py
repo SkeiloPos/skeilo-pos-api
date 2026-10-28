@@ -166,6 +166,81 @@ class ExportEndpointTests(unittest.TestCase):
         )
 
 
+class ExportFiltersTests(unittest.TestCase):
+    """Historia 2 de la spec 142 (P2): `supplier_id`/`type_` opcionales en
+    `GET /inventory/items/export`, reemplazando `list_all_items_for_export()` por
+    `list_items_query()` (la misma consulta que ya usa `GET /inventory/items`,
+    spec 133). Sin filtro el resultado sigue siendo idéntico al de
+    `ExportEndpointTests` (FR-005) -- no se repite aquí, solo los casos nuevos."""
+
+    def setUp(self):
+        self.db = _new_session()
+        self.tenant = _con_modulo_inventario(self.db)
+        self.admin = pf.make_user(self.db, self.tenant, role_name="ADMIN")
+        self.db.commit()
+        self.client = _build_client(self.db, self.tenant, self.admin)
+
+    def _codes(self, resp):
+        wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+        return [row[0].value for row in wb.active.iter_rows(min_row=2)]
+
+    def test_filtra_solo_por_supplier_id(self):
+        supplier = f.make_supplier(self.db, name="Molino XYZ")
+        otro_supplier = f.make_supplier(self.db, name="Otro proveedor")
+        con_proveedor = f.make_inventory_item(self.db, name="Con proveedor", code="0001")
+        sin_proveedor = f.make_inventory_item(self.db, name="Sin proveedor", code="0002")
+        f.make_supplier_item(self.db, supplier, con_proveedor, preferred=True)
+        f.make_supplier_item(self.db, otro_supplier, sin_proveedor, preferred=True)
+        self.db.commit()
+
+        resp = self.client.get(f"/api/v1/inventory/items/export?supplier_id={supplier.id}")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._codes(resp), ["0001"])
+
+    def test_filtra_solo_por_type(self):
+        f.make_inventory_item(self.db, name="Harina", code="0001", type="raw_material")
+        f.make_inventory_item(self.db, name="Vaso", code="0002", type="packaged")
+        self.db.commit()
+
+        resp = self.client.get("/api/v1/inventory/items/export?type_=raw_material")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._codes(resp), ["0001"])
+
+    def test_filtra_por_supplier_id_y_type_a_la_vez_es_interseccion(self):
+        supplier = f.make_supplier(self.db, name="Molino XYZ")
+        materia_con_proveedor = f.make_inventory_item(
+            self.db, name="Harina", code="0001", type="raw_material",
+        )
+        f.make_inventory_item(self.db, name="Azúcar", code="0002", type="raw_material")
+        empacado_con_proveedor = f.make_inventory_item(
+            self.db, name="Vaso", code="0003", type="packaged",
+        )
+        f.make_supplier_item(self.db, supplier, materia_con_proveedor, preferred=True)
+        f.make_supplier_item(self.db, supplier, empacado_con_proveedor, preferred=True)
+        self.db.commit()
+
+        resp = self.client.get(
+            f"/api/v1/inventory/items/export?supplier_id={supplier.id}&type_=raw_material"
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._codes(resp), ["0001"])
+
+    def test_combinacion_sin_coincidencias_genera_archivo_solo_con_encabezados(self):
+        f.make_inventory_item(self.db, name="Vaso", code="0001", type="packaged")
+        self.db.commit()
+
+        resp = self.client.get(
+            f"/api/v1/inventory/items/export?supplier_id={_uid()}&type_=raw_material"
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+        self.assertEqual(wb.active.max_row, 1)
+
+
 class ExportColumnsTests(unittest.TestCase):
     """Historia 2 (P2): encabezados exactos y celdas numéricas nativas."""
 
@@ -182,15 +257,13 @@ class ExportColumnsTests(unittest.TestCase):
         return openpyxl.load_workbook(io.BytesIO(resp.content))
 
     def test_fila_1_son_los_encabezados_exactos_en_orden(self):
-        """spec 138, Historia 1: presentación, factor de conversión y último
-        costo del proveedor preferido ya no forman parte de la plantilla (solo
-        son editables desde el módulo de proveedores), pero el nombre del
-        proveedor preferido sí se conserva."""
+        """spec 142, Historia 3: Grupo, Unidad de compra y Factor de conversión
+        (compra) se agregan a la plantilla de la spec 139 (8 columnas)."""
         wb = self._export()
         headers = [c.value for c in next(wb.active.iter_rows(min_row=1, max_row=1))]
         self.assertEqual(headers, [
-            "Código", "Nombre", "Tipo", "Unidad", "Stock", "Mínimo", "Costo",
-            "Proveedor preferido",
+            "Código", "Nombre", "Tipo", "Unidad", "Grupo", "Stock", "Mínimo", "Costo",
+            "Proveedor preferido", "Unidad de compra", "Factor de conversión (compra)",
         ])
 
     def test_celdas_stock_minimo_costo_son_numericas_no_texto(self):
@@ -200,7 +273,7 @@ class ExportColumnsTests(unittest.TestCase):
         )
         wb = self._export()
         row = next(wb.active.iter_rows(min_row=2, max_row=2))
-        stock_cell, min_cell, cost_cell = row[4], row[5], row[6]
+        stock_cell, min_cell, cost_cell = row[5], row[6], row[7]
         self.assertEqual(stock_cell.data_type, "n")
         self.assertEqual(min_cell.data_type, "n")
         self.assertEqual(cost_cell.data_type, "n")
@@ -209,7 +282,7 @@ class ExportColumnsTests(unittest.TestCase):
         f.make_inventory_item(self.db, unit_cost=Decimal("15.00"))
         wb = self._export()
         row = next(wb.active.iter_rows(min_row=2, max_row=2))
-        cost_cell = row[6]
+        cost_cell = row[7]
         self.assertEqual(float(cost_cell.value), 15.0)
         self.assertNotIsInstance(cost_cell.value, str)
 
@@ -219,6 +292,51 @@ class ExportColumnsTests(unittest.TestCase):
         wb = self._export()
         codigos = [row[0].value for row in wb.active.iter_rows(min_row=2)]
         self.assertEqual(sorted(codigos), ["0001", "0002"])
+
+    def test_grupo_exporta_el_nombre_del_grupo_de_la_unidad_base(self):
+        """spec 142, Historia 3: todo insumo se exporta con el `name` del
+        `UnitMeasureGroup` de su unidad base, no solo su abreviatura."""
+        grupo = f.make_unit_measure_group(self.db, name="MASA")
+        unit = f.make_unit(self.db, group=grupo, name="GRAMO", abbreviation="G")
+        f.make_inventory_item(self.db, name="Harina", unit=unit)
+        wb = self._export()
+        row = next(wb.active.iter_rows(min_row=2, max_row=2))
+        self.assertEqual(row[4].value, "MASA")
+
+    def test_unidad_de_compra_y_factor_exportan_desde_la_relacion_preferida_en_modo_unit_measure_id(self):
+        """spec 142, Historia 3: en modo `unit_measure_id` (spec 140), se exporta
+        la abreviatura y el `factor_to_base` de esa unidad."""
+        grupo = f.make_unit_measure_group(self.db, name="MASA")
+        base = f.make_unit(self.db, group=grupo, name="GRAMO", abbreviation="G")
+        compra = f.make_unit(
+            self.db, group=grupo, name="KILOGRAMO", abbreviation="KG",
+            is_base=False, factor_to_base=Decimal("1000"),
+        )
+        item = f.make_inventory_item(self.db, name="Harina", unit=base)
+        supplier = f.make_supplier(self.db, name="Molino XYZ")
+        f.make_supplier_item(
+            self.db, supplier, item, unit_measure_id=compra.id, preferred=True,
+        )
+        wb = self._export()
+        row = next(wb.active.iter_rows(min_row=2, max_row=2))
+        self.assertEqual(row[9].value, "KG")
+        self.assertEqual(float(row[10].value), 1000.0)
+
+    def test_unidad_de_compra_y_factor_en_blanco_si_la_relacion_preferida_es_legada(self):
+        """spec 142, Historia 3: una relación preferida en modo legado
+        (`presentation`/`conversion_factor`, p. ej. editada manualmente desde el
+        módulo de proveedores) deja ambas columnas en blanco, sin error."""
+        item = f.make_inventory_item(self.db, name="Con proveedor legado")
+        supplier = f.make_supplier(self.db, name="Distribuidora Norte")
+        f.make_supplier_item(
+            self.db, supplier, item,
+            presentation="Bolsa x 500 g", conversion_factor=Decimal("500"),
+            preferred=True,
+        )
+        wb = self._export()
+        row = next(wb.active.iter_rows(min_row=2, max_row=2))
+        self.assertFalse(row[9].value)
+        self.assertFalse(row[10].value)
 
 
 class ExportLabelsTests(unittest.TestCase):
@@ -253,8 +371,9 @@ class ExportLabelsTests(unittest.TestCase):
     def test_insumo_con_proveedor_preferido_exporta_solo_el_nombre(self):
         """spec 138, FR-001/FR-002: la fila de un insumo con proveedor preferido
         asignado trae el nombre del proveedor, pero ninguna columna de
-        presentación/factor/último costo -- esos 3 datos ya no forman parte de
-        la plantilla."""
+        presentación/factor/último costo legados -- esos 2 datos no forman parte
+        de la plantilla (spec 142: Unidad de compra/Factor sí, pero solo en modo
+        `unit_measure_id`, ver `ExportColumnsTests`)."""
         item = f.make_inventory_item(self.db, name="Con proveedor")
         supplier = f.make_supplier(self.db, name="Distribuidora Norte")
         f.make_supplier_item(
@@ -264,8 +383,8 @@ class ExportLabelsTests(unittest.TestCase):
         )
         wb = self._export()
         row = [c.value for c in next(wb.active.iter_rows(min_row=2, max_row=2))]
-        self.assertEqual(len(row), 8)
-        self.assertEqual(row[7], "Distribuidora Norte")
+        self.assertEqual(len(row), 11)
+        self.assertEqual(row[8], "Distribuidora Norte")
 
     def test_insumo_sin_proveedor_preferido_deja_esa_columna_en_blanco(self):
         """spec 109, Historia 1, escenario 3: sin proveedor preferido, la
@@ -274,7 +393,7 @@ class ExportLabelsTests(unittest.TestCase):
         wb = self._export()
         row = next(wb.active.iter_rows(min_row=2, max_row=2))
         # openpyxl normaliza la cadena vacía a None al leerla de vuelta.
-        self.assertFalse(row[7].value)
+        self.assertFalse(row[8].value)
 
 
 class ExportEncodingTests(unittest.TestCase):
@@ -334,7 +453,7 @@ class ImportEndpointTests(unittest.TestCase):
 
     def test_estructura_valida_crea_job_y_encola_la_tarea(self):
         content = _xlsx_bytes(INVENTORY_TEMPLATE_HEADERS, [
-            ["", "Insumo nuevo", "Materia prima", "un", "0", "0", "0"],
+            ["", "Insumo nuevo", "Materia prima", "un", "", "0", "0", "0", "", "", ""],
         ])
         resp, mock_task = self._upload(content)
         self.assertEqual(resp.status_code, 202)
@@ -368,21 +487,25 @@ class ImportEndpointTests(unittest.TestCase):
         self.db.commit()
 
         legacy_headers = [
-            *INVENTORY_TEMPLATE_HEADERS,
-            "Presentación", "Factor de conversión", "Último costo",
+            "Código", "Nombre", "Tipo", "Unidad", "Stock", "Mínimo", "Costo",
+            "Proveedor preferido", "Presentación", "Factor de conversión", "Último costo",
         ]
         content = _xlsx_bytes(legacy_headers, [
             ["0001", "Con proveedor", "Materia prima", "un", "5", "1", "100",
              "Otro Proveedor", "Bulto x 25", "25", "9999"],
         ])
-        resp, _mock_task = self._upload(content)
+        resp, mock_task = self._upload(content)
         self.assertEqual(resp.status_code, 202)
         body = resp.json()
         self.assertEqual(body["total_rows"], 1)
 
         job = self.db.get(InventoryImportJob, UUID(body["id"]))
-        wb = openpyxl.load_workbook(io.BytesIO(content))
-        filas = [[c.value for c in row] for row in wb.active.iter_rows(min_row=2)]
+        # spec 142: `router.import_items` recorta las filas al formato de 8
+        # columnas (`normalizar_filas`) antes de encolarlas -- se usa lo que de
+        # verdad se encoló (vía el mock de `.delay`), no una relectura manual del
+        # archivo crudo, para no reintroducir la ambigüedad de 11 columnas que
+        # esa normalización existe justamente para evitar.
+        filas = mock_task.delay.call_args.args[2]
         import_service.procesar_archivo_importacion(self.db, job, filas)
         self.db.refresh(job)
         self.assertEqual(job.updated_count, 1, job.errors)
@@ -596,6 +719,271 @@ class ImportUnitLinkingTests(unittest.TestCase):
             select(InventoryItem).where(InventoryItem.name == "Insumo sin unidad")
         ).scalar_one_or_none()
         self.assertIsNone(existe)
+
+
+class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
+    """Historia 3 de la spec 142 (P3): columna Grupo (FR-010/FR-012) y columnas
+    Unidad de compra/Factor de conversión (compra) del proveedor preferido
+    (FR-015/FR-016/FR-017/FR-018/FR-019/FR-020a), solo al crear un insumo nuevo
+    (FR-021). Filas de 11 columnas (formato vigente, `INVENTORY_TEMPLATE_HEADERS`)
+    -- llama `validar_y_aplicar_fila` directamente, igual que
+    `ImportUnitLinkingTests`."""
+
+    def setUp(self):
+        self.db = f.new_session()
+
+    def _fila(
+        self, code="", name="Insumo", tipo="Materia prima", unidad="g", grupo="",
+        stock="0", minimo="0", costo="0", proveedor="", unidad_compra="", factor_compra="",
+    ):
+        return [
+            code, name, tipo, unidad, grupo, stock, minimo, costo, proveedor,
+            unidad_compra, factor_compra,
+        ]
+
+    def test_grupo_nuevo_crea_grupo_y_unidad_base_dentro_de_el(self):
+        """FR-010, Acceptance Scenario 1: "Masa" no existe -- se crea el grupo y
+        la unidad base "g" dentro de él."""
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(name="Harina", unidad="g", grupo="Masa"),
+        )
+        self.assertTrue(resultado["ok"], resultado)
+
+        item = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one()
+        unidad = self.db.get(UnitMeasure, item.unit_measure_id)
+        self.assertEqual(unidad.abbreviation, "G")
+        self.assertTrue(unidad.is_base)
+        grupo = self.db.get(UnitMeasureGroup, unidad.group_id)
+        self.assertEqual(grupo.name, "MASA")
+
+    def test_grupo_existente_reutiliza_el_grupo_sin_duplicarlo(self):
+        """FR-010, Acceptance Scenario 2: "Masa" ya existe -- se reutiliza, sin
+        crear un segundo grupo con el mismo nombre."""
+        grupo_existente = f.make_unit_measure_group(self.db, name="MASA")
+        self.db.commit()
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(name="Harina", unidad="g", grupo="Masa"),
+        )
+        self.assertTrue(resultado["ok"], resultado)
+
+        grupos = self.db.execute(
+            select(UnitMeasureGroup).where(UnitMeasureGroup.name == "MASA")
+        ).scalars().all()
+        self.assertEqual(len(grupos), 1)
+        self.assertEqual(grupos[0].id, grupo_existente.id)
+
+    def test_unidad_en_otro_grupo_con_grupo_indicado_falla_por_ambiguedad(self):
+        """FR-012, Acceptance Scenario 4: "g" ya existe en el grupo "Volumen",
+        distinto al grupo "Masa" indicado en la fila -- falla sin crear nada."""
+        otro_grupo = f.make_unit_measure_group(self.db, name="VOLUMEN")
+        f.make_unit(self.db, group=otro_grupo, name="G", abbreviation="g")
+        self.db.commit()
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(name="Insumo ambiguo", unidad="g", grupo="Masa"),
+        )
+        self.assertFalse(resultado["ok"])
+        self.assertIn("grupo", resultado["motivo"])
+        existe = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Insumo ambiguo")
+        ).scalar_one_or_none()
+        self.assertIsNone(existe)
+
+    def test_grupo_existente_con_base_ya_asignada_falla_al_crear_otra_base(self):
+        """Edge case del contrato (ambigüedad de base duplicada): el grupo "Masa"
+        ya tiene una unidad base ("g") -- una fila nueva con una unidad distinta
+        sin coincidencia y el mismo grupo falla, en vez de crear una segunda base
+        (violaría la restricción de una sola base por grupo, spec 137)."""
+        grupo = f.make_unit_measure_group(self.db, name="MASA")
+        f.make_unit(self.db, group=grupo, name="G", abbreviation="g", is_base=True)
+        self.db.commit()
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(name="Insumo", unidad="lb", grupo="Masa"),
+        )
+        self.assertFalse(resultado["ok"])
+        self.assertIn("unidad base", resultado["motivo"])
+
+    def test_unidad_de_compra_coincidente_con_factor_vacio_reutiliza_la_unidad(self):
+        """FR-015, Acceptance Scenario 5: "KG" ya existe en el grupo de la base
+        -- se reutiliza, sin modificar su factor."""
+        grupo = f.make_unit_measure_group(self.db, name="MASA")
+        f.make_unit(self.db, group=grupo, name="G", abbreviation="G", is_base=True)
+        kg = f.make_unit(
+            self.db, group=grupo, name="KG", abbreviation="KG",
+            is_base=False, factor_to_base=Decimal("1000"),
+        )
+        self.db.commit()
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
+                unidad_compra="KG",
+            ),
+        )
+        self.assertTrue(resultado["ok"], resultado)
+
+        item = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one()
+        relacion = self.db.execute(
+            select(SupplierItem).where(SupplierItem.inventory_item_id == item.id)
+        ).scalar_one()
+        self.assertEqual(relacion.unit_measure_id, kg.id)
+        self.db.refresh(kg)
+        self.assertEqual(kg.factor_to_base, Decimal("1000"))
+
+    def test_unidad_de_compra_coincidente_con_factor_distinto_falla_por_conflicto(self):
+        """FR-016, Acceptance Scenario 6: "KG" ya existe con factor 1000 -- una
+        fila con factor 900 falla, sin modificar el factor ya vigente."""
+        grupo = f.make_unit_measure_group(self.db, name="MASA")
+        f.make_unit(self.db, group=grupo, name="G", abbreviation="G", is_base=True)
+        kg = f.make_unit(
+            self.db, group=grupo, name="KG", abbreviation="KG",
+            is_base=False, factor_to_base=Decimal("1000"),
+        )
+        self.db.commit()
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
+                unidad_compra="KG", factor_compra="900",
+            ),
+        )
+        self.assertFalse(resultado["ok"])
+        self.assertIn("factor", resultado["motivo"])
+        self.db.refresh(kg)
+        self.assertEqual(kg.factor_to_base, Decimal("1000"))
+        existe = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one_or_none()
+        self.assertIsNone(existe)
+
+    def test_unidad_de_compra_en_otro_grupo_falla_por_ambiguedad(self):
+        """FR-017: "KG" existe, pero en un grupo distinto al de la unidad base
+        del insumo -- falla, sin usarla como unidad de compra."""
+        grupo_base = f.make_unit_measure_group(self.db, name="MASA")
+        f.make_unit(self.db, group=grupo_base, name="G", abbreviation="G", is_base=True)
+        otro_grupo = f.make_unit_measure_group(self.db, name="OTRO")
+        f.make_unit(self.db, group=otro_grupo, name="KG", abbreviation="KG")
+        self.db.commit()
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
+                unidad_compra="KG", factor_compra="1000",
+            ),
+        )
+        self.assertFalse(resultado["ok"])
+        self.assertIn("otro grupo", resultado["motivo"])
+
+    def test_unidad_de_compra_sin_coincidencia_y_con_factor_crea_unidad_nueva(self):
+        """FR-015, Acceptance Scenario 7: "KG" no existe en el grupo de la base
+        -- se crea dentro de ese mismo grupo, con el factor de la fila."""
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
+                unidad_compra="KG", factor_compra="1000",
+            ),
+        )
+        self.assertTrue(resultado["ok"], resultado)
+
+        item = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one()
+        base = self.db.get(UnitMeasure, item.unit_measure_id)
+        relacion = self.db.execute(
+            select(SupplierItem).where(SupplierItem.inventory_item_id == item.id)
+        ).scalar_one()
+        compra = self.db.get(UnitMeasure, relacion.unit_measure_id)
+        self.assertEqual(compra.abbreviation, "KG")
+        self.assertEqual(compra.factor_to_base, Decimal("1000"))
+        self.assertFalse(compra.is_base)
+        self.assertEqual(compra.group_id, base.group_id)
+
+    def test_unidad_de_compra_sin_coincidencia_y_sin_factor_falla_por_dato_obligatorio(self):
+        """FR-018, Acceptance Scenario 8: "KG" no existe en el grupo de la base y
+        la fila no trae factor -- falla, no se crea el insumo."""
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
+                unidad_compra="KG",
+            ),
+        )
+        self.assertFalse(resultado["ok"])
+        self.assertIn("obligatorio", resultado["motivo"])
+        existe = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one_or_none()
+        self.assertIsNone(existe)
+
+    def test_unidad_de_compra_sin_proveedor_preferido_falla_toda_la_fila(self):
+        """FR-020a, Acceptance Scenario 11: Unidad de compra llena sin Proveedor
+        preferido -- falla antes de crear el insumo, la unidad o la relación."""
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                name="Harina", unidad="g", grupo="Masa",
+                unidad_compra="KG", factor_compra="1000",
+            ),
+        )
+        self.assertFalse(resultado["ok"])
+        self.assertIn("Proveedor preferido", resultado["motivo"])
+        existe = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one_or_none()
+        self.assertIsNone(existe)
+
+    def test_sin_unidad_de_compra_la_relacion_queda_en_modo_legado_null(self):
+        """FR-020, sin cambio: Proveedor preferido sin Unidad de compra sigue
+        creando la relación con `unit_measure_id=NULL`."""
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(name="Harina", unidad="g", proveedor="Molino XYZ"),
+        )
+        self.assertTrue(resultado["ok"], resultado)
+
+        item = self.db.execute(
+            select(InventoryItem).where(InventoryItem.name == "Harina")
+        ).scalar_one()
+        relacion = self.db.execute(
+            select(SupplierItem).where(SupplierItem.inventory_item_id == item.id)
+        ).scalar_one()
+        self.assertIsNone(relacion.unit_measure_id)
+        self.assertIsNone(relacion.presentation)
+        self.assertIsNone(relacion.conversion_factor)
+
+    def test_actualizacion_ignora_grupo_unidad_de_compra_y_factor(self):
+        """FR-021: una fila que actualiza un insumo existente nunca resuelve
+        Grupo ni Unidad de compra/Factor, aunque vengan llenas con valores que
+        entrarían en conflicto si se evaluaran."""
+        base = f.make_unit(self.db, name="Gramo", abbreviation="G")
+        item = f.make_inventory_item(self.db, name="Harina", code="0001", unit=base)
+        self.db.commit()
+        grupos_antes = set(self.db.execute(select(UnitMeasureGroup.id)).scalars().all())
+        unidades_antes = set(self.db.execute(select(UnitMeasure.id)).scalars().all())
+
+        resultado = import_service.validar_y_aplicar_fila(
+            self.db, self._fila(
+                code="0001", name="Harina", unidad="g", grupo="Masa",
+                proveedor="Molino XYZ", unidad_compra="KG", factor_compra="1000",
+            ),
+        )
+        self.assertTrue(resultado["ok"], resultado)
+        self.assertEqual(resultado["accion"], "actualizado")
+
+        self.db.refresh(item)
+        self.assertEqual(item.unit_measure_id, base.id)
+        grupos_despues = set(self.db.execute(select(UnitMeasureGroup.id)).scalars().all())
+        unidades_despues = set(self.db.execute(select(UnitMeasure.id)).scalars().all())
+        self.assertEqual(grupos_antes, grupos_despues, "no debía crear ningún grupo nuevo")
+        self.assertEqual(unidades_antes, unidades_despues, "no debía crear ninguna unidad nueva")
+        relacion = self.db.execute(
+            select(SupplierItem).where(SupplierItem.inventory_item_id == item.id)
+        ).scalar_one()
+        self.assertTrue(relacion.preferred)
+        self.assertIsNone(relacion.unit_measure_id)
 
 
 class ImportUnitUnchangedOnUpdateTests(unittest.TestCase):

@@ -11,6 +11,7 @@ from openpyxl import Workbook
 
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
+from app.models.unit_measure_group import UnitMeasureGroup
 from app.api.v1.inventory.schemas import INVENTORY_TEMPLATE_HEADERS
 
 
@@ -23,6 +24,8 @@ def build_inventory_excel(
     items: list[InventoryItem],
     unit_measures_by_id: dict[UUID, UnitMeasure],
     preferred_by_item: dict[UUID, dict] | None = None,
+    groups_by_id: dict[UUID, UnitMeasureGroup] | None = None,
+    purchase_unit_by_item: dict[UUID, tuple[str, Decimal]] | None = None,
 ) -> io.BytesIO:
     """Arma el workbook completo en memoria: fila 1 con `INVENTORY_TEMPLATE_HEADERS`
     (FR-001/FR-002) y una fila por cada `InventoryItem` recibido, con Stock/Mínimo/
@@ -31,24 +34,37 @@ def build_inventory_excel(
     preferido (esos datos solo son editables desde el módulo de proveedores), pero
     conservó el nombre del proveedor preferido mismo. `preferred_by_item` es el
     resultado de `supplier_items.preferred_relations_by_item` -- un insumo sin
-    proveedor preferido deja esa columna en blanco, sin error."""
+    proveedor preferido deja esa columna en blanco, sin error.
+
+    Spec 142, Historia 3: `Grupo` es siempre el `name` del `UnitMeasureGroup` de la
+    unidad base del insumo (`groups_by_id`); `Unidad de compra`/`Factor de conversión
+    (compra)` (`purchase_unit_by_item`) solo se exportan si la relación preferida está
+    en modo `unit_measure_id` (spec 140) -- en blanco si no hay proveedor preferido o
+    si su relación preferida está en modo legado (`presentation`/`conversion_factor`)."""
     preferred_by_item = preferred_by_item or {}
+    groups_by_id = groups_by_id or {}
+    purchase_unit_by_item = purchase_unit_by_item or {}
     wb = Workbook()
     ws = wb.active
     ws.append(INVENTORY_TEMPLATE_HEADERS)
 
     for item in items:
         unit = unit_measures_by_id.get(item.unit_measure_id)
+        group = groups_by_id.get(unit.group_id) if unit is not None else None
         preferred = preferred_by_item.get(item.id)
+        purchase_unit = purchase_unit_by_item.get(item.id)
         ws.append([
             item.code,
             item.name,
             _type_label(item.type),
             unit.abbreviation if unit is not None else "",
+            group.name if group is not None else "",
             item.current_stock,
             item.min_stock,
             item.unit_cost,
             preferred["supplier_name"] if preferred else "",
+            purchase_unit[0] if purchase_unit else "",
+            purchase_unit[1] if purchase_unit else "",
         ])
 
     buffer = io.BytesIO()
