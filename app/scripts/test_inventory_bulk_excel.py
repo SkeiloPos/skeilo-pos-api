@@ -111,9 +111,13 @@ def _row_by_header(headers: list[str], values: list, header: str):
 def test_export_incluye_proveedor_preferido_sin_presentacion_ni_factor(db, item, unit):
     """spec 138, FR-001/FR-002: la plantilla trae código y el nombre del
     proveedor preferido, pero ya no trae presentación/factor de conversión/
-    último costo."""
+    último costo legados (spec 142: sí trae Grupo, y Unidad de
+    compra/Factor de conversión (compra) en modo `unit_measure_id`)."""
+    grupo = db.get(UnitMeasureGroup, unit.group_id)
     preferred = supplier_items.preferred_relations_by_item(db, [item.id])
-    buffer = build_inventory_excel([item], {unit.id: unit}, preferred)
+    buffer = build_inventory_excel(
+        [item], {unit.id: unit}, preferred, {grupo.id: grupo},
+    )
 
     import openpyxl
     wb = openpyxl.load_workbook(buffer)
@@ -124,7 +128,8 @@ def test_export_incluye_proveedor_preferido_sin_presentacion_ni_factor(db, item,
     assert "Último costo" not in headers
     row = [c.value for c in next(wb.active.iter_rows(min_row=2, max_row=2))]
     assert _row_by_header(headers, row, "Código") == item.code
-    assert len(row) == 8, row
+    assert _row_by_header(headers, row, "Grupo") == grupo.name
+    assert len(row) == len(INVENTORY_TEMPLATE_HEADERS), row
     print("OK: export_incluye_proveedor_preferido_sin_presentacion_ni_factor")
 
 
@@ -289,15 +294,27 @@ def test_estructura_alterada_no_crea_job():
 
 
 def test_archivo_legado_de_11_columnas_se_acepta_sin_error_de_estructura():
-    """spec 138, FR-003: un archivo exportado antes de este cambio (11
-    columnas, con presentación/factor/último costo al final) se sigue
-    aceptando."""
+    """spec 138, FR-003: un archivo exportado antes de la spec 139 (11
+    columnas, con presentación/factor/último costo al final en vez de Grupo/
+    Unidad de compra/Factor de conversión (compra)) se sigue aceptando."""
     legacy_headers = [
-        *INVENTORY_TEMPLATE_HEADERS,
-        "Presentación", "Factor de conversión", "Último costo",
+        "Código", "Nombre", "Tipo", "Unidad", "Stock", "Mínimo", "Costo",
+        "Proveedor preferido", "Presentación", "Factor de conversión", "Último costo",
     ]
     assert validar_estructura(legacy_headers) is None
     print("OK: archivo_legado_de_11_columnas_se_acepta_sin_error_de_estructura")
+
+
+def test_archivo_de_8_columnas_de_la_spec_139_se_acepta_sin_error_de_estructura():
+    """spec 142, contrato de plantilla: un archivo exportado entre la spec 139
+    y esta spec (8 columnas, sin Grupo/Unidad de compra/Factor) se sigue
+    aceptando."""
+    headers_139 = [
+        "Código", "Nombre", "Tipo", "Unidad", "Stock", "Mínimo", "Costo",
+        "Proveedor preferido",
+    ]
+    assert validar_estructura(headers_139) is None
+    print("OK: archivo_de_8_columnas_de_la_spec_139_se_acepta_sin_error_de_estructura")
 
 
 def test_proveedor_preferido_marca_relacion_existente_sin_integrity_error(db, item, unit):
@@ -499,6 +516,247 @@ def test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit):
     print("OK: interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado")
 
 
+def _fila_h3(
+    code, name, unidad, grupo="", stock="0", minimo="0", costo="0",
+    proveedor="", unidad_compra="", factor_compra="",
+):
+    """Fila de 11 columnas (formato vigente, `INVENTORY_TEMPLATE_HEADERS`) para
+    los escenarios de Historia 3 (spec 142)."""
+    return [
+        code, name, "Materia prima", unidad, grupo, stock, minimo, costo,
+        proveedor, unidad_compra, factor_compra,
+    ]
+
+
+def test_h3_grupo_nuevo_y_luego_reutilizado(db):
+    """Combina quickstart.md Historia 3, escenarios 1 y 2, en una sola prueba
+    (la segunda depende del grupo que crea la primera)."""
+    grupo_nombre, unidad_base = test_h3_grupo_nuevo_vincula_unidad_base_y_unidad_de_compra(db)
+    test_h3_grupo_existente_reutiliza_el_grupo_sin_duplicarlo(db, grupo_nombre, unidad_base)
+
+
+def test_h3_grupo_nuevo_vincula_unidad_base_y_unidad_de_compra(db):
+    """quickstart.md, Historia 3, escenario 1: grupo "Masa" no existe todavía --
+    se crea junto con la unidad base "g" y, para el proveedor preferido, una
+    `UnitMeasure` "KG" nueva dentro del mismo grupo con el factor de la fila."""
+    etiqueta = uuid4().hex[:6]
+    code = f"T{etiqueta}"
+    grupo_nombre = f"Masa-test-{etiqueta}"
+    unidad_base = f"g{etiqueta}"
+    unidad_compra = f"kg{etiqueta}"
+    proveedor_nombre = f"Molino XYZ {etiqueta}"
+    fila = _fila_h3(
+        code, f"Harina-{etiqueta}", unidad_base, grupo=grupo_nombre,
+        proveedor=proveedor_nombre, unidad_compra=unidad_compra, factor_compra="1000",
+    )
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code)
+
+    item = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code)
+    ).scalar_one()
+    base = db.get(UnitMeasure, item.unit_measure_id)
+    grupo = db.get(UnitMeasureGroup, base.group_id)
+    assert grupo.name == grupo_nombre.upper()
+    assert base.is_base is True
+    _unidades_extra.append(base.id)
+    _grupos_extra.append(grupo.id)
+
+    proveedor = db.execute(
+        select(Supplier).where(Supplier.name == proveedor_nombre.upper())
+    ).scalar_one()
+    _proveedores_extra.append(proveedor.id)
+    relacion = db.execute(
+        select(SupplierItem).where(
+            SupplierItem.inventory_item_id == item.id,
+            SupplierItem.supplier_id == proveedor.id,
+        )
+    ).scalar_one()
+    assert relacion.preferred is True
+    compra = db.get(UnitMeasure, relacion.unit_measure_id)
+    assert compra is not None, "la unidad de compra debía quedar resuelta"
+    assert compra.abbreviation == unidad_compra.upper()
+    assert compra.factor_to_base == Decimal("1000")
+    assert compra.group_id == grupo.id
+    _unidades_extra.append(compra.id)
+    print("OK: h3_grupo_nuevo_vincula_unidad_base_y_unidad_de_compra")
+    return grupo_nombre, unidad_base
+
+
+def test_h3_grupo_existente_reutiliza_el_grupo_sin_duplicarlo(db, grupo_nombre: str, unidad_base: str):
+    """quickstart.md, Historia 3, escenario 2: el grupo ya existe (creado por el
+    escenario anterior) -- se reutiliza, sin duplicar grupo ni unidad."""
+    antes_grupos = set(db.execute(select(UnitMeasureGroup.id)).scalars().all())
+    etiqueta = uuid4().hex[:6]
+    code = f"T{etiqueta}"
+    fila = _fila_h3(code, f"Harina-2-{etiqueta}", unidad_base, grupo=grupo_nombre)
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code)
+
+    despues_grupos = set(db.execute(select(UnitMeasureGroup.id)).scalars().all())
+    assert despues_grupos == antes_grupos, "no debía crear un segundo grupo"
+    item = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code)
+    ).scalar_one()
+    base = db.get(UnitMeasure, item.unit_measure_id)
+    assert base.group.name == grupo_nombre.upper()
+    print("OK: h3_grupo_existente_reutiliza_el_grupo_sin_duplicarlo")
+
+
+def test_h3_conflicto_de_factor_falla_sin_modificar_el_vigente(db):
+    """quickstart.md, Historia 3, escenario 3: la unidad de compra "KG" ya
+    existe con un factor -- una fila con un factor distinto falla, sin
+    modificar el factor ya vigente."""
+    etiqueta = uuid4().hex[:6]
+    grupo_nombre = f"Masa-conflicto-{etiqueta}"
+    unidad_base = f"g{etiqueta}"
+    unidad_compra = f"kg{etiqueta}"
+    proveedor_nombre = f"Molino conflicto {etiqueta}"
+    code_base = f"T{etiqueta}A"
+    fila_base = _fila_h3(
+        code_base, f"Harina-base-{etiqueta}", unidad_base, grupo=grupo_nombre,
+        proveedor=proveedor_nombre, unidad_compra=unidad_compra, factor_compra="1000",
+    )
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila_base])
+    db.refresh(job)
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code_base)
+
+    item_base = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code_base)
+    ).scalar_one()
+    base = db.get(UnitMeasure, item_base.unit_measure_id)
+    _unidades_extra.append(base.id)
+    _grupos_extra.append(base.group_id)
+    proveedor = db.execute(
+        select(Supplier).where(Supplier.name == proveedor_nombre.upper())
+    ).scalar_one()
+    _proveedores_extra.append(proveedor.id)
+    relacion_base = db.execute(
+        select(SupplierItem).where(
+            SupplierItem.inventory_item_id == item_base.id,
+            SupplierItem.supplier_id == proveedor.id,
+        )
+    ).scalar_one()
+    kg = db.get(UnitMeasure, relacion_base.unit_measure_id)
+    _unidades_extra.append(kg.id)
+    assert kg.factor_to_base == Decimal("1000")
+
+    code_conflicto = f"T{etiqueta}B"
+    fila_conflicto = _fila_h3(
+        code_conflicto, f"Harina-conflicto-{etiqueta}", unidad_base, grupo=grupo_nombre,
+        proveedor=proveedor_nombre, unidad_compra=unidad_compra, factor_compra="900",
+    )
+    job2 = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job2, [fila_conflicto])
+    db.refresh(job2)
+    assert job2.failed_count == 1, job2.errors
+    assert job2.created_count == 0
+    db.refresh(kg)
+    assert kg.factor_to_base == Decimal("1000"), "no debía modificarse el factor vigente"
+    print("OK: h3_conflicto_de_factor_falla_sin_modificar_el_vigente")
+
+
+def test_h3_unidad_de_compra_sin_proveedor_falla_la_fila(db, unit):
+    """quickstart.md, Historia 3, escenario 4: Unidad de compra llena sin
+    Proveedor preferido -- falla sin crear el insumo (FR-020a)."""
+    etiqueta = uuid4().hex[:6]
+    code = f"T{etiqueta}"
+    fila = _fila_h3(
+        code, f"Sin-proveedor-{etiqueta}", unit.abbreviation,
+        unidad_compra="KG", factor_compra="1000",
+    )
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.failed_count == 1, job.errors
+    assert job.created_count == 0
+    existe = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code)
+    ).scalar_one_or_none()
+    assert existe is None
+    print("OK: h3_unidad_de_compra_sin_proveedor_falla_la_fila")
+
+
+def test_h3_ambiguedad_de_grupo_en_unidad_base_falla_sin_crear_nada(db, unit):
+    """quickstart.md, Historia 3, escenario 5: la unidad base del fixture ya
+    existe en su propio grupo -- una fila con esa misma unidad pero otro grupo
+    indicado falla por ambigüedad, sin crear ni modificar nada."""
+    etiqueta = uuid4().hex[:6]
+    code = f"T{etiqueta}"
+    otro_grupo = f"Otro-grupo-{etiqueta}"
+    fila = _fila_h3(
+        code, f"Ambiguo-{etiqueta}", unit.abbreviation, grupo=otro_grupo,
+    )
+    antes_grupos = set(db.execute(select(UnitMeasureGroup.id)).scalars().all())
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.failed_count == 1, job.errors
+    assert job.created_count == 0
+    despues_grupos = set(db.execute(select(UnitMeasureGroup.id)).scalars().all())
+    assert despues_grupos == antes_grupos, "no debía crear ningún grupo"
+    existe = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code)
+    ).scalar_one_or_none()
+    assert existe is None
+    print("OK: h3_ambiguedad_de_grupo_en_unidad_base_falla_sin_crear_nada")
+
+
+def test_h3_actualizacion_ignora_grupo_y_unidad_de_compra(db, item, unit):
+    """quickstart.md, Historia 3, escenario 6: actualizar un insumo existente
+    con Grupo/Unidad de compra/Factor llenos no cambia la unidad del insumo ni
+    crea ningún grupo/unidad/relación nueva (FR-021)."""
+    antes_grupos = set(db.execute(select(UnitMeasureGroup.id)).scalars().all())
+    antes_unidades = set(db.execute(select(UnitMeasure.id)).scalars().all())
+    proveedor_nombre = f"Proveedor-h3-{uuid4().hex[:5]}"
+    fila = _fila_h3(
+        item.code, item.name, unit.abbreviation, grupo="Grupo que se ignora",
+        stock=str(item.current_stock), minimo=str(item.min_stock), costo="555",
+        proveedor=proveedor_nombre, unidad_compra="UNIDAD-IGNORADA",
+        factor_compra="123",
+    )
+    job = _job(db, item.id, 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.updated_count == 1, job.errors
+    db.refresh(item)
+    assert item.unit_measure_id == unit.id, "la unidad del insumo no debía cambiar"
+    assert item.unit_cost == Decimal("555")
+
+    despues_grupos = set(db.execute(select(UnitMeasureGroup.id)).scalars().all())
+    despues_unidades = set(db.execute(select(UnitMeasure.id)).scalars().all())
+    assert despues_grupos == antes_grupos, "no debía crear ningún grupo nuevo"
+    assert despues_unidades == antes_unidades, "no debía crear ninguna unidad nueva"
+
+    proveedor = db.execute(
+        select(Supplier).where(Supplier.name == proveedor_nombre.upper())
+    ).scalar_one()
+    _proveedores_extra.append(proveedor.id)
+    relacion = db.execute(
+        select(SupplierItem).where(
+            SupplierItem.inventory_item_id == item.id,
+            SupplierItem.supplier_id == proveedor.id,
+        )
+    ).scalar_one()
+    assert relacion.unit_measure_id is None, "la unidad de compra debía ignorarse"
+    print("OK: h3_actualizacion_ignora_grupo_y_unidad_de_compra")
+
+
 def main() -> None:
     schema = _schema()
     print(f"Usando tenant con esquema: {schema}")
@@ -513,6 +771,7 @@ def main() -> None:
             lambda: test_filas_con_errores_distintos_fallan_individualmente(db, unit),
             test_estructura_alterada_no_crea_job,
             test_archivo_legado_de_11_columnas_se_acepta_sin_error_de_estructura,
+            test_archivo_de_8_columnas_de_la_spec_139_se_acepta_sin_error_de_estructura,
             lambda: test_codigos_duplicados_en_el_archivo_fallan_ambas(db, unit),
             lambda: test_nombre_duplicado_contra_insumo_existente_falla_la_fila(db, unit, item),
             lambda: test_job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes(db, unit, schema),
@@ -522,6 +781,11 @@ def main() -> None:
             lambda: test_actualizar_insumo_existente_ignora_la_unidad_de_la_fila(db, item, unit),
             lambda: test_proveedor_preferido_marca_relacion_existente_sin_integrity_error(db, item, unit),
             lambda: test_proveedor_preferido_sin_relacion_activa_crea_proveedor_y_relacion_con_null(db, item, unit),
+            lambda: test_h3_grupo_nuevo_y_luego_reutilizado(db),
+            lambda: test_h3_conflicto_de_factor_falla_sin_modificar_el_vigente(db),
+            lambda: test_h3_unidad_de_compra_sin_proveedor_falla_la_fila(db, unit),
+            lambda: test_h3_ambiguedad_de_grupo_en_unidad_base_falla_sin_crear_nada(db, unit),
+            lambda: test_h3_actualizacion_ignora_grupo_y_unidad_de_compra(db, item, unit),
         ]
         fallos = 0
         try:

@@ -21,10 +21,13 @@ INVENTORY_TEMPLATE_HEADERS = [
     "Nombre",
     "Tipo",
     "Unidad",
+    "Grupo",
     "Stock",
     "Mínimo",
     "Costo",
     "Proveedor preferido",
+    "Unidad de compra",
+    "Factor de conversión (compra)",
 ]
 
 

@@ -28,34 +28,80 @@ from app.api.v1.inventory.schemas import INVENTORY_TEMPLATE_HEADERS
 
 _TYPE_LABELS = {"Materia prima": "raw_material", "Empacado": "packaged"}
 
-# Índices de columna dentro de una fila, en el mismo orden que
-# INVENTORY_TEMPLATE_HEADERS (data-model.md): las últimas 3 columnas de la
-# plantilla previa a la spec 138 (presentación/factor/último costo) ya no
-# existen -- solo el nombre del proveedor preferido se conserva.
-_CODE, _NAME, _TYPE, _UNIT, _STOCK, _MIN, _COST, _SUPPLIER = range(8)
+# spec 139: plantilla previa a esta spec, sin Grupo/Unidad de compra/Factor de
+# conversión (compra) -- un archivo exportado entre la spec 139 y esta spec
+# sigue aceptándose con esta forma (contracts/plantilla-excel-inventario.md).
+_FORMAT_8_HEADERS = [
+    "Código", "Nombre", "Tipo", "Unidad", "Stock", "Mínimo", "Costo",
+    "Proveedor preferido",
+]
 
-# spec 109: plantilla previa a la spec 138, con 3 columnas más al final
+# spec 109: plantilla legada previa a la spec 138, con 3 columnas más al final
 # (presentación/factor de conversión/último costo). Un archivo exportado antes
 # de la spec 138 sigue aceptándose con esta forma (FR-003); el contenido de
-# esas 3 columnas se ignora por completo (FR-004) -- por eso ningún índice las
-# referencia.
-_LEGACY_TEMPLATE_HEADERS = [
-    *INVENTORY_TEMPLATE_HEADERS,
+# esas 3 columnas se ignora por completo (FR-004).
+_FORMAT_11_HEADERS = [
+    *_FORMAT_8_HEADERS,
     "Presentación", "Factor de conversión", "Último costo",
 ]
+
+# Índices de columna por formato de encabezado aceptado (data-model.md): el
+# formato vigente (`INVENTORY_TEMPLATE_HEADERS`) trae Grupo y las columnas de
+# unidad de compra; el formato de la spec 139 (8 columnas, sin esas 3) comparte
+# los mismos índices para lo que sí tiene -- `None` marca una columna que no
+# existe en ese formato. El formato legado de la spec 109 (11 columnas, con
+# Presentación/Factor de conversión/Último costo en vez de Grupo/Unidad de
+# compra/Factor de conversión (compra)) coincide en longitud con el formato
+# vigente -- `normalizar_filas()` lo recorta a la forma de 8 columnas antes de
+# que una fila individual llegue aquí, así que nunca hay ambigüedad real por
+# tamaño en este punto.
+_IDX_VIGENTE = {
+    "CODE": 0, "NAME": 1, "TYPE": 2, "UNIT": 3, "GROUP": 4, "STOCK": 5, "MIN": 6,
+    "COST": 7, "SUPPLIER": 8, "PURCHASE_UNIT": 9, "PURCHASE_FACTOR": 10,
+}
+_IDX_FORMATO_8 = {
+    "CODE": 0, "NAME": 1, "TYPE": 2, "UNIT": 3, "GROUP": None, "STOCK": 4, "MIN": 5,
+    "COST": 6, "SUPPLIER": 7, "PURCHASE_UNIT": None, "PURCHASE_FACTOR": None,
+}
+
+
+def _indices(fila_len: int) -> dict[str, int | None]:
+    return _IDX_VIGENTE if fila_len == len(INVENTORY_TEMPLATE_HEADERS) else _IDX_FORMATO_8
+
+
+def _col(fila: list[Any], idx: dict[str, int | None], key: str) -> Any:
+    i = idx[key]
+    if i is None or i >= len(fila):
+        return None
+    return fila[i]
+
+
+def normalizar_filas(headers: list[Any], filas: list[list[Any]]) -> list[list[Any]]:
+    """Router.py llama a esto justo después de que `validar_estructura` acepte el
+    archivo, antes de encolar las filas para su procesamiento: el formato legado
+    de la spec 109 (11 columnas) coincide en longitud con el formato vigente
+    (también 11), pero sus últimas 3 columnas (Presentación/Factor de
+    conversión/Último costo) no son Grupo/Unidad de compra/Factor de conversión
+    (compra) -- se descartan aquí (ya se ignoraban por completo, FR-004),
+    dejando la fila con la misma forma de 8 columnas que el formato de la spec
+    139. Así, el resto del módulo (`_indices`) nunca necesita adivinar el
+    formato de origen de una fila ambigua por tamaño."""
+    if list(headers) == _FORMAT_11_HEADERS:
+        return [list(fila[:8]) for fila in filas]
+    return filas
 
 
 def validar_estructura(headers: list[Any]) -> list[str] | None:
     """FR-005/FR-003: compara las cabeceras del archivo subido contra la plantilla
-    vigente (8 columnas) o la plantilla legada previa a la spec 138 (11 columnas),
-    nombre y orden exactos. Devuelve la lista de problemas, o `None` si
-    corresponde."""
+    vigente, la plantilla de la spec 139 (8 columnas) o la plantilla legada
+    previa a la spec 138 (11 columnas), nombre y orden exactos. Devuelve la
+    lista de problemas, o `None` si corresponde a alguna de las tres."""
     headers = list(headers)
-    if headers == INVENTORY_TEMPLATE_HEADERS or headers == _LEGACY_TEMPLATE_HEADERS:
+    formatos_validos = (INVENTORY_TEMPLATE_HEADERS, _FORMAT_8_HEADERS, _FORMAT_11_HEADERS)
+    if headers in formatos_validos:
         return None
-    esperado = (
-        _LEGACY_TEMPLATE_HEADERS if len(headers) == len(_LEGACY_TEMPLATE_HEADERS)
-        else INVENTORY_TEMPLATE_HEADERS
+    esperado = next(
+        (f for f in formatos_validos if len(f) == len(headers)), INVENTORY_TEMPLATE_HEADERS,
     )
     problemas = []
     if len(headers) != len(esperado):
@@ -84,19 +130,35 @@ def _parse_decimal(valor: Any, campo: str) -> Decimal:
     return numero
 
 
-def _resolve_unit(db: Session, nombre_unidad: Any) -> UnitMeasure:
-    """FR-006/FR-008/FR-009: vincula la columna Unidad de una fila que crea un
-    insumo nuevo a una `UnitMeasure` existente del negocio (case-insensitive por
-    `abbreviation`) o crea una completa -- grupo propio nuevo, unidad base de ese
-    grupo, factor 1 -- si ninguna coincide. Solo se llama al crear: una fila que
-    actualiza un insumo existente nunca pasa por aquí (FR-007, ver
-    `validar_y_aplicar_fila`), así que no hay riesgo de recrear la unidad de un
-    insumo ya registrado. La comparación y el guardado son siempre en mayúscula,
-    sin distinguir cómo venía escrita en el Excel."""
+def _resolve_or_create_group(db: Session, nombre_normalizado: str) -> UnitMeasureGroup:
+    """FR-010: reutiliza un `UnitMeasureGroup` existente por `name` case-insensitive,
+    o lo crea si no existe todavía."""
+    grupo = db.execute(
+        select(UnitMeasureGroup).where(func.upper(UnitMeasureGroup.name) == nombre_normalizado)
+    ).scalar_one_or_none()
+    if grupo is not None:
+        return grupo
+    grupo = UnitMeasureGroup(name=nombre_normalizado)
+    db.add(grupo)
+    db.flush()
+    return grupo
+
+
+def _resolve_unit(db: Session, nombre_unidad: Any, nombre_grupo: Any = None) -> UnitMeasure:
+    """FR-006/FR-008/FR-009/FR-010/FR-012: vincula la columna Unidad de una fila que
+    crea un insumo nuevo a una `UnitMeasure` existente del negocio (case-insensitive
+    por `abbreviation`) o crea una completa -- grupo nuevo o reutilizado según la
+    columna Grupo, unidad base de ese grupo, factor 1 -- si ninguna coincide. Solo se
+    llama al crear: una fila que actualiza un insumo existente nunca pasa por aquí
+    (FR-007/FR-013, ver `validar_y_aplicar_fila`), así que no hay riesgo de recrear la
+    unidad de un insumo ya registrado. La comparación y el guardado son siempre en
+    mayúscula, sin distinguir cómo venía escrita en el Excel."""
     if not nombre_unidad or not str(nombre_unidad).strip():
         raise ValueError("Unidad es obligatoria")
     texto = str(nombre_unidad).strip()
     normalizado = texto.upper()
+    grupo_texto = str(nombre_grupo).strip() if nombre_grupo and str(nombre_grupo).strip() else None
+    grupo_normalizado = grupo_texto.upper() if grupo_texto else None
 
     candidatos = db.execute(
         select(UnitMeasure).where(func.upper(UnitMeasure.abbreviation) == normalizado)
@@ -107,7 +169,13 @@ def _resolve_unit(db: Session, nombre_unidad: Any) -> UnitMeasure:
             f"mayúsculas/minúsculas; corrígelo manualmente antes de reimportar"
         )
     if candidatos:
-        return candidatos[0]
+        unidad = candidatos[0]
+        if grupo_normalizado is not None and unidad.group.name.upper() != grupo_normalizado:
+            raise ValueError(
+                f"la unidad '{texto}' ya existe en el grupo '{unidad.group.name}', distinto "
+                f"al grupo '{grupo_texto}' indicado; corrígelo manualmente antes de reimportar"
+            )
+        return unidad
 
     conflicto = db.execute(
         select(UnitMeasure).where(func.upper(UnitMeasure.name) == normalizado)
@@ -121,13 +189,87 @@ def _resolve_unit(db: Session, nombre_unidad: Any) -> UnitMeasure:
     # Spec 137/139: `group_id` es NOT NULL -- toda unidad nueva necesita su propio
     # grupo antes de poder crearse (mismo patrón que
     # unit_measure_groups.router.create_unit_measure_group).
-    grupo = UnitMeasureGroup(name=normalizado)
-    db.add(grupo)
-    db.flush()
+    if grupo_normalizado is not None:
+        grupo = _resolve_or_create_group(db, grupo_normalizado)
+        existing_base = next((u for u in grupo.units if u.is_base), None)
+        if existing_base is not None:
+            raise ValueError(
+                f"el grupo '{grupo.name}' ya tiene una unidad base ('{existing_base.abbreviation}'); "
+                f"no se puede crear otra unidad base '{texto}' en el mismo grupo"
+            )
+    else:
+        grupo = UnitMeasureGroup(name=normalizado)
+        db.add(grupo)
+        db.flush()
 
     unidad = UnitMeasure(
         name=normalizado, abbreviation=normalizado,
         group_id=grupo.id, is_base=True, factor_to_base=1,
+    )
+    db.add(unidad)
+    db.flush()
+    return unidad
+
+
+def _resolve_purchase_unit(
+    db: Session, group_id: Any, nombre_unidad: Any, factor: Any,
+) -> UnitMeasure:
+    """research.md D7/data-model.md: resuelve o crea la `UnitMeasure` de la unidad de
+    compra del proveedor preferido, acotada al mismo `group_id` que la unidad base del
+    insumo (FR-015/FR-016/FR-017/FR-018). Solo se llama al crear un insumo nuevo con
+    `Proveedor preferido` y `Unidad de compra` ambos presentes."""
+    texto = str(nombre_unidad).strip()
+    normalizado = texto.upper()
+    factor_valor = None
+    if factor is not None and str(factor).strip():
+        factor_valor = _parse_decimal(factor, "Factor de conversión (compra)")
+
+    en_grupo = db.execute(
+        select(UnitMeasure).where(
+            UnitMeasure.group_id == group_id,
+            UnitMeasure.active.is_(True),
+            (func.upper(UnitMeasure.abbreviation) == normalizado)
+            | (func.upper(UnitMeasure.name) == normalizado),
+        )
+    ).scalars().all()
+    if len(en_grupo) > 1:
+        raise ValueError(
+            f"hay más de una unidad en el grupo que coincide con '{texto}' sin distinguir "
+            f"mayúsculas/minúsculas; corrígelo manualmente antes de reimportar"
+        )
+    if en_grupo:
+        unidad = en_grupo[0]
+        if factor_valor is not None and factor_valor != unidad.factor_to_base:
+            raise ValueError(
+                f"la unidad de compra '{texto}' ya existe con un factor de conversión de "
+                f"{unidad.factor_to_base}, distinto al indicado ({factor_valor}); no se "
+                f"modifica el factor ya vigente"
+            )
+        return unidad
+
+    en_otro_grupo = db.execute(
+        select(UnitMeasure).where(
+            UnitMeasure.group_id != group_id,
+            UnitMeasure.active.is_(True),
+            (func.upper(UnitMeasure.abbreviation) == normalizado)
+            | (func.upper(UnitMeasure.name) == normalizado),
+        )
+    ).scalars().all()
+    if en_otro_grupo:
+        raise ValueError(
+            f"ya existe una unidad llamada '{texto}' en otro grupo distinto al de la unidad "
+            f"base de este insumo; no se puede usar como unidad de compra"
+        )
+
+    if factor_valor is None:
+        raise ValueError(
+            f"Factor de conversión (compra) es obligatorio para crear la unidad de compra "
+            f"'{texto}'"
+        )
+
+    unidad = UnitMeasure(
+        name=normalizado, abbreviation=normalizado,
+        group_id=group_id, is_base=False, factor_to_base=factor_valor,
     )
     db.add(unidad)
     db.flush()
@@ -175,20 +317,36 @@ def _resolve_supplier(db: Session, nombre_proveedor: str) -> Supplier:
     return supplier
 
 
-def _apply_preferred_supplier(db: Session, item: InventoryItem, fila: list[Any]) -> None:
+def _apply_preferred_supplier(
+    db: Session, item: InventoryItem, fila: list[Any], idx: dict[str, int | None], *, creado: bool,
+) -> None:
     """Spec 138 (ajuste pedido por el usuario): la columna Proveedor preferido
     vincula (o crea) el proveedor y marca como preferida su relación con este
-    insumo -- creándola si no existía todavía, ya que la plantilla ya no trae
-    presentación ni factor de conversión (FR-001/FR-002), esa relación nueva
-    queda con esos dos campos en `NULL` hasta que el administrador la completa
-    desde el módulo de proveedores (estado intermedio, a refinar en una spec
-    futura). Si la columna viene vacía, no toca nada (no borra la preferida
-    actual). Nunca modifica presentación/factor/último costo de una relación ya
+    insumo -- creándola si no existía todavía. Spec 142, solo al **crear** un
+    insumo nuevo (`creado=True`, FR-021: al actualizar estas columnas se ignoran
+    igual que ya se ignoraba Unidad): si la fila trae también `Unidad de compra`,
+    la relación nueva queda con `unit_measure_id` resuelto por
+    `_resolve_purchase_unit` en vez de con `presentation`/`conversion_factor` en
+    `NULL` (FR-015/FR-019); sin unidad de compra, ambos campos quedan en `NULL`
+    como antes (FR-020). Si la columna Proveedor preferido viene vacía, no toca
+    nada (no borra la preferida actual) -- salvo que la fila traiga unidad de
+    compra sin proveedor, lo que falla la fila completa (FR-020a). Nunca modifica
+    presentación/factor/último costo/unidad de compra de una relación ya
     existente."""
-    if len(fila) <= _SUPPLIER:
-        return
-    nombre_proveedor = fila[_SUPPLIER]
-    if not nombre_proveedor or not str(nombre_proveedor).strip():
+    nombre_proveedor = _col(fila, idx, "SUPPLIER")
+    tiene_proveedor = bool(nombre_proveedor and str(nombre_proveedor).strip())
+
+    nombre_unidad_compra = _col(fila, idx, "PURCHASE_UNIT") if creado else None
+    factor_compra = _col(fila, idx, "PURCHASE_FACTOR") if creado else None
+    tiene_unidad_compra = bool(nombre_unidad_compra and str(nombre_unidad_compra).strip())
+    tiene_factor_compra = factor_compra is not None and str(factor_compra).strip() != ""
+
+    if not tiene_proveedor:
+        if tiene_unidad_compra or tiene_factor_compra:
+            raise ValueError(
+                "Unidad de compra / Factor de conversión (compra) requieren que la fila "
+                "también traiga Proveedor preferido"
+            )
         return
 
     supplier = _resolve_supplier(db, str(nombre_proveedor))
@@ -207,6 +365,12 @@ def _apply_preferred_supplier(db: Session, item: InventoryItem, fila: list[Any])
             f"este insumo; resuélvelo desde el módulo de proveedores antes de reimportar"
         )
 
+    resolved_unit = None
+    if tiene_unidad_compra:
+        resolved_unit = _resolve_purchase_unit(
+            db, item.unit_measure.group_id, nombre_unidad_compra, factor_compra,
+        )
+
     if candidatos:
         relation = candidatos[0]
         if relation.preferred:
@@ -214,6 +378,7 @@ def _apply_preferred_supplier(db: Session, item: InventoryItem, fila: list[Any])
     else:
         relation = SupplierItem(
             supplier_id=supplier.id, inventory_item_id=item.id,
+            unit_measure_id=resolved_unit.id if resolved_unit is not None else None,
             presentation=None, conversion_factor=None, active=True,
         )
         db.add(relation)
@@ -232,18 +397,23 @@ def validar_y_aplicar_fila(db: Session, fila: list[Any]) -> dict:
     `{ok, accion, motivo}` -- `accion` es "creado"/"actualizado" cuando `ok` es
     `True`.
 
-    FR-007: la columna Unidad solo se usa al crear un insumo nuevo -- en una fila
-    que actualiza un insumo existente (código ya registrado), se ignora por
-    completo, sin resolver ni crear ninguna `UnitMeasure`."""
+    FR-007/FR-013: las columnas Unidad y Grupo solo se usan al crear un insumo
+    nuevo -- en una fila que actualiza un insumo existente (código ya registrado),
+    se ignoran por completo, sin resolver ni crear ninguna `UnitMeasure`/
+    `UnitMeasureGroup`. Lo mismo aplica a Unidad de compra/Factor de conversión
+    (compra), vía el `creado=False` que recibe `_apply_preferred_supplier`
+    (FR-021)."""
+    idx = _indices(len(fila))
     try:
-        tipo = _resolve_type(fila[_TYPE])
-        nombre = fila[_NAME]
+        tipo = _resolve_type(_col(fila, idx, "TYPE"))
+        nombre = _col(fila, idx, "NAME")
         if not nombre:
             raise ValueError("Nombre es obligatorio")
-        stock = _parse_decimal(fila[_STOCK], "Stock")
-        minimo = _parse_decimal(fila[_MIN], "Mínimo")
-        costo = _parse_decimal(fila[_COST], "Costo")
-        code = str(fila[_CODE]).strip() if fila[_CODE] else None
+        stock = _parse_decimal(_col(fila, idx, "STOCK"), "Stock")
+        minimo = _parse_decimal(_col(fila, idx, "MIN"), "Mínimo")
+        costo = _parse_decimal(_col(fila, idx, "COST"), "Costo")
+        code_valor = _col(fila, idx, "CODE")
+        code = str(code_valor).strip() if code_valor else None
 
         existente = None
         if code:
@@ -256,10 +426,12 @@ def validar_y_aplicar_fila(db: Session, fila: list[Any]) -> dict:
             current_stock=stock, min_stock=minimo, unit_cost=costo,
         )
         if existente is None:
-            campos["unit_measure_id"] = _resolve_unit(db, fila[_UNIT]).id
+            campos["unit_measure_id"] = _resolve_unit(
+                db, _col(fila, idx, "UNIT"), _col(fila, idx, "GROUP"),
+            ).id
 
         item, creado = service.resolve_or_create_by_code(db, code, **campos)
-        _apply_preferred_supplier(db, item, fila)
+        _apply_preferred_supplier(db, item, fila, idx, creado=creado)
         db.commit()
         return {"ok": True, "accion": "creado" if creado else "actualizado", "motivo": None}
     except ValueError as exc:
@@ -284,9 +456,10 @@ def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> No
     job como ya no `procesando`, el loop corta aquí mismo y nunca llega al
     bloque final que lo pondría en `finalizado`, dejando el status que haya
     puesto quien canceló."""
+    # El código (columna 1) está en el mismo índice en los tres formatos aceptados.
     codigos_vistos: dict[str, int] = {}
     for numero, fila in enumerate(filas, start=1):
-        code = str(fila[_CODE]).strip() if fila[_CODE] else None
+        code = str(fila[0]).strip() if fila[0] else None
         if code:
             codigos_vistos[code] = codigos_vistos.get(code, 0) + 1
     duplicados = {code for code, veces in codigos_vistos.items() if veces > 1}
@@ -294,7 +467,7 @@ def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> No
     for numero, fila in enumerate(filas, start=1):
         if job.status != "procesando":
             return
-        code = str(fila[_CODE]).strip() if fila[_CODE] else None
+        code = str(fila[0]).strip() if fila[0] else None
         if code and code in duplicados:
             resultado = {
                 "ok": False,
