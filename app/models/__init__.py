@@ -13,6 +13,7 @@ from .variant_option_group import VariantOptionGroup
 from .recipe_item import RecipeItem
 from .presentation import Presentation
 from .category_presentation import CategoryPresentation
+from .product_import_job import ProductImportJob
 
 # Inventario (stock único, sin lotes)
 from .inventory_item import InventoryItem

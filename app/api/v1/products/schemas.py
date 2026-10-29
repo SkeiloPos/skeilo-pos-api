@@ -19,6 +19,54 @@ class PreparationType(str, Enum):
     PACKAGED = "packaged"
 
 
+# ---------- Plantilla única de export/import de la carta (spec 143, research.md D8) ----------
+# Una sola definición de cabeceras por hoja, en orden -- `export.py` e `import_.py` las
+# importan en vez de repetirlas cada uno por su lado (FR-001). Ver data-model.md para el
+# origen/destino y tipo esperado de cada columna.
+PRODUCT_TEMPLATE_HEADERS = [
+    "Código",
+    "Nombre",
+    "Categoría",
+    "Tipo de preparación",
+    "Descripción",
+    "Activo",
+    "Disponible",
+    "Rastrea inventario",
+    "Es adición",
+    "Visible en menú QR",
+]
+
+VARIANT_TEMPLATE_HEADERS = [
+    "Código de producto",
+    "Presentación",
+    "SKU",
+    "Nombre comercial",
+    "Precio",
+    "Orden",
+    "Activo",
+]
+
+RECIPE_TEMPLATE_HEADERS = [
+    "Código de producto",
+    "Presentación",
+    "Insumo",
+    "Cantidad",
+]
+
+TOPPING_TEMPLATE_HEADERS = [
+    "Código de producto",
+    "Código de producto adición",
+]
+
+# Nombre de hoja -> cabeceras esperadas, en el orden de procesamiento FR-007.
+PRODUCT_IMPORT_SHEETS = {
+    "Productos": PRODUCT_TEMPLATE_HEADERS,
+    "Presentaciones y precios": VARIANT_TEMPLATE_HEADERS,
+    "Receta": RECIPE_TEMPLATE_HEADERS,
+    "Adiciones": TOPPING_TEMPLATE_HEADERS,
+}
+
+
 class ToppingSummaryResponse(BaseModel):
     """spec 129: nombre de una adición asociada, denormalizado (igual criterio que
     `category_name` en `Product`) -- evita que el selector de "Adiciones disponibles"
@@ -31,6 +79,10 @@ class ToppingSummaryResponse(BaseModel):
 
 
 class ProductCreate(BaseModel):
+    code: str | None = Field(
+        None, min_length=1, max_length=20,
+        description="Si no se indica, se asigna uno automáticamente (spec 143).",
+    )
     category_id: UUID = Field(..., description="Categoría del producto.")
     name: str = Field(..., min_length=1, max_length=255, examples=["Helado en copa"])
     description: str | None = Field(None, max_length=500)
@@ -79,6 +131,7 @@ class ProductCreate(BaseModel):
 
 
 class ProductUpdate(BaseModel):
+    code: str | None = Field(None, min_length=1, max_length=20)
     category_id: UUID | None = None
     name: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = Field(None, max_length=500)
@@ -124,6 +177,7 @@ class ProductAvailabilityUpdate(BaseModel):
 
 class ProductResponse(BaseModel):
     id: UUID
+    code: str
     category_id: UUID
     # spec 097: resuelto en el propio servidor (Product.category_name), sin depender de
     # que el cliente haya cargado `GET /categories` (tope 100 por página) por separado.
@@ -215,3 +269,27 @@ class ProductSaveResponse(ProductResponse):
     variants: list[VariantSaveOut] = Field(default_factory=list)
     topping_ids: list[UUID] = Field(default_factory=list)
     toppings: list[ToppingSummaryResponse] = Field(default_factory=list)
+
+
+# ---------- Importación/exportación masiva de la carta (spec 143) ----------
+class ProductImportJobResponse(BaseModel):
+    id: UUID
+    status: str
+    file_name: str
+    started_at: UtcDatetime
+    finished_at: UtcDatetime | None = None
+    total_rows: int
+    created_count: int
+    updated_count: int
+    failed_count: int
+    # No es una columna mapeada -- lo fija el router al construir la respuesta
+    # (mismo patrón que `InventoryImportJobResponse.has_errors`), para que el
+    # frontend decida si ofrece la descarga de errores sin mirar el conteo.
+    has_errors: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ImportStructureError(BaseModel):
+    """Cuerpo del 422 de FR-010: problemas de estructura, uno por línea."""
+    problems: list[str]

@@ -190,6 +190,7 @@ def make_cash_register(db: Session, **kw) -> CashRegister:
 def make_product(db: Session, **kw) -> Product:
     kw.setdefault("category_id", uuid.uuid4())
     kw.setdefault("name", f"producto-{uuid.uuid4()}")
+    kw.setdefault("code", f"codigo-{uuid.uuid4()}")
     product = Product(**kw)
     db.add(product)
     db.flush()

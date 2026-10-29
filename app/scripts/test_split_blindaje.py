@@ -103,7 +103,7 @@ def _fixture(db, suf: str):
         current_stock=Decimal("500"), unit_cost=Decimal("1"),
     )
     db.add(item); db.flush()
-    product = Product(name=f"prod-split-{suf}", category_id=cat.id, preparation_type="prepared")
+    product = Product(name=f"prod-split-{suf}", code=f"cod-split-{suf}", category_id=cat.id, preparation_type="prepared")
     db.add(product); db.flush()
     variant = ProductVariant(product_id=product.id, name="Única", price=PRECIO, active=True,
                              display_order=1)
