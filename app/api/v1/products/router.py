@@ -1,6 +1,9 @@
+from datetime import timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from openpyxl import load_workbook
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db, get_tenant
@@ -12,7 +15,12 @@ from app.core.dependencies import (
 from app.core.pagination import Page, paginate
 from app.core.models import Tenant, User
 from app.core.plan_limits import enforce_plan_limit
+from app.core.timezone import business_today, utc_now_naive
+from app.models.product_import_job import ProductImportJob
 from app.api.v1.products.service import ProductService
+from app.api.v1.products import import_ as import_service
+from app.api.v1.products.export import build_products_excel, build_import_errors_excel
+from app.celery_task import import_products_task
 from app.api.v1.products.schemas import (
     ProductCreate,
     ProductUpdate,
@@ -21,11 +29,161 @@ from app.api.v1.products.schemas import (
     ProductListResponse,
     ProductDetailResponse,
     ProductSaveResponse,
+    ProductImportJobResponse,
+    PRODUCT_IMPORT_SHEETS,
 )
 
 router = APIRouter(prefix="/products", tags=["products"])
 
 service = ProductService()
+
+# research.md D7: mismo criterio que inventory.service.IMPORT_JOB_TIMEOUT -- un
+# job "procesando" más viejo que esto se considera abandonado.
+IMPORT_JOB_TIMEOUT = timedelta(minutes=30)
+
+
+def _find_blocking_import_job(db: Session) -> ProductImportJob | None:
+    candidatos = db.execute(
+        select(ProductImportJob).where(ProductImportJob.status == "procesando")
+    ).scalars().all()
+    ahora = utc_now_naive()
+    for job in candidatos:
+        if ahora - job.started_at > IMPORT_JOB_TIMEOUT:
+            job.status = "interrumpido"
+            job.finished_at = ahora
+            db.add(job)
+        else:
+            db.commit()
+            return job
+    db.commit()
+    return None
+
+
+def _job_response(job: ProductImportJob) -> ProductImportJobResponse:
+    job.has_errors = job.failed_count > 0
+    return ProductImportJobResponse.model_validate(job)
+
+
+def _get_import_job_or_404(db: Session, job_id: UUID) -> ProductImportJob:
+    job = db.get(ProductImportJob, job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Import job not found")
+    return job
+
+
+@router.get("/export", summary="Exportar la carta a .xlsx")
+def export_products(
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    _: User = Depends(require_tenant_admin),
+):
+    buffer = build_products_excel(db)
+    filename = f"carta_{business_today(tenant).isoformat()}.xlsx"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post(
+    "/import", response_model=ProductImportJobResponse,
+    status_code=status.HTTP_202_ACCEPTED, summary="Importar la carta desde .xlsx",
+)
+def import_products(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    user: User = Depends(require_tenant_admin),
+):
+    try:
+        wb = load_workbook(file.file, data_only=True)
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "El archivo no es un .xlsx válido"
+        ) from exc
+
+    hojas_headers: dict[str, list] = {}
+    hojas_filas: dict[str, list[list]] = {}
+    for nombre_hoja in wb.sheetnames:
+        ws = wb[nombre_hoja]
+        filas_wb = list(ws.iter_rows(values_only=True))
+        if not filas_wb:
+            continue
+        hojas_headers[nombre_hoja] = list(filas_wb[0])
+        hojas_filas[nombre_hoja] = [list(f) for f in filas_wb[1:]]
+
+    problemas = import_service.validar_estructura(hojas_headers)
+    if problemas:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "; ".join(problemas))
+
+    en_curso = _find_blocking_import_job(db)
+    if en_curso is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Ya hay una importación de la carta en curso (job {en_curso.id})",
+        )
+
+    hojas_filas = {k: v for k, v in hojas_filas.items() if k in PRODUCT_IMPORT_SHEETS}
+    total_rows = sum(len(filas) for filas in hojas_filas.values())
+
+    job = ProductImportJob(
+        status="procesando", file_name=file.filename or "carta.xlsx",
+        started_by_user_id=user.id, total_rows=total_rows,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    import_products_task.delay(tenant.schema, str(job.id), hojas_filas)
+    return _job_response(job)
+
+
+@router.get(
+    "/import/current", response_model=ProductImportJobResponse | None,
+    summary="Job de importación de la carta más reciente del negocio",
+)
+def current_product_import_job(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    job = db.execute(
+        select(ProductImportJob).order_by(ProductImportJob.started_at.desc())
+    ).scalars().first()
+    return _job_response(job) if job is not None else None
+
+
+@router.get(
+    "/import/{job_id}", response_model=ProductImportJobResponse,
+    summary="Job de importación de la carta puntual",
+)
+def get_product_import_job(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    return _job_response(_get_import_job_or_404(db, job_id))
+
+
+@router.get(
+    "/import/{job_id}/errors", summary="Reporte de filas fallidas de un import de la carta",
+)
+def download_product_import_errors(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin),
+):
+    job = _get_import_job_or_404(db, job_id)
+    if job.failed_count == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Este import no tiene filas fallidas")
+
+    buffer = build_import_errors_excel(job.errors)
+    filename = f"errores_{job.file_name}"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get(

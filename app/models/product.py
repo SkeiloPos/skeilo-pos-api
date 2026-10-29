@@ -31,6 +31,12 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    # Identificador de negocio para el upsert del import/export masivo de la carta
+    # (spec 143) -- mismo patrón que `InventoryItem.code` (spec 109). Generado
+    # automáticamente (secuencial con cero a la izquierda) cuando no se especifica;
+    # editable por el administrador.
+    code: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
+
     description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     preparation_type: Mapped[str] = mapped_column(

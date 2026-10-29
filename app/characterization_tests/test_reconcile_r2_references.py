@@ -95,7 +95,10 @@ def _new_session(*, tenants=None) -> Session:
 
 
 def _product(db, image):
-    db.add(Product(id=uuid.uuid4(), category_id=uuid.uuid4(), name=f"p-{uuid.uuid4()}", image_url=image))
+    db.add(Product(
+        id=uuid.uuid4(), category_id=uuid.uuid4(), name=f"p-{uuid.uuid4()}",
+        code=f"c-{uuid.uuid4()}", image_url=image,
+    ))
     db.commit()
 
 

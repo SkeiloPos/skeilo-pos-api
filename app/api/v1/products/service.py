@@ -7,6 +7,7 @@ tiene ninguna, nace con la variante default 'Presentación única' (FR-006, A-74
 ser vendible de inmediato; se agregan más desde el módulo catalog.
 """
 import logging
+import re
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy.sql import Select
 
 from app.core.audit import record_audit
-from app.core.crud import get_or_404
+from app.core.crud import get_or_404, ensure_unique
 from app.core.models import Tenant, User
 from app.core.plan_limits import ensure_module_access
 from app.core.timezone import utc_now_naive
@@ -51,6 +52,22 @@ from app.api.v1.products.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+_NUMERIC_CODE = re.compile(r"^\d+$")
+
+
+def generate_next_product_code(db: Session) -> str:
+    """Código secuencial con cero a la izquierda (spec 143, research.md D3) -- mismo
+    criterio que `inventory/service.generate_next_code`: el siguiente entero después
+    del código numérico más alto ya asignado en este tenant, con al menos 4 dígitos.
+    Códigos no numéricos que el administrador haya fijado a mano no interfieren con
+    la secuencia automática -- se ignoran al buscar el máximo."""
+    codes = db.execute(select(Product.code)).scalars().all()
+    max_numeric = 0
+    for code in codes:
+        if _NUMERIC_CODE.match(code):
+            max_numeric = max(max_numeric, int(code))
+    return f"{max_numeric + 1:04d}"
 
 
 class ProductService:
@@ -202,8 +219,11 @@ class ProductService:
             sent=data.image_url, base_provided=False, base=None, current=None,
             is_creation=True,
         )
+        if data.code:
+            ensure_unique(db, Product, Product.code, data.code, "Product code already exists")
         try:
             product = Product(
+                code=data.code or generate_next_product_code(db),
                 category_id=data.category_id,
                 name=data.name,
                 description=data.description,
@@ -261,6 +281,9 @@ class ProductService:
             current=normalize_asset_ref(product.image_url),
             is_creation=False,
         )
+        if data.code is not None and data.code != product.code:
+            ensure_unique(db, Product, Product.code, data.code, "Product code already exists")
+            product.code = data.code
         if data.category_id is not None:
             product.category_id = data.category_id
         if data.name is not None:

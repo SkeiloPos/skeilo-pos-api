@@ -77,11 +77,11 @@ def _seed(db):
     db.add(cat)
     db.flush()
     products = {
-        "v0": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v0", image_url=V0),
-        "v1": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v1", image_url=V1_IMG),
-        "v2": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v2", image_url=V2_IMG),
-        "v3": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v3", image_url=V3_IMG),
-        "v4": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v4", image_url=V4),
+        "v0": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v0", code="v0", image_url=V0),
+        "v1": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v1", code="v1", image_url=V1_IMG),
+        "v2": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v2", code="v2", image_url=V2_IMG),
+        "v3": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v3", code="v3", image_url=V3_IMG),
+        "v4": Product(id=uuid.uuid4(), category_id=cat.id, name="p-v4", code="v4", image_url=V4),
     }
     for p in products.values():
         db.add(p)

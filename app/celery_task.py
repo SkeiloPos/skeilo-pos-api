@@ -7,6 +7,8 @@ from app.core.mail import send_email, create_message
 from app.core.timezone import utc_now_naive
 from app.api.v1.inventory.import_ import procesar_archivo_importacion
 from app.models.inventory_import_job import InventoryImportJob
+from app.api.v1.products.import_ import procesar_archivo_importacion as procesar_archivo_importacion_productos
+from app.models.product_import_job import ProductImportJob
 
 c_app = Celery("pos")
 
@@ -42,3 +44,22 @@ def import_inventory_task(tenant_schema: str, job_id: str, filas: list[list]):
             db.commit()
             raise
     print(f"Import {job_id} finalizado")
+
+
+@c_app.task
+def import_products_task(tenant_schema: str, job_id: str, hojas: dict[str, list[list]]):
+    """spec 143: procesa en segundo plano un archivo de importación de la carta
+    ya validado en estructura (FR-010, síncrono, en el router). `hojas` ya
+    viene parseada por hoja -- igual criterio que `import_inventory_task`."""
+    with with_db(tenant_schema) as db:
+        job = db.get(ProductImportJob, UUID(job_id))
+        try:
+            procesar_archivo_importacion_productos(db, job, hojas)
+        except Exception:
+            db.rollback()
+            job = db.get(ProductImportJob, UUID(job_id))
+            job.status = "interrumpido"
+            job.finished_at = utc_now_naive()
+            db.commit()
+            raise
+    print(f"Import de productos {job_id} finalizado")

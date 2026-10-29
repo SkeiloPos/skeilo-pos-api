@@ -74,7 +74,7 @@ def _fixture(db):
         db.add(cat)
         db.flush()
 
-    product = Product(name=f"prod-test-{uuid4().hex[:8]}", category_id=cat.id,
+    product = Product(name=f"prod-test-{uuid4().hex[:8]}", code=f"cod-test-{uuid4().hex[:8]}", category_id=cat.id,
                       preparation_type="prepared")
     db.add(product)
     db.flush()
