@@ -18,10 +18,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from fastapi import Response
+from fastapi import HTTPException, Response
 
 from app.characterization_tests import cart_fixtures as fx
+from app.characterization_tests import product_availability_fixtures as role_fx
 from app.api.v1.promotions import router as promotions_router
+from app.api.v1.promotions import service
+from app.api.v1.promotions.schemas import PromotionUpdate
+from app.core.dependencies import require_tenant_admin
 
 
 def _list(db, user, response, **kw):
@@ -94,6 +98,39 @@ class TestListPromotionsA09(unittest.TestCase):
         self.assertEqual({i["name"] for i in solo_vivas["items"]}, {"viva"})
 
         self.assertEqual(viva.id is not None, True)  # silencia linters sobre `viva`
+
+
+class TestUpdatePromotionVisibleEnQrPermisoSpec144(unittest.TestCase):
+    """spec 144 (T012): `PATCH /promotions/{id}` -- incluido el campo nuevo
+    `visible_en_qr` -- sigue dependiendo de `require_tenant_admin`
+    (`update_promotion`, `app/api/v1/promotions/router.py`), sin excepción
+    por campo. Mismo patrón que `test_product_visibility_permission.py`
+    para `visible_en_qr` de `Product`: la dependencia de FastAPI rechaza
+    con 403 antes de llegar a la lógica de negocio."""
+
+    def test_rol_sin_acceso_de_administrador_no_alcanza_require_tenant_admin(self):
+        db = role_fx.new_session()
+        tenant = role_fx.make_tenant(db)
+        cajero = role_fx.make_user(db, tenant=tenant, role=role_fx.make_role(db, name="CASHIER"))
+
+        with self.assertRaises(HTTPException) as ctx:
+            require_tenant_admin(cajero)
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_admin_si_puede_cambiar_visible_en_qr(self):
+        db = role_fx.new_session()
+        tenant = role_fx.make_tenant(db)
+        admin = role_fx.make_user(db, tenant=tenant, role=role_fx.make_role(db, name="ADMIN"))
+        self.assertIs(require_tenant_admin(admin), admin)
+
+        promo_db = fx.new_session()
+        promo = fx.make_promotion(promo_db, status="active", visible_en_qr=True)
+        promo_db.commit()
+
+        service.update(promo_db, promo, PromotionUpdate(visible_en_qr=False))
+        promo_db.commit()
+
+        self.assertFalse(promo.visible_en_qr)
 
 
 if __name__ == "__main__":
