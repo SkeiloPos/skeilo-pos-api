@@ -1,7 +1,7 @@
 from app.core.models import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import (
-    String, Text, Integer, Numeric, ForeignKey, DateTime, Time, CheckConstraint,
+    String, Text, Integer, Numeric, Boolean, ForeignKey, DateTime, Time, CheckConstraint,
     UniqueConstraint, Index,
 )
 from sqlalchemy.orm import mapped_column, Mapped, relationship
@@ -77,6 +77,14 @@ class Promotion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # (`GET /promotions?closed_by_refactor=true`).
     closed_by_refactor_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True
+    )
+
+    # spec 144 (FR-001/FR-010): visibilidad específica del menú QR, independiente
+    # de `status` -- mismo patrón que `Category.visible_en_qr` (spec 128) /
+    # `Product.visible_en_qr` (spec 129). Editable en cualquier estado, incluido
+    # `active` (ver guard de `update()` en `service.py`).
+    visible_en_qr: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
     )
 
     # spec 063 (revisión 2026-09-01, FR-001/FR-001a): una promoción agrupa una

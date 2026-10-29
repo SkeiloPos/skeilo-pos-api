@@ -341,14 +341,22 @@ def promo_lines_for(db: Session, lines: list[SaleLine]) -> list[dict]:
 
 def auto_discount(
     db: Session, lines: list[SaleLine], now: datetime, tenant: Tenant | None = None,
+    *, exclude_hidden_in_qr: bool = False,
 ) -> tuple[Decimal, UUID | None, list[dict]]:
     """`(descuento_automático_total, promotion_id, applied)` — motor por conjunto
     de variantes (spec 063). `promotion_id = applied[0].promotion_id` si una sola
     promoción explica el descuento, si no `None` (`applied_promotions` lo cubre —
     A-29 resuelto). `applied` es el snapshot serializable para
     `Sale/Invoice/CustomerOrder.applied_promotions` (FR-021). `tenant` (spec
-    127): si el caller lo tiene resuelto, evalúa vigencia en SU zona horaria."""
-    r = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), now, tenant)
+    127): si el caller lo tiene resuelto, evalúa vigencia en SU zona horaria.
+
+    `exclude_hidden_in_qr` (spec 144, US3, FR-008): reenviado sin cambio a
+    `evaluate_variant_sets` -- cada caller con un `order` en alcance lo deriva
+    de `order.channel == "QR_MENU"`; los flujos exclusivamente `POS` (sin
+    `order`, p. ej. `compute_draft_preview`) dejan el valor por defecto `False`."""
+    r = promotions.evaluate_variant_sets(
+        db, promo_lines_for(db, lines), now, tenant, exclude_hidden_in_qr=exclude_hidden_in_qr,
+    )
     return r.total, r.single_promotion_id, promotions.applied_to_dicts(r.applied)
 
 
@@ -426,10 +434,21 @@ def refresh_order_item_discounts(
     ya cobrado. Usa el mismo instante congelado que `compute_checkout_preview`/
     `checkout_and_send`/`pay_order` (`promotion_evaluation_instant`), para que
     el número coincida centavo a centavo con lo que cobrará el módulo de cobro
-    (FR-002)."""
+    (FR-002).
+
+    spec 144 (US3, FR-008): deriva `exclude_hidden_in_qr` de `order.channel`
+    -- el comensal (`QR_MENU`) nunca ve el descuento de una promoción oculta
+    en QR, aunque el producto ya estuviera en su pedido antes de ocultarla;
+    un pedido manual (`POS`) no se ve afectado. Ningún llamador externo
+    (`kitchen.py`, `additions.py`, `toppings.py`, `consolidation.py`,
+    `orders/service.py`) cambia su firma -- esto vive enteramente aquí
+    adentro, a partir del `order` que ya recibían."""
     lines = order_sale_lines(db, order.id)
     instant = promotion_evaluation_instant([order], now=datetime.now(timezone.utc))
-    result = promotions.evaluate_variant_sets(db, promo_lines_for(db, lines), instant, tenant)
+    result = promotions.evaluate_variant_sets(
+        db, promo_lines_for(db, lines), instant, tenant,
+        exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+    )
     for idx, line in enumerate(lines):
         discounted_unit_price, discounted_line_total = line_discount_snapshot(
             result, idx, line.line_total, line.quantity, line.addons_total,
@@ -463,7 +482,9 @@ def compute_checkout_preview(
     raw_subtotal = sum((line.line_total for line in lines), start=Decimal("0"))
 
     instant = promotion_evaluation_instant([order], now=datetime.now(timezone.utc))
-    promo_discount, _, _ = auto_discount(db, lines, instant, tenant)
+    promo_discount, _, _ = auto_discount(
+        db, lines, instant, tenant, exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+    )
 
     delivery_fee = order.delivery_fee or Decimal("0")
     total = max(
@@ -559,7 +580,9 @@ def pay_order(
         lines = order_sale_lines(db, order.id)
 
         # Descuento automático (RF-012): motor por conjunto de variantes (spec 063).
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
+        promo_discount, final_promotion_id, applied = auto_discount(
+            db, lines, instant, tenant, exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+        )
 
         sale = build_sale(
             db,
@@ -781,7 +804,9 @@ def checkout_and_send(
 
         # Descuento automático (RF-012), igual que `pay_order`: motor por
         # conjunto de variantes (spec 063).
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
+        promo_discount, final_promotion_id, applied = auto_discount(
+            db, lines, instant, tenant, exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+        )
 
         sale = build_sale(
             db,
@@ -1304,7 +1329,9 @@ def approve_payment_attempt(
             instant = promotion_evaluation_instant([order], now=utc_now())
             lines = order_sale_lines(db, order.id)
             # spec 138 (FR-006): la vigencia se evalúa en la zona del tenant dueño del cobro.
-            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
+            promo_discount, final_promotion_id, applied = auto_discount(
+                db, lines, instant, tenant, exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+            )
             # Spec 056, research.md Decisión 5: el domicilio debe quedar incluido
             # en el ÚNICO pago que se autogenera aquí — de lo contrario queda
             # corto exactamente en ese valor y el propio chequeo `paid < total`
@@ -1654,7 +1681,9 @@ def _confirm_cash_portion_of_mixed_attempt(
 
             instant = promotion_evaluation_instant([order], now=utc_now())
             lines = order_sale_lines(db, order.id)
-            promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
+            promo_discount, final_promotion_id, applied = auto_discount(
+                db, lines, instant, tenant, exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+            )
             delivery_fee = order.delivery_fee or Decimal("0")
             total = (
                 sum((line.line_total for line in lines), Decimal("0"))
@@ -1807,7 +1836,9 @@ def confirm_cash_payment_attempt(
         # congelado del pedido.
         instant = promotion_evaluation_instant([order], now=utc_now())
         lines = order_sale_lines(db, order.id)
-        promo_discount, final_promotion_id, applied = auto_discount(db, lines, instant, tenant)
+        promo_discount, final_promotion_id, applied = auto_discount(
+            db, lines, instant, tenant, exclude_hidden_in_qr=(order.channel == "QR_MENU"),
+        )
 
         build_sale(
             db,

@@ -189,6 +189,9 @@ class PromotionUpdate(_VigenciaMixin):
     days_of_week: str | None = Field(None, max_length=20)
     start_time: time | None = None
     end_time: time | None = None
+    # spec 144 (FR-001/FR-010): a diferencia del resto de estos campos, editable sin
+    # importar el `status` de la promoción -- ver guarda de `update()` en `service.py`.
+    visible_en_qr: bool | None = None
 
 
 class PromotionShapeUpdate(BaseModel):
@@ -254,6 +257,8 @@ class PromotionResponse(BaseModel):
     end_time: time | None = None
     # spec 063: marca de "finalizada por la migración" (FR-025).
     closed_by_refactor_at: UtcDatetime | None = None
+    # spec 144 (FR-010): visibilidad en el menú QR, independiente de `status`.
+    visible_en_qr: bool = True
     # spec 063 (revisión 2026-09-01, FR-001): reemplaza type/value/min_qty/
     # condition_text/variants sueltos — cada regla lleva los suyos.
     rules: list[PromotionRuleResponse] = Field(default_factory=list)

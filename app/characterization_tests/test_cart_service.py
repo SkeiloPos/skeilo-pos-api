@@ -742,6 +742,52 @@ class TestCartService(unittest.TestCase):
         self.assertIsNone(without_promo.discounted_unit_price)
         self.assertIsNone(without_promo.discounted_line_total)
 
+    def test_submit_cart_promocion_oculta_en_qr_no_se_descuenta_pero_si_en_pos(self):
+        """spec 144 (US3, T021/FR-008): un carrito QR_MENU que califica para una
+        promoción vigente y visible, cuya promoción se oculta (`visible_en_qr=
+        false`) SIN tocar el carrito, confirma el pedido sin el descuento --
+        `exclude_hidden_in_qr=True` solo aplica al canal QR_MENU. Un pedido
+        equivalente de mostrador (canal POS, vía `auto_discount` sin ese flag)
+        sigue aplicando el mismo descuento en paralelo."""
+        db, table, ts, participant = self._seed_session()
+        variant, product, category = self._seed_variant(db, price=Decimal("10000"))
+        promo = cart_fixtures.make_promotion(db, status="active", visible_en_qr=True)
+        cart_fixtures.add_rule_to_promotion(
+            db, promo, type="percent", value=Decimal("10"), min_qty=1,
+            variants=[variant],
+        )
+        efectivo = self._seed_efectivo(db)
+
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+
+        # Se oculta la promoción del menú QR sin tocar el carrito ya armado.
+        promo.visible_en_qr = False
+        db.commit()
+
+        order = service.submit_cart(db, participant, efectivo.id)
+        self.assertEqual(order.channel, "QR_MENU")
+        self.assertIsNone(order.items[0].discounted_unit_price)
+        self.assertIsNone(order.items[0].discounted_line_total)
+
+        # Pedido manual equivalente (canal POS): la misma promoción oculta en
+        # QR sigue aplicando el descuento -- `evaluate_variant_sets` sin
+        # `exclude_hidden_in_qr` es el comportamiento de siempre.
+        from app.api.v1.orders import checkout as orders_checkout
+
+        pos_lines = [
+            orders_checkout.SaleLine(
+                product_variant_id=variant.id,
+                description="pos",
+                options=[],
+                quantity=1,
+                unit_price=variant.price,
+            ),
+        ]
+        pos_discount, _, _ = orders_checkout.auto_discount(
+            db, pos_lines, datetime.now(timezone.utc), None,
+        )
+        self.assertEqual(pos_discount, Decimal("1000.00"))
+
     def test_submit_cart_congela_el_instante_de_vigencia_de_promociones(self):
         """spec 073, FR-018 (A-70): el flujo del carrito QR también congela el
         instante de vigencia al confirmar el pedido — `CustomerOrder.
