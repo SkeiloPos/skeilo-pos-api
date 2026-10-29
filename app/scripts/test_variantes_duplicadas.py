@@ -104,7 +104,7 @@ def _fixture(db):
     if cat is None:
         cat = Category(name=f"cat-{uuid4().hex[:6]}"); db.add(cat); db.flush()
 
-    product = Product(name=f"prod-dup-{uuid4().hex[:8]}", category_id=cat.id,
+    product = Product(name=f"prod-dup-{uuid4().hex[:8]}", code=f"cod-dup-{uuid4().hex[:8]}", category_id=cat.id,
                       preparation_type="prepared")
     db.add(product); db.flush()
     return product.id, insumo.id

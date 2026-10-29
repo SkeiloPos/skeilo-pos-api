@@ -172,6 +172,7 @@ def make_product(db: Session, category: Category | None = None, **kw) -> Product
     kw.setdefault("id", _uid())
     kw.setdefault("category_id", category.id)
     kw.setdefault("name", f"producto-{kw['id']}")
+    kw.setdefault("code", f"codigo-{kw['id']}")
     kw.setdefault("preparation_type", "prepared")
     kw.setdefault("active", True)
     kw.setdefault("available", True)

@@ -112,6 +112,7 @@ def seed():
             db.add(cat); db.flush()
 
         product = Product(name=f"e2e-prod-{uuid.uuid4().hex[:8]}",
+                          code=f"e2e-cod-{uuid.uuid4().hex[:8]}",
                           category_id=cat.id, preparation_type="prepared")
         db.add(product); db.flush()
         variant = ProductVariant(product_id=product.id, name="única",
