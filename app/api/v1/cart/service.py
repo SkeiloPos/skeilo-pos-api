@@ -360,7 +360,11 @@ def serialize_cart(
     # líneas del carrito. No se persiste (FR-020); se recalcula en cada `GET /cart`.
     # spec 127: `tenant`, cuando el caller lo tiene resuelto (siempre,
     # `SessionContext.tenant`), evalúa la vigencia en SU zona horaria real.
-    result = promotions.evaluate_variant_sets(db, _cart_promo_lines(db, cart), now, tenant)
+    # spec 144 (US3, FR-008): el carrito del comensal es siempre canal QR_MENU --
+    # una promoción oculta en QR no se cuenta como descuento ofrecido aquí.
+    result = promotions.evaluate_variant_sets(
+        db, _cart_promo_lines(db, cart), now, tenant, exclude_hidden_in_qr=True,
+    )
 
     items: list[CartItemResponse] = []
     total = Decimal("0")
@@ -1045,7 +1049,11 @@ def submit_cart(
         # descuento del pedido recién confirmado debe coincidir exactamente con
         # lo que el carrito mostraba justo antes.
         now = datetime.now(timezone.utc)
-        result = promotions.evaluate_variant_sets(db, _cart_promo_lines(db, cart), now, tenant)
+        # spec 144 (US3, FR-008): mismo motivo que `serialize_cart` arriba -- el
+        # pedido que el comensal envía por su cuenta es siempre canal QR_MENU.
+        result = promotions.evaluate_variant_sets(
+            db, _cart_promo_lines(db, cart), now, tenant, exclude_hidden_in_qr=True,
+        )
 
         for idx, ci in enumerate(cart.items):
             line_total = compute_line_total(ci.unit_price, ci.quantity, ci.addons_total)

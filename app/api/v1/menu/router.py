@@ -25,8 +25,8 @@ from app.models.variant_option_group import VariantOptionGroup
 from app.models.dining_table import DiningTable
 from app.models.product_topping import ProductTopping
 from app.api.v1.promotions.service import (
-    active_variant_set_rules, menu_unit_discount, menu_variant_promotion,
-    variant_display_names, variant_set_condition_text,
+    _reachable_by_qr, active_variant_set_rules, menu_unit_discount,
+    menu_variant_promotion, variant_display_names, variant_set_condition_text,
 )
 from app.api.v1.menu.schemas import (
     MenuCategoryResponse, MenuProductResponse, MenuVariantResponse,
@@ -308,7 +308,13 @@ def _build_menu_promotions(
     spec 063 (revisión 2026-09-01): una promoción anuncia **una `rules[]` por
     cada `PromotionRule` vigente** que tenga (antes: siempre 1, una promoción
     = una combinación). El DTO `MenuPromotionAnnouncement.rules[]` ya tenía
-    esta forma (research.md D-R3) — solo cambia la cardinalidad."""
+    esta forma (research.md D-R3) — solo cambia la cardinalidad.
+
+    spec 144 (FR-003 a FR-006, clarificación sesión 2026-10-29): además, toda
+    `Promotion` con `visible_en_qr=False` o sin ningún producto/variante
+    alcanzable por QR (`_reachable_by_qr`, evaluado una vez por promoción
+    completa, no por regla) se descarta por completo antes de anunciarse —
+    si ninguna promoción pasa el filtro, el resultado es `[]`."""
     # `active_variant_set_rules` ya exige `status == "active"` + `_valid_now`
     # (vigencia en ese instante, FR-022 / SC-007), evaluado sobre la
     # promoción dueña de cada regla.
@@ -320,11 +326,20 @@ def _build_menu_promotions(
     names = variant_display_names(
         db, {v.product_variant_id for r in reglas for v in r.variants}
     )
+    reachable_cache: dict = {}   # promotion_id -> bool (una query por promoción, no por regla)
     for rule in reglas:
+        promo = rule.promotion
+        if not promo.visible_en_qr:
+            continue
+        reachable = reachable_cache.get(promo.id)
+        if reachable is None:
+            reachable = _reachable_by_qr(db, promo)
+            reachable_cache[promo.id] = reachable
+        if not reachable:
+            continue
         text = variant_set_condition_text(rule, names)
         if text is None:
             continue
-        promo = rule.promotion
         anuncio = by_promotion.get(promo.id)
         if anuncio is None:
             anuncio = MenuPromotionAnnouncement(

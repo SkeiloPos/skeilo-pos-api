@@ -268,5 +268,94 @@ class TestAnunciosPorPresentacionSinDuplicar(unittest.TestCase):
         self.assertEqual(len(anuncio.rules), 2)
 
 
+class TestMenuPromotionsVisibleEnQrSpec144(unittest.TestCase):
+    """spec 144 (FR-003 a FR-006): `_build_menu_promotions` -- consumida por
+    `menu_by_signed_qr` -- excluye toda `Promotion` con `visible_en_qr=False`
+    o sin ningún producto/variante alcanzable por QR, para decidir si el menú
+    QR firmado anuncia algo (y si el frontend muestra la pestaña)."""
+
+    NOW = datetime(2026, 8, 5, 18, 0, tzinfo=timezone.utc)
+
+    def test_sin_ninguna_promocion_vigente_la_lista_queda_vacia(self):
+        db = fx.new_session()
+        prod = fx.make_product(db)
+        variant = fx.make_variant(db, product=prod, price=Decimal("8000"))
+        promo = fx.make_promotion(db, status="draft")  # nunca vigente
+        fx.add_rule_to_promotion(
+            db, promo, type="percent", value=Decimal("10"), min_qty=1,
+            variants=[variant],
+        )
+        db.commit()
+
+        anuncios = _build_menu_promotions(db, self.NOW)
+
+        self.assertEqual(anuncios, [])
+
+    def test_vigente_pero_con_todos_sus_productos_ocultos_en_qr_la_lista_queda_vacia(self):
+        """Edge case de spec.md: una promoción `active` + vigente cuyo único
+        producto cubierto tiene `Product.visible_en_qr=False` no se anuncia --
+        ninguna de sus variantes es alcanzable por QR."""
+        db = fx.new_session()
+        category = fx.make_category(db)
+        prod = fx.make_product(db, category=category, visible_en_qr=False)
+        variant = fx.make_variant(db, product=prod, price=Decimal("8000"))
+        promo = fx.make_promotion(db, status="active")
+        fx.add_rule_to_promotion(
+            db, promo, type="percent", value=Decimal("10"), min_qty=1,
+            variants=[variant],
+        )
+        db.commit()
+
+        anuncios = _build_menu_promotions(db, self.NOW)
+
+        self.assertEqual(anuncios, [])
+
+    def test_vigente_visible_y_alcanzable_si_se_anuncia(self):
+        db = fx.new_session()
+        category = fx.make_category(db)
+        prod = fx.make_product(db, category=category, visible_en_qr=True)
+        variant = fx.make_variant(db, product=prod, price=Decimal("8000"))
+        promo = fx.make_promotion(db, status="active", visible_en_qr=True)
+        fx.add_rule_to_promotion(
+            db, promo, type="percent", value=Decimal("10"), min_qty=1,
+            variants=[variant],
+        )
+        db.commit()
+
+        anuncios = _build_menu_promotions(db, self.NOW)
+
+        self.assertEqual(len(anuncios), 1)
+        self.assertEqual(anuncios[0].promotion_id, promo.id)
+
+    def test_promotion_visible_en_qr_false_excluye_aunque_vigente_y_alcanzable(self):
+        """spec 144 (US2, T011): aislado de la vigencia/alcanzabilidad de T007 --
+        una promoción vigente, visible por sus productos y alcanzable, se excluye
+        en cuanto `Promotion.visible_en_qr=False`, y vuelve a anunciarse al
+        restaurarlo a `True` (`service.update`, sin cambiar status/rules)."""
+        db = fx.new_session()
+        category = fx.make_category(db)
+        prod = fx.make_product(db, category=category, visible_en_qr=True)
+        variant = fx.make_variant(db, product=prod, price=Decimal("8000"))
+        promo = fx.make_promotion(db, status="active", visible_en_qr=True)
+        fx.add_rule_to_promotion(
+            db, promo, type="percent", value=Decimal("10"), min_qty=1,
+            variants=[variant],
+        )
+        db.commit()
+
+        self.assertEqual(len(_build_menu_promotions(db, self.NOW)), 1)
+
+        from app.api.v1.promotions import service
+        from app.api.v1.promotions.schemas import PromotionUpdate
+
+        service.update(db, promo, PromotionUpdate(visible_en_qr=False))
+        db.commit()
+        self.assertEqual(_build_menu_promotions(db, self.NOW), [])
+
+        service.update(db, promo, PromotionUpdate(visible_en_qr=True))
+        db.commit()
+        self.assertEqual(len(_build_menu_promotions(db, self.NOW)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

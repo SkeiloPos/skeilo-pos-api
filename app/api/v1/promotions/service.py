@@ -34,6 +34,7 @@ from sqlalchemy.sql import Select
 from app.core.config import settings
 from app.core.models import Tenant
 from app.core.timezone import resolve_timezone
+from app.models.category import Category
 from app.models.product import Product
 from app.models.presentation import Presentation
 from app.models.product_variant import ProductVariant
@@ -145,7 +146,8 @@ class SetDiscountResult:
 
 
 def active_variant_set_rules(
-    db: Session, now: datetime, tenant: Tenant | None = None
+    db: Session, now: datetime, tenant: Tenant | None = None,
+    *, exclude_hidden_in_qr: bool = False,
 ) -> list[PromotionRule]:
     """spec 063 (revisión 2026-09-01): reglas `percent` / `package_price` de
     promociones **activas y vigentes ahora** (`_valid_now`, hora local del
@@ -154,8 +156,21 @@ def active_variant_set_rules(
     índice `ix_promotions_status_ends_at`. `tenant` (spec 127): el tenant
     propietario de las promociones que se están evaluando — si el caller lo
     tiene resuelto (siempre debería, ver `research.md` de spec 127), se usa
-    su zona horaria real en vez del respaldo global de instancia."""
+    su zona horaria real en vez del respaldo global de instancia.
+
+    spec 144 (US3, FR-008): `exclude_hidden_in_qr=True` descarta además toda
+    regla cuya `Promotion.visible_en_qr` sea `False` -- solo lo pasan en
+    `True` los caminos de cálculo del canal `QR_MENU` (carrito/checkout del
+    comensal); el resto de callers (POS, borrador manual) deja el valor por
+    defecto `False`, sin cambio de comportamiento."""
     today: date = local_now(now, tenant).date()
+    filters = [
+        Promotion.status == "active",
+        PromotionRule.type.in_(LIVE_TYPES),
+        or_(Promotion.ends_at.is_(None), Promotion.ends_at >= today),
+    ]
+    if exclude_hidden_in_qr:
+        filters.append(Promotion.visible_en_qr.is_(True))
     stmt = (
         select(PromotionRule)
         .join(PromotionRule.promotion)
@@ -163,17 +178,43 @@ def active_variant_set_rules(
             selectinload(PromotionRule.variants),
             contains_eager(PromotionRule.promotion),
         )
-        .where(
-            Promotion.status == "active",
-            PromotionRule.type.in_(LIVE_TYPES),
-            or_(Promotion.ends_at.is_(None), Promotion.ends_at >= today),
-        )
+        .where(*filters)
     )
     return [
         r
         for r in db.execute(stmt).scalars().all()
         if _valid_now(r.promotion, now, tenant)
     ]
+
+
+def _reachable_by_qr(db: Session, promo: Promotion) -> bool:
+    """spec 144 (FR-004/FR-006, clarificación sesión 2026-10-29): verdadero si
+    la promoción **completa** (unión de variantes de todas sus reglas) tiene
+    al menos una variante alcanzable por QR -- es decir, con
+    `ProductVariant.active`, `Product.active`, `Product.visible_en_qr`,
+    `Category.active` y `Category.visible_en_qr` todos verdaderos (mismo
+    criterio que `category_filters`/`product_filters` con
+    `only_visible_en_qr=True` en `menu/router.py::_build_menu`). Se evalúa
+    sobre toda la promoción, no por regla individual (si tuviera varias,
+    basta que UNA variante de CUALQUIER regla sea alcanzable)."""
+    variant_ids = {v.product_variant_id for r in promo.rules for v in r.variants}
+    if not variant_ids:
+        return False
+    stmt = (
+        select(ProductVariant.id)
+        .join(Product, ProductVariant.product_id == Product.id)
+        .join(Category, Product.category_id == Category.id)
+        .where(
+            ProductVariant.id.in_(variant_ids),
+            ProductVariant.active.is_(True),
+            Product.active.is_(True),
+            Product.visible_en_qr.is_(True),
+            Category.active.is_(True),
+            Category.visible_en_qr.is_(True),
+        )
+        .limit(1)
+    )
+    return db.execute(stmt).first() is not None
 
 
 def _unit_sort_key(unit) -> tuple:
@@ -233,7 +274,8 @@ def _distribute_group_discount(group_units: list, discount: Decimal) -> dict:
 
 
 def evaluate_variant_sets(
-    db: Session, promo_lines: list, now: datetime, tenant: Tenant | None = None
+    db: Session, promo_lines: list, now: datetime, tenant: Tenant | None = None,
+    *, exclude_hidden_in_qr: bool = False,
 ) -> SetDiscountResult:
     """Algoritmo normativo de contracts/motor-y-persistencia.md §3. spec 063
     (revisión 2026-09-01): agrupa por **regla** (antes: por promoción) — la
@@ -241,6 +283,10 @@ def evaluate_variant_sets(
     se aplica a todas sus reglas; el cálculo por bloque no cambia de fórmula.
     `tenant` (spec 127): reenviado a `active_variant_set_rules` para evaluar
     vigencia en la zona horaria real del tenant.
+
+    `exclude_hidden_in_qr` (spec 144, US3, FR-008): reenviado sin cambio a
+    `active_variant_set_rules` -- `True` solo en los caminos de cálculo del
+    canal `QR_MENU` (ver `cart/service.py`, `orders/checkout.py`).
 
     FR-027 (spec 083, sesión 2026-09-17): para `type == "percent"`, el `%` se
     aplica solo sobre `base_unit_price` (precio de la variante sin toppings),
@@ -254,7 +300,9 @@ def evaluate_variant_sets(
     toppings) trae `base_unit_price == unit_price`, así que esta rama no
     cambia nada para ese caso."""
     result = SetDiscountResult()
-    rules = active_variant_set_rules(db, now, tenant)
+    rules = active_variant_set_rules(
+        db, now, tenant, exclude_hidden_in_qr=exclude_hidden_in_qr,
+    )
     if not rules:
         return result
 
@@ -862,13 +910,19 @@ def update(db: Session, promo: Promotion, data, tenant: Tenant | None = None) ->
     Deliberadamente NO se reutiliza la condición de `update_shape`
     (`status not in ("draft", "paused")`): esa también bloquearía `finished`, y FR-009
     exige que estos campos sigan editables en `Borrador`, `Pausada` y `Finalizada` --
-    solo `active` se bloquea aquí."""
-    if promo.status == "active":
+    solo `active` se bloquea aquí.
+
+    spec 144 (FR-001/FR-010, US2 acceptance scenario 1): `visible_en_qr` es la ÚNICA
+    excepción a la guarda de `active` de arriba -- el negocio pidió explícitamente
+    poder ocultar una promoción activa y vigente del menú QR "sin tener que pausarla
+    ni desactivarla". Por eso la guarda de `active` solo dispara si se está tocando
+    algún OTRO campo además de/en vez de `visible_en_qr`."""
+    provided = data.model_fields_set
+    if promo.status == "active" and (provided - {"visible_en_qr"}):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "Pausa la promoción antes de modificarla",
         )
-    provided = data.model_fields_set
     # spec 127 (FR-005): `starts_at` es más estricto que el resto -- solo se
     # puede corregir mientras la promoción sigue en `draft` (nunca llegó a
     # estar vigente), para no alterar retroactivamente la fecha de inicio de
@@ -885,6 +939,9 @@ def update(db: Session, promo: Promotion, data, tenant: Tenant | None = None) ->
             if field_name in ("starts_at", "ends_at") and value is not None:
                 value = local_now(value, tenant)
             setattr(promo, field_name, value)
+
+    if "visible_en_qr" in provided and data.visible_en_qr is not None:
+        promo.visible_en_qr = data.visible_en_qr
 
     if (promo.start_time is None) != (promo.end_time is None):
         raise HTTPException(
@@ -1068,5 +1125,6 @@ def serialize_promotion(db: Session, promo: Promotion) -> dict:
         "start_time": promo.start_time,
         "end_time": promo.end_time,
         "closed_by_refactor_at": promo.closed_by_refactor_at,
+        "visible_en_qr": promo.visible_en_qr,
         "rules": [_serialize_rule(r, by_id) for r in promo.rules],
     }
