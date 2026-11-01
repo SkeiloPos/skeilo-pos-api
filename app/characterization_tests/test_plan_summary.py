@@ -33,7 +33,9 @@ class TestPlanSummary(unittest.TestCase):
         self.assertEqual(summary["plan_name"], "Básico")
         self.assertEqual(summary["resources"]["mesas"], {"used": 4, "limit": 5})
         self.assertTrue(summary["modules"]["inventario"])
-        self.assertFalse(summary["modules"]["compras"])
+        self.assertFalse(summary["modules"]["promociones"])
+        # spec 141 (FR-001/FR-022): «Compras» ya no es un módulo; `modules` trae exactamente dos claves.
+        self.assertEqual(set(summary["modules"]), {"inventario", "promociones"})
 
     # ---------------------------------------------------------- Acceptance Scenario 2
 

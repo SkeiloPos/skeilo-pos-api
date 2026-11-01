@@ -1,8 +1,8 @@
 """Cumplimiento del plan de suscripción de un tenant (spec 033): límites
 numéricos, acceso a módulos, y vencimiento. Consumido por los cinco
 endpoints de creación de recursos limitados (mesas/cajas/usuarios/productos/
-métodos de pago activos) y por los routers de inventario/compras/
-promociones.
+métodos de pago activos) y por los routers de inventario (que incluye
+proveedores y compras, spec 141) y promociones.
 
 `ensure_plan_not_expired` (Historia de Usuario 5, FR-019/FR-020/FR-021) se
 llama como primer paso dentro de `enforce_plan_limit`/`require_module_access`
@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db, get_tenant
 from app.core.dependencies import get_current_user
+from app.core.exceptions import ModuleNotInPlanError
 from app.core.models import Tenant, User, UserInvitation
 from app.core.timezone import utc_now_naive
 from app.models.cash_register import CashRegister
@@ -26,6 +27,10 @@ from app.models.dining_table import DiningTable
 from app.models.payment import PaymentMethod
 from app.models.plan import Plan
 from app.models.product import Product
+
+#: Catálogo único de módulos que un plan puede incluir (spec 141, FR-001). «Proveedores» y «Compras» no son
+#: módulos: viven dentro de `inventario` (A-150). Cada funcionalidad pertenece a uno solo (FR-002).
+PLAN_MODULES = ("inventario", "promociones")
 
 
 @dataclass(frozen=True)
@@ -123,6 +128,14 @@ def enforce_plan_limit(db: Session, tenant: Tenant, resource_key: str) -> None:
         )
 
 
+def _validate_module_key(module_key: str) -> None:
+    """Una clave fuera de `PLAN_MODULES` es un error de programación, no un acceso denegado: antes de
+    la spec 141 `getattr(plan, f"{module_key}_access", False)` la habría tratado en silencio como «sin
+    módulo». `ValueError` la hace visible de inmediato."""
+    if module_key not in PLAN_MODULES:
+        raise ValueError(f"Módulo de plan desconocido: {module_key!r} (válidos: {', '.join(PLAN_MODULES)})")
+
+
 def ensure_module_access(db: Session, tenant: Tenant, module_key: str) -> None:
     """Misma comprobación que `require_module_access` (acceso a módulo por plan,
     FR-008/FR-009/FR-019), pero invocable directamente dentro de un handler —
@@ -130,18 +143,16 @@ def ensure_module_access(db: Session, tenant: Tenant, module_key: str) -> None:
     campos concretos (ej. `Product.tracks_inventory`, `Option.inventory_item_id`)
     dentro de endpoints que deben seguir funcionando para tenants sin el módulo
     (spec 064, research.md Decisión 4) — a diferencia de `unit_measures`/`reports`
-    (spec 062), donde el módulo completo se gatea a nivel de router/ruta."""
+    (spec 062), donde el módulo completo se gatea a nivel de router/ruta.
+
+    Orden de rechazos (spec 141, FR-009): primero el plan vencido (403 sin `code`) y después el módulo
+    ausente (`ModuleNotInPlanError`: 403 con `code`/`module`)."""
+    _validate_module_key(module_key)
     ensure_plan_not_expired(tenant)
-    access_column = f"{module_key}_access"
-    labels = {"inventario": "inventario", "compras": "compras", "promociones": "promociones"}
-    label = labels.get(module_key, module_key)
 
     plan = db.get(Plan, tenant.plan_id)
-    if not getattr(plan, access_column):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            f"Tu plan actual no incluye el módulo de {label}.",
-        )
+    if not getattr(plan, f"{module_key}_access"):
+        raise ModuleNotInPlanError(module_key, module_key)
 
 
 def has_module_access(db: Session, tenant: Tenant, module_key: str) -> bool:
@@ -155,8 +166,9 @@ def has_module_access(db: Session, tenant: Tenant, module_key: str) -> bool:
     módulo", cuando son dos motivos de negocio distintos — un plan vencido
     debería seguir siendo un problema de plan, no degradar en silencio a "sin
     inventario". Esta función solo mira el acceso al módulo en sí."""
+    _validate_module_key(module_key)
     plan = db.get(Plan, tenant.plan_id)
-    return bool(getattr(plan, f"{module_key}_access", False))
+    return bool(getattr(plan, f"{module_key}_access"))
 
 
 def require_module_access(module_key: str) -> Callable:
@@ -164,7 +176,12 @@ def require_module_access(module_key: str) -> Callable:
     no incluye `module_key` (FR-008/FR-009), o si el plan venció (FR-019).
     Sin lock — solo lectura, no hay condición de carrera que resolver para
     un acceso de módulo. Wrapper delgado sobre `ensure_module_access` (spec 064)
-    — mismo comportamiento de siempre para los routers que ya la usan."""
+    — mismo comportamiento de siempre para los routers que ya la usan.
+
+    Spec 141: `module_key` se valida **al construir** la dependencia (al importar el router, no en la
+    primera petición) y la función devuelta expone `.module_key` para que `test_module_route_inventory.py`
+    compruebe qué módulo gobierna cada ruta."""
+    _validate_module_key(module_key)
 
     def _dependency(
         tenant: Tenant = Depends(get_tenant),
@@ -173,6 +190,7 @@ def require_module_access(module_key: str) -> Callable:
     ) -> None:
         ensure_module_access(db, tenant, module_key)
 
+    _dependency.module_key = module_key
     return _dependency
 
 

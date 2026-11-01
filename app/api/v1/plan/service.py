@@ -31,7 +31,6 @@ def build_plan_summary(db: Session, tenant: Tenant) -> dict:
         "resources": resources,
         "modules": {
             "inventario": plan.inventario_access,
-            "compras": plan.compras_access,
             "promociones": plan.promociones_access,
         },
     }
