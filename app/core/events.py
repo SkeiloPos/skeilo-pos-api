@@ -179,7 +179,7 @@ def order_created(
     tenant_id: int, *, order_id, table_session_id, dining_table_id,
     table_number, customer_name, items_count, total,
 ) -> str | None:
-    """El comensal envió su carrito. El pedido queda en `recibida`."""
+    """El comensal envió su carrito. El pedido queda en `pendiente`."""
     return publish(
         tenant_id,
         type="order.created",
@@ -193,7 +193,7 @@ def order_created(
 
 
 def order_confirmed(tenant_id: int, *, order_id, table_session_id) -> str | None:
-    """El staff aceptó el pedido: 'recibida' → 'abierta' (descuenta inventario)."""
+    """El staff aceptó el pedido: 'pendiente' → 'abierta' (descuenta inventario)."""
     return publish(
         tenant_id,
         type="order.confirmed",

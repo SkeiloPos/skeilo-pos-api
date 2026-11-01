@@ -158,13 +158,13 @@ def _mesas_fusionadas(zona, instante) -> Decimal:
 
 
 def _pedido_qr(instante, *, metodo, mixto=False):
-    """Pedido de comensal por QR en `recibida` con su instante congelado y un intento de pago pendiente."""
+    """Pedido de comensal por QR en `pendiente` con su instante congelado y un intento de pago pendiente."""
     db = fx.new_session()
     ts = fx.make_table_session(db, table=fx.make_dining_table(db))
     participant = fx.make_participant(db, table_session=ts)
     variant, _ = _catalogo(db)
     order = fx.make_customer_order(
-        db, ts, participant=participant, status="recibida", channel="QR_MENU", promotion_evaluated_at=instante,
+        db, ts, participant=participant, status="pendiente", channel="QR_MENU", promotion_evaluated_at=instante,
     )
     fx.make_order_item(db, order, variant, quantity=2, estado_cocina="pendiente")
     kw = {}

@@ -532,7 +532,7 @@ class AuditoriaYLogOperativoConvivenTests(unittest.TestCase):
         insumo = fx.make_inventory_item(self.db, current_stock=Decimal("1000"))
         fx.make_recipe_item(self.db, variant, insumo, quantity=Decimal("1"))
         self.order = fx.make_customer_order(
-            self.db, ts, participant=participant, status="recibida"
+            self.db, ts, participant=participant, status="pendiente"
         )
         fx.make_order_item(self.db, self.order, variant, estado_cocina="pendiente")
         self.db.commit()

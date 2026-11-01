@@ -44,7 +44,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         """Acceptance Scenario 1 (US6)."""
         db, participant, variant, efectivo = self._seed_session_con_carrito()
         first = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(first.status, "recibida")
+        self.assertEqual(first.status, "pendiente")
 
         # Nuevo carrito abierto tras el submit (mismo patrón que
         # `_get_or_create_open_cart`); se le agrega un ítem para poder
@@ -82,7 +82,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
 
         second = service.submit_cart(db, participant, efectivo.id)
         self.assertNotEqual(second.id, first.id)
-        self.assertEqual(second.status, "recibida")
+        self.assertEqual(second.status, "pendiente")
 
     def test_segunda_orden_tras_cancelar_la_primera_se_permite(self):
         db, participant, variant, efectivo = self._seed_session_con_carrito()
@@ -95,7 +95,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         db.commit()
 
         second = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(second.status, "recibida")
+        self.assertEqual(second.status, "pendiente")
 
     # ------------------------------------------- Confirmación duplicada (T011)
 
@@ -164,7 +164,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         db.commit()
 
         order = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
 
 if __name__ == "__main__":

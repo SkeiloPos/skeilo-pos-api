@@ -1,21 +1,20 @@
 """Service de comandas del staff (mostrador/mesero): crea una `customer_order`
 con sus líneas y opciones, tomando un snapshot del precio.
 
-**Consume inventario al crear, salvo `hold_for_payment`.** Por defecto la
-comanda nace en `abierta`, o sea ya confirmada: no vuelve a pasar por
-`confirm_order`, así que si no descontara aquí no descontaría nunca —cobrarla
-tampoco lo hace— y el stock quedaría sobrestimado en silencio. Es el mismo
-punto de descuento que la confirmación, por la otra puerta.
+**Nace siempre en `pendiente`, sin descontar inventario (spec 146, A-150).**
+Antes de esta spec, por defecto la comanda nacía directamente en `abierta`
+(confirmada) y descontaba inventario aquí mismo, salvo con
+`hold_for_payment=True` (spec 028, T013), que la hacía nacer `recibida` sin
+tocar inventario. A-150 unifica el criterio entre canales: todo canal
+(mostrador/mesero, domicilio, y QR vía `/cart/submit`) nace ahora en
+`pendiente`/`payment_status='UNPAID'`, y el único punto de descuento es la
+confirmación (`checkout.checkout_and_send`/`confirm_order`), nunca la
+creación. `hold_for_payment` ya no afecta el estado de creación — se conserva
+en el esquema de la API por compatibilidad, pero no tiene efecto aquí.
 
-Con `hold_for_payment=True` (spec 028, T013) la comanda nace `recibida` en su
-lugar, sin tocar inventario: el staff cobra primero
-(`checkout.checkout_and_send`) y ese es el nuevo punto de descuento para este
-camino — mismo criterio de "un único punto de descuento", solo que movido.
-
-El pedido anónimo por QR **no** entra por aquí: llega como `recibida` vía
+El pedido anónimo por QR **no** entra por aquí: llega como `pendiente` vía
 `/cart/submit` y lo descuenta el staff al confirmarlo."""
 import logging
-from collections import defaultdict
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from math import ceil
@@ -28,7 +27,6 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
-from app.core.plan_limits import has_module_access
 from app.core.timezone import local_day_bounds_utc, resolve_timezone
 from app.core.order_audit import (
     ActorType,
@@ -38,7 +36,7 @@ from app.core.order_audit import (
 )
 from app.models.product_variant import ProductVariant
 from app.models.option import Option
-from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
+from app.catalog_engine import compute_addons_total, compute_unit_price, mark_per_line
 from app.models.session_participant import SessionParticipant
 from app.models.dining_table import DiningTable
 from app.models.customer_order import CustomerOrder
@@ -49,14 +47,12 @@ from app.models.sale import Sale
 from app.models.table_session import TableSession
 from app.core.models import Tenant, User
 from app.api.v1.catalog.line_pricing import (
-    check_availability,
     ensure_products_available,
     load_valid_options,
 )
 from app.api.v1.cash.service import resolve_dine_in_table_order
 from app.api.v1.orders import topping_lines
 from app.api.v1.orders.consolidation import get_or_create_table_session_id
-from app.api.v1.orders.consumption import deduct_order_items_naming_product
 from app.api.v1.orders.schemas import (
     AppliedPromotionOut,
     OrderBillingSummary,
@@ -73,7 +69,7 @@ logger = logging.getLogger(__name__)
 #: importarlo) porque cada módulo de este paquete define el suyo (ver
 #: `checkout.TERMINAL`), y `cart.service` ya importa de `table_sessions.service`,
 #: que a su vez depende de `orders.checkout`.
-_NON_TERMINAL_ORDER_STATUSES = ("recibida", "abierta", "bloqueada")
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "abierta", "bloqueada")
 
 #: Combinaciones canal × tipo de orden con sentido de negocio (spec 055,
 #: FR-006; research.md D4) — validado solo aquí: es el único punto donde
@@ -505,7 +501,7 @@ def list_orders(
 #: conjunto cerrado que acepta la rama paginada de `GET /orders` (spec 079,
 #: FR-008, data-model.md §3). `None` / ausente = "Todos" (sin predicado). El
 #: router valida contra este conjunto y responde 422 fuera de rango.
-ESTADOS_MOSTRADOS_ORDENES = ("recibida", "abierta", "bloqueada", "pagada", "cancelada")
+ESTADOS_MOSTRADOS_ORDENES = ("pendiente", "abierta", "bloqueada", "pagada", "cancelada")
 
 
 def list_orders_query(
@@ -557,7 +553,7 @@ def list_orders_query(
         select(Sale.id).where(Sale.customer_order_id == CustomerOrder.id)
     )
 
-    if status_mostrado in ("recibida", "abierta", "bloqueada"):
+    if status_mostrado in ("pendiente", "abierta", "bloqueada"):
         stmt = stmt.where(
             CustomerOrder.status == status_mostrado, ~tiene_venta,
         )
@@ -628,13 +624,11 @@ def create_order(
     solo no lleva. Opcional para no cambiar el contrato de ningún llamador
     existente; el router sí lo pasa siempre.
 
-    `tenant` (spec 129) gobierna si las adiciones (productos-topping) de cada línea
-    descuentan inventario -- mismo criterio (`has_module_access(db, tenant,
-    "inventario")`) que ya usa `orders.toppings.add_topping_to_order_item` para una
-    adición agregada después. Opcional por el mismo motivo que `user`: ningún
-    llamador existente (los characterization tests) lo pasaba antes de esta spec, y
-    sin él simplemente no se descuenta inventario de las adiciones (se asume que el
-    tenant no tiene el módulo activo).
+    `tenant` (spec 129) se mantiene en la firma por compatibilidad con los
+    llamadores existentes. Desde A-150 (spec 146) esta función ya no descuenta
+    ningún inventario (ni de productos ni de adiciones): la comanda nace
+    `pendiente` sin tocar stock, y el único punto de descuento es la
+    confirmación (`checkout.py`).
 
     `request_id` (spec 074, extensión de logging operativo — FR-021) es igual
     de opcional y por el mismo motivo: correlaciona el evento de auditoría con
@@ -652,7 +646,7 @@ def create_order(
 
     # T013 (spec 028): 'hold_for_payment' es el modo "cobra primero, envía
     # después" del mostrador/mesero. El canal QR ya tiene su propio flujo
-    # 'recibida' (vía /cart/submit, con OrderPaymentAttempt) — mezclarlo con
+    # 'pendiente' (vía /cart/submit, con OrderPaymentAttempt) — mezclarlo con
     # esta bandera duplicaría ese camino con reglas distintas.
     if data.hold_for_payment and data.channel is OrderChannel.QR_MENU:
         raise HTTPException(
@@ -778,10 +772,11 @@ def create_order(
             # columna es DateTime(timezone=True); NO `.replace(tzinfo=None)`,
             # ver data-model.md). Nunca se vuelve a tocar.
             promotion_evaluated_at=datetime.now(timezone.utc),
-            # T013: con hold_for_payment nace 'recibida', igual que un pedido
-            # QR sin confirmar — no compromete stock ni es visible para cocina
-            # hasta que se cobre (`checkout.checkout_and_send`).
-            status="recibida" if data.hold_for_payment else "abierta",
+            # A-150 (spec 146): todo canal nace en 'pendiente'/'UNPAID', sin
+            # excepción — no compromete stock ni es visible para cocina hasta
+            # que se cobre/confirme (`checkout.checkout_and_send`/`confirm_order`).
+            status="pendiente",
+            payment_status="UNPAID",
             user_id=user_id,
             notes=data.notes,
             client_request_id=data.client_request_id,
@@ -801,20 +796,8 @@ def create_order(
         # de obligar a reintentar uno por uno.
         ensure_products_available(variants_by_line)
 
-        # spec 129: si el tenant no tiene el módulo "inventario" activo, las
-        # adiciones (productos-topping) se guardan igual pero no descuentan
-        # stock -- mismo criterio que `orders.toppings.add_topping_to_order_item`.
-        inventario_activo = tenant is not None and has_module_access(db, tenant, "inventario")
-        # Insumo -> cantidad requerida, agregado de TODAS las adiciones de TODAS
-        # las líneas -- un solo `check_availability` para todo el pedido, igual
-        # que `ensure_products_available` nombra todos los productos agotados de
-        # una vez en vez de reventar línea por línea (spec 093).
-        topping_consumption: dict[UUID, Decimal] = defaultdict(Decimal)
-
-        entries: list[tuple[OrderItem, list[ChosenOption]]] = []
         # (item, [(topping_variant, quantity), ...]) -- se guardan y, si aplica,
-        # se descuentan después del `refresh_order_item_discounts` de abajo, igual
-        # que `entries` para las opciones normales.
+        # se descuentan en el punto de confirmación (`checkout.py`), no aquí.
         topping_rows: list[tuple[OrderItem, list[topping_lines.ResolvedTopping]]] = []
         for line, variant in zip(data.items, variants_by_line):
             # Deduplica, exige que estén activas y valida la selección contra los
@@ -848,15 +831,12 @@ def create_order(
             resolved_toppings, toppings_total = topping_lines.resolve_toppings(
                 db, variant.product_id, line.toppings,
             )
-            if inventario_activo:
-                topping_lines.accumulate_consumption(db, resolved_toppings, topping_consumption)
 
             item.unit_price = compute_unit_price(variant, options)
             # FR-017/FR-007 (spec 129): precio de catálogo de cada adición, cobrado una
             # vez por línea -- nunca multiplicado por `line.quantity`, igual que las
             # opciones "cantidad" ya separadas en `compute_addons_total(options)`.
             item.addons_total = compute_addons_total(options) + toppings_total
-            entries.append((item, options))
             if resolved_toppings:
                 topping_rows.append((item, resolved_toppings))
 
@@ -872,27 +852,10 @@ def create_order(
         from app.api.v1.orders.checkout import refresh_order_item_discounts
         refresh_order_item_discounts(db, order)
 
-        if not data.hold_for_payment:
-            # Nace confirmada, así que compromete stock aquí y ahora. Si falta
-            # un insumo (o alguna variante no tiene receta) revienta la
-            # transacción entera y no se crea la comanda: mejor no venderla
-            # que venderla sin descontar.
-            #
-            # Con hold_for_payment=True (T013) esto se salta a propósito: la
-            # comanda nace 'recibida' y el descuento se hace en
-            # `checkout.checkout_and_send`, al cobrar — mismo punto único de
-            # descuento que usa el flujo QR (`_confirm_order_impl`), por la
-            # otra puerta.
-            deduct_order_items_naming_product(db, entries, user_id, reference_id=order.id)
-
-            if inventario_activo and topping_consumption:
-                # Mismo chequeo preventivo (409, sin lock) que ya usa la adición
-                # posterior a un pedido (`orders.toppings`) -- el agotado de
-                # adiciones nunca bloquea la línea del producto principal, que ya
-                # se descontó arriba.
-                check_availability(db, topping_consumption, extra_context="crear pedido")
-                for item, resolved_toppings in topping_rows:
-                    topping_lines.deduct_toppings(db, resolved_toppings, user_id, order.id)
+        # A-150 (spec 146): la comanda nace 'pendiente' para todo canal y no
+        # descuenta inventario aquí — el descuento se mueve al único punto de
+        # confirmación (`checkout.checkout_and_send`/`confirm_order`, vía
+        # `_deduct_and_open`), igual que ya hacía el flujo QR.
 
         db.commit()
     except HTTPException:

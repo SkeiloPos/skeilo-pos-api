@@ -105,7 +105,7 @@ def _staff(db) -> User:
     return user
 
 
-def _order(db, variants, *, status="recibida"):
+def _order(db, variants, *, status="pendiente"):
     """Pedido con una línea por variante dada."""
     order = CustomerOrder(channel="QR_MENU", order_type="DINE_IN", status=status)
     db.add(order); db.flush()
@@ -140,7 +140,7 @@ def _cleanup(schema, product_id, item_id):
         db.execute(text(f'''
             DELETE FROM "{schema}".customer_orders WHERE id NOT IN (
                 SELECT order_id FROM "{schema}".order_items) AND channel = 'QR_MENU'
-                AND status = 'recibida'
+                AND status = 'pendiente'
         '''))
         db.execute(text(f'''DELETE FROM "{schema}".recipe_items WHERE product_variant_id IN (
                 SELECT id FROM "{schema}".product_variants WHERE product_id = :p)'''),
@@ -181,7 +181,7 @@ def main():
             print("  ok  · el error nombra la variante a configurar")
 
         with with_db(schema) as db:
-            _check("el pedido sigue 'recibida'", db.get(CustomerOrder, oid).status, "recibida")
+            _check("el pedido sigue 'pendiente'", db.get(CustomerOrder, oid).status, "pendiente")
             _check("y no escribió ningún movimiento", _movs(db, oid), 0)
             _check("el stock no se movió", _stock(db, item_id), STOCK_INICIAL)
 

@@ -86,7 +86,7 @@ from app.core.timezone import utc_now_naive
 #: orden en alguno de estos, no puede crear otra (spec 024, FR-005/FR-006;
 #: research.md spec 024, Decisión 8, mismo criterio de "terminal" que ya usa
 #: `checkout.TERMINAL`/`mark_order_ready`).
-_NON_TERMINAL_ORDER_STATUSES = ("recibida", "abierta", "bloqueada")
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "abierta", "bloqueada")
 
 logger = logging.getLogger(__name__)
 
@@ -672,10 +672,10 @@ def cancel_my_order(
 ) -> CustomerOrder:
     """Cancelación por el propio comensal. Solo hasta que cocina empieza:
 
-    - `recibida`: siempre, salvo que ya se haya "aceptado para cocina" sin
+    - `pendiente`: siempre, salvo que ya se haya "aceptado para cocina" sin
       cobrar (`POST /orders/{id}/start-preparation`) -- ahí ya hay ítems
       `en_preparacion` aunque el pago siga pendiente y `status` no se haya
-      movido de `recibida`;
+      movido de `pendiente`;
     - `abierta`: solo si **todos** sus ítems siguen `pendiente`;
     - a partir de `en_preparacion` el insumo ya se combinó y la decisión de cuánto
       se pierde es del staff, no del cliente.
@@ -703,7 +703,7 @@ def cancel_my_order(
         it for it in order.items
         if it.estado_cocina not in ("pendiente", "anulado")
     ]
-    if en_cocina or order.status not in ("recibida", "abierta"):
+    if en_cocina or order.status not in ("pendiente", "abierta"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "El pedido ya está en preparación; pide al personal que lo cancele.",
@@ -796,7 +796,7 @@ def submit_cart(
     transfer_method_id: UUID | None = None,
 ) -> CustomerOrder:
     """Envía el carrito del comensal como pedido: crea una `CustomerOrder` en
-    estado `recibida` con sus líneas **y** su primer `OrderPaymentAttempt`, en
+    estado `pendiente` con sus líneas **y** su primer `OrderPaymentAttempt`, en
     una sola transacción (spec 025, contracts/submit-cart-with-payment.md).
     Antes de esta llamada no existe ningún registro del pedido — no hay
     ningún estado intermedio "sin pago" que el staff pueda ver
@@ -1031,7 +1031,8 @@ def submit_cart(
             customer_name=participant.display_label or participant.display_name,
             channel="QR_MENU",
             order_type="DINE_IN",
-            status="recibida",
+            status="pendiente",
+            payment_status="UNPAID",
             user_id=None,  # lo envió el comensal, no un usuario del sistema
             cash_shift_id=cash_shift_id,
             table_order_number=table_order_number,
@@ -1257,7 +1258,7 @@ def create_payment_attempt(
     garantía última; este chequeo solo da un 409 con mensaje claro en vez de
     dejar que la violación de índice llegue como error crudo."""
     order = _load_own_order(db, participant_id, order_id)
-    if order.status != "recibida":
+    if order.status != "pendiente":
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f"La orden no admite un nuevo intento de pago (status={order.status})",

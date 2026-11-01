@@ -256,10 +256,13 @@ class TestOrdersListModoPaginado(unittest.TestCase):
         self.assertEqual(result["pages"], 1)
 
     def test_status_fuera_del_enum_cerrado_da_422(self):
+        # A-150 (spec 146): 'pendiente' entró al conjunto cerrado (reemplazó a
+        # 'recibida'), así que ya no sirve como ejemplo de valor fuera de rango --
+        # se usa un literal que sigue sin pertenecer a ningún subconjunto del enum.
         db, _, _ = self._seed(3)
 
         with self.assertRaises(HTTPException) as ctx:
-            _call_list_orders(db, status="pendiente", page=1)
+            _call_list_orders(db, status="en_revision", page=1)
         self.assertEqual(ctx.exception.status_code, 422)
 
     def test_guardia_de_trabajo_acotado_numero_de_sentencias_constante(self):

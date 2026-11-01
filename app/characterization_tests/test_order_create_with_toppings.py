@@ -1,9 +1,21 @@
 """Spec 129: `create_order` acepta `OrderItemIn.toppings` y las resuelve en la MISMA
-transacción que crea el pedido (`OrderItemTopping` + descuento de inventario, si el
-tenant tiene el módulo activo) -- antes el cliente las adjuntaba con una llamada
-aparte por adición, después de crear el pedido (`POST /orders/items/{item_id}/
-toppings`, un N+1 de escrituras evitable porque la selección ya se conoce al armar
-el pedido).
+transacción que crea el pedido (`OrderItemTopping`) -- antes el cliente las
+adjuntaba con una llamada aparte por adición, después de crear el pedido (`POST
+/orders/items/{item_id}/toppings`, un N+1 de escrituras evitable porque la
+selección ya se conoce al armar el pedido).
+
+**A-150 (spec 146)**: antes de esta spec, `create_order` descontaba el stock de la
+adición inmediatamente al crear si el tenant tenía el módulo "inventario" activo y
+`hold_for_payment` era `False` (el camino real, nunca usado por el frontend
+vigente). Desde A-150, `create_order` nunca descuenta inventario (ni del producto
+principal ni de sus adiciones) -- el único punto de descuento es la confirmación
+(`checkout.py`, `_deduct_and_open`). **Gap conocido, fuera de alcance de esta
+spec**: `_deduct_and_open` solo descuenta `OrderItem`/`OrderItemOption` (vía
+`consumption.chosen_from_rows`), nunca `OrderItemTopping` -- el descuento de una
+adición queda sin ningún punto de ejecución tras A-150 (ya era así para
+`hold_for_payment=True`, que nunca pasó por aquí; A-150 solo lo generaliza a todo
+canal). Estos tests se actualizan explícitamente citando A-150
+(`registro-de-anomalias.md`), no en silencio.
 
 Ejecutar solo este módulo:
 
@@ -11,7 +23,6 @@ Ejecutar solo este módulo:
 """
 from decimal import Decimal
 import unittest
-from unittest import mock
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -48,7 +59,7 @@ class TestCreateOrderConToppings(unittest.TestCase):
         self.tenant = fx.make_tenant_double()
         self.db.commit()
 
-    def _crear(self, *, quantity_gomitas=1, con_inventario=False, hold_for_payment=False):
+    def _crear(self, *, quantity_gomitas=1, hold_for_payment=False):
         data = OrderCreate(
             channel=OrderChannel.POS,
             order_type=OrderType.DINE_IN,
@@ -62,8 +73,7 @@ class TestCreateOrderConToppings(unittest.TestCase):
                 )],
             )],
         )
-        with mock.patch.object(service, "has_module_access", return_value=con_inventario):
-            return service.create_order(self.db, data, uuid4(), tenant=self.tenant)
+        return service.create_order(self.db, data, uuid4(), tenant=self.tenant)
 
     def test_la_adicion_se_guarda_en_la_misma_transaccion_que_crea_el_pedido(self):
         order = self._crear(quantity_gomitas=2)
@@ -75,29 +85,34 @@ class TestCreateOrderConToppings(unittest.TestCase):
         self.assertEqual(item.addons_total, PRECIO_GOMITAS * 2)
         self.assertEqual(item.line_total, PRECIO + PRECIO_GOMITAS * 2)
 
-    def test_sin_tenant_con_modulo_inventario_no_descuenta_stock_de_la_adicion(self):
-        order = self._crear(con_inventario=False)
+    def test_la_creacion_nunca_descuenta_stock_de_la_adicion(self):
+        """A-150 (spec 146): a diferencia del comportamiento anterior (descontaba
+        si el tenant tenía el módulo "inventario" activo), `create_order` ya no
+        descuenta inventario de ninguna adición en la creación, sin importar el
+        módulo del tenant -- el descuento se diferiría a la confirmación, que hoy
+        no lo implementa (gap conocido, documentado arriba)."""
+        insumo = fx.make_inventory_item(self.db, current_stock=Decimal("10"))
+        fx.make_recipe_item(self.db, self.gomitas_variant, insumo, quantity=Decimal("3"))
+        self.db.commit()
+
+        order = self._crear(quantity_gomitas=3)
+
         movimientos = self.db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()
         self.assertEqual(movimientos, [])
-
-    def test_con_modulo_inventario_descuenta_stock_de_la_adicion_al_crear(self):
-        insumo = fx.make_inventory_item(self.db, current_stock=Decimal("10"))
-        fx.make_recipe_item(self.db, self.gomitas_variant, insumo, quantity=Decimal("1"))
-        self.db.commit()
-
-        self._crear(quantity_gomitas=3, con_inventario=True)
-
         self.db.refresh(insumo)
-        self.assertEqual(Decimal(insumo.current_stock), Decimal("7"))
+        self.assertEqual(Decimal(insumo.current_stock), Decimal("10"))
 
-    def test_hold_for_payment_difiere_el_descuento_pero_guarda_la_adicion(self):
+    def test_hold_for_payment_ya_no_cambia_nada_sobre_la_adicion(self):
+        """A-150: con todo canal naciendo 'pendiente' sin descuento, el resultado
+        con `hold_for_payment=True` es idéntico al de `False` (antes del cambio,
+        este test contrastaba explícitamente ambos caminos)."""
         insumo = fx.make_inventory_item(self.db, current_stock=Decimal("10"))
         fx.make_recipe_item(self.db, self.gomitas_variant, insumo, quantity=Decimal("1"))
         self.db.commit()
 
-        order = self._crear(quantity_gomitas=3, con_inventario=True, hold_for_payment=True)
+        order = self._crear(quantity_gomitas=3, hold_for_payment=True)
 
         [item] = order.items
         self.assertEqual(len(item.toppings), 1)
@@ -119,25 +134,27 @@ class TestCreateOrderConToppings(unittest.TestCase):
                 toppings=[ToppingSelectionIn(topping_product_id=otra.id, quantity=1)],
             )],
         )
-        with mock.patch.object(service, "has_module_access", return_value=False):
-            with self.assertRaises(HTTPException) as ctx:
-                service.create_order(self.db, data, uuid4(), tenant=self.tenant)
+        with self.assertRaises(HTTPException) as ctx:
+            service.create_order(self.db, data, uuid4(), tenant=self.tenant)
         self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_agotado_de_la_adicion_revienta_toda_la_transaccion(self):
+    def test_un_agotado_de_la_adicion_ya_no_bloquea_la_creacion(self):
+        """A-150: antes, un insumo agotado de la adición revertía TODA la
+        transacción (409) porque la creación descontaba inmediatamente. Ya no hay
+        ningún descuento en la creación, así que ni siquiera se evalúa la
+        disponibilidad del insumo de la adición -- la orden se crea igual, en
+        'pendiente'. Reemplaza la caracterización anterior (que exigía el 409)."""
         insumo = fx.make_inventory_item(self.db, current_stock=Decimal("1"))
         fx.make_recipe_item(self.db, self.gomitas_variant, insumo, quantity=Decimal("1"))
         self.db.commit()
 
-        with self.assertRaises(HTTPException) as ctx:
-            self._crear(quantity_gomitas=5, con_inventario=True)
-        self.assertEqual(ctx.exception.status_code, 409)
+        order = self._crear(quantity_gomitas=5)
 
-        # Transacción entera revertida: tampoco se creó el pedido ni su línea principal.
-        huerfanos = self.db.execute(
-            select(InventoryMovement).where(InventoryMovement.reference_type == "order")
-        ).scalars().all()
-        self.assertEqual(huerfanos, [])
+        self.assertEqual(order.status, "pendiente")
+        [item] = order.items
+        self.assertEqual(len(item.toppings), 1)
+        self.db.refresh(insumo)
+        self.assertEqual(Decimal(insumo.current_stock), Decimal("1"))
 
 
 if __name__ == "__main__":

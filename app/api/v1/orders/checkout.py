@@ -70,7 +70,7 @@ _CONSUMED_KITCHEN = ("en_preparacion", "listo")
 
 # Estados de orden en los que el inventario todavía NO se descontó: el descuento
 # ocurre al confirmar. Cancelar desde aquí no genera ningún movimiento.
-_NOT_DEDUCTED = ("recibida",)
+_NOT_DEDUCTED = ("pendiente",)
 
 
 # ------------------------------------------- Auditoría de orden (spec 074)
@@ -103,7 +103,7 @@ def _record_order_confirmed(
     request_id: str | None = None,
 ) -> None:
     """Emite `order.confirmed` — único punto de emisión para las dos rutas de
-    la transición `recibida → abierta` (research.md § 4).
+    la transición `pendiente → abierta` (research.md § 4).
 
     Vive fuera de `_confirm_order_impl` a propósito: esa función no tiene
     frontera transaccional propia (quien la llama decide el `commit`), así que
@@ -627,7 +627,7 @@ def pay_order(
 # --------------------------------------------------------------- Confirmación
 
 def _deduct_and_open(db: Session, order: CustomerOrder, user: User) -> CustomerOrder:
-    """Núcleo de `recibida` → `abierta`: descuenta inventario y abre el pedido
+    """Núcleo de `pendiente` → `abierta`: descuenta inventario y abre el pedido
     a cocina, sobre una orden **ya cargada** (con o sin lock — lo decide quien
     llama) y con `order.items` ya en memoria. Sin `commit`/`rollback` propios.
 
@@ -653,7 +653,7 @@ def _deduct_and_open(db: Session, order: CustomerOrder, user: User) -> CustomerO
 
 
 def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrder:
-    """Lógica de `recibida` → `abierta` (descuento de inventario incluido), sin
+    """Lógica de `pendiente` → `abierta` (descuento de inventario incluido), sin
     `commit`/`rollback` propios — quien la invoque decide la frontera de la
     transacción. Extraída de `confirm_order` (spec 026, FR-001/FR-002,
     research.md Decisión 1) para que `confirm_cash_payment_attempt` y
@@ -678,10 +678,10 @@ def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrde
     ).scalar_one_or_none()
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
-    if order.status != "recibida":
+    if order.status != "pendiente":
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"Solo se confirman pedidos en 'recibida' (status={order.status})",
+            f"Solo se confirman pedidos en 'pendiente' (status={order.status})",
         )
 
     # spec 024, FR-017: una orden solo avanza a comanda con un intento de pago
@@ -712,14 +712,14 @@ def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrde
 def confirm_order(
     db: Session, order_id: UUID, user: User, request_id: str | None = None
 ) -> CustomerOrder:
-    """`recibida` → `abierta`: el staff acepta el pedido que envió el comensal y
+    """`pendiente` → `abierta`: el staff acepta el pedido que envió el comensal y
     **aquí es donde se compromete el inventario**.
 
     Es el único punto de descuento de los pedidos por QR (`_confirm_order_impl`).
     La validación de stock es la real (con lock por fila, en orden canónico de id
     para no deadlockear); el chequeo del carrito era solo preventivo y pudo quedar
     obsoleto. Si falta stock de un solo insumo, la transacción entera hace
-    rollback y el pedido sigue `recibida`, listo para reintentar o cancelar.
+    rollback y el pedido sigue `pendiente`, listo para reintentar o cancelar.
 
     Endpoint público (`POST /orders/{id}/confirm`) sin cambios de contrato. Desde
     spec 026, el flujo normal de la Terminal de Mesas ya no lo invoca
@@ -784,10 +784,10 @@ def checkout_and_send(
         ).scalar_one_or_none()
         if order is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
-        if order.status != "recibida":
+        if order.status != "pendiente":
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"Solo se cobra y envía pedidos en 'recibida' (status={order.status})",
+                f"Solo se cobra y envía pedidos en 'pendiente' (status={order.status})",
             )
         if order.version != data.version:
             raise HTTPException(
@@ -901,7 +901,7 @@ def cancel_order(
     """Cancela un pedido y ajusta el inventario **según lo que se alcanzó a
     consumir**, no como una reversa simétrica:
 
-    - orden aún sin confirmar (`recibida`): nunca se descontó → cero movimientos;
+    - orden aún sin confirmar (`pendiente`): nunca se descontó → cero movimientos;
     - ítem `pendiente`: descontado pero no preparado → entrada real ('in');
     - ítem `en_preparacion`/`listo`: el insumo ya se combinó → **no vuelve al
       stock**. El 'out' de la confirmación ya es esa pérdida; escribir otro

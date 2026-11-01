@@ -95,7 +95,7 @@ def accept_order_for_kitchen(db: Session, order_id: UUID) -> tuple[CustomerOrder
     (arriba), pero con el target de la transición invertido.
 
     No toca `CustomerOrder.status` a propósito: aceptar para cocina y cobrar
-    son decisiones separadas (el pedido puede seguir `recibida`, esperando
+    son decisiones separadas (el pedido puede seguir `pendiente`, esperando
     revisión de pago, mientras cocina ya empezó). Por eso tampoco descuenta
     inventario aquí -- eso sigue pasando únicamente en `confirm`/`pay`."""
     order = db.execute(

@@ -127,7 +127,7 @@ class OrdersSoldOutTests(unittest.TestCase):
         )
         order = service.create_order(db, data, uuid4())
 
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "pendiente")
 
     # -- escenario 8: un pedido ya creado no se revalida ---------------------
 
@@ -149,7 +149,7 @@ class OrdersSoldOutTests(unittest.TestCase):
 
         # El pedido conserva su ítem y su estado, sin ninguna revalidación.
         reloaded = db.get(CustomerOrder, order_id)
-        self.assertEqual(reloaded.status, "abierta")
+        self.assertEqual(reloaded.status, "pendiente")
         self.assertEqual(len(reloaded.items), 1)
 
 

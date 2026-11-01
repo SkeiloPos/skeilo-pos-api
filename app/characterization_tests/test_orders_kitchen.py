@@ -173,26 +173,26 @@ class TestKitchen(unittest.TestCase):
     def test_accept_order_for_kitchen_pasa_pendientes_a_en_preparacion_sin_tocar_status(self):
         """`accept_order_for_kitchen` ("Aceptar pedido" sin cobrar): mueve los
         ítems `pendiente` a `en_preparacion` en bloque, sin tocar
-        `CustomerOrder.status` -- el pedido sigue `recibida`, sin descontar
+        `CustomerOrder.status` -- el pedido sigue `pendiente`, sin descontar
         inventario ni generar venta. Es la pieza nueva que permite que cocina
         empiece mientras el pago sigue pendiente de revisión."""
-        s = self._seed_item(order_status="recibida", estado_cocina="pendiente")
+        s = self._seed_item(order_status="pendiente", estado_cocina="pendiente")
         db, order = s["db"], s["order"]
 
         actualizada, cambiados = kitchen.accept_order_for_kitchen(db, order.id)
         self.assertEqual(len(cambiados), 1)
         self.assertEqual(cambiados[0].estado_cocina, "en_preparacion")
-        self.assertEqual(actualizada.status, "recibida")
+        self.assertEqual(actualizada.status, "pendiente")
 
     def test_accept_order_for_kitchen_es_idempotente(self):
         """Una segunda llamada sin ítems `pendiente` que mover no falla --
         devuelve la orden sin cambios, igual que `mark_order_ready`."""
-        s = self._seed_item(order_status="recibida", estado_cocina="en_preparacion")
+        s = self._seed_item(order_status="pendiente", estado_cocina="en_preparacion")
         db, order = s["db"], s["order"]
 
         actualizada, cambiados = kitchen.accept_order_for_kitchen(db, order.id)
         self.assertEqual(cambiados, [])
-        self.assertEqual(actualizada.status, "recibida")
+        self.assertEqual(actualizada.status, "pendiente")
 
     def test_accept_order_for_kitchen_409_si_orden_pagada_o_cancelada(self):
         """Mismo guard que `mark_order_ready`: una orden ya terminal rechaza
@@ -316,7 +316,7 @@ class TestKitchen(unittest.TestCase):
             checkout.block_order(s4["db"], s4["order"].id, BlockIn(version=0))
         self.assertEqual(ctx4.exception.status_code, 409)
 
-        # confirm_order: orden 'abierta' no está en 'recibida'.
+        # confirm_order: orden 'abierta' no está en 'pendiente'.
         s5 = self._seed_item(order_status="abierta", estado_cocina="listo")
         with self.assertRaises(HTTPException) as ctx5:
             checkout.confirm_order(s5["db"], s5["order"].id, self._user())

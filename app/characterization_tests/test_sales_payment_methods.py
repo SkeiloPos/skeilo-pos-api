@@ -103,7 +103,7 @@ class TestSalesPaymentMethods(unittest.TestCase):
         table = fx.make_dining_table(db)
         ts = fx.make_table_session(db, table=table)
         participant = fx.make_participant(db, table_session=ts)
-        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         nequi = fx.make_payment_method(
             db, name="Nequi", is_cash=False, type="transfer",
             payment_info={"cuenta": "3001234567"},

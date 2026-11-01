@@ -75,12 +75,12 @@ class _Base(unittest.TestCase):
 class TestFiltroDeEstado(_Base):
 
     def test_recibida_solo_recibidas_sin_venta(self):
-        recibida = self._order(status="recibida")
-        self._order(status="recibida", con_sale=True)  # ya tiene venta → "pagada"
+        recibida = self._order(status="pendiente")
+        self._order(status="pendiente", con_sale=True)  # ya tiene venta → "pagada"
         self._order(status="abierta")
         self.db.commit()
 
-        self.assertEqual(_ids(self.db, status="recibida"), {recibida.id})
+        self.assertEqual(_ids(self.db, status="pendiente"), {recibida.id})
 
     def test_abierta_excluye_las_que_ya_tienen_venta(self):
         abierta = self._order(status="abierta")

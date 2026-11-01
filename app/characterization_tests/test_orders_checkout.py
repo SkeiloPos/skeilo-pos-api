@@ -528,9 +528,9 @@ class TestCheckout(unittest.TestCase):
     def test_confirm_order_descuenta_una_vez_y_stock_insuficiente_revierte(self):
         """CONGELA comportamiento actual (`checkout.confirm_order:366-390` +
         `checkout._confirm_order_impl:313-363`, spec.md Historia 2, escenario
-        4): pedido 'recibida' con ítems válidos → pasa a 'abierta' y descuenta
+        4): pedido 'pendiente' con ítems válidos → pasa a 'abierta' y descuenta
         inventario exactamente una vez; con stock insuficiente de un insumo,
-        la transacción entera revierte y el pedido sigue 'recibida'.
+        la transacción entera revierte y el pedido sigue 'pendiente'.
 
         Actualizado por spec 024-pagos-ordenes-mesa (FR-017, Principio III):
         `confirm_order` ahora exige un intento de pago `confirmado` antes de
@@ -559,7 +559,7 @@ class TestCheckout(unittest.TestCase):
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("2"))
         metodo = fx.make_payment_method(db, name="Efectivo", is_cash=True)
 
-        order = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
         fx.make_payment_attempt(db, order, metodo, status="confirmado")
         db.commit()
@@ -575,7 +575,7 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(Decimal(insumo.current_stock), Decimal("3"))
 
         # Stock insuficiente para un segundo pedido (necesita 10, sobran 3).
-        order2 = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order2 = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order2, variant, quantity=5, estado_cocina="pendiente")
         fx.make_payment_attempt(db, order2, metodo, status="confirmado")
         db.commit()
@@ -584,7 +584,7 @@ class TestCheckout(unittest.TestCase):
             checkout.confirm_order(db, order2.id, user)
         self.assertEqual(ctx.exception.status_code, 400)
         db.refresh(order2)
-        self.assertEqual(order2.status, "recibida")
+        self.assertEqual(order2.status, "pendiente")
         movimientos2 = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order2.id)
         ).scalars().all()
@@ -681,7 +681,7 @@ class TestCheckout(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = fx.make_payment_method(db, is_cash=True)
         attempt = fx.make_payment_attempt(db, order, method, status="pendiente")
@@ -704,7 +704,7 @@ class TestCheckout(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = fx.make_payment_method(db, is_cash=False)
         attempt = fx.make_payment_attempt(
@@ -881,7 +881,7 @@ class TestCheckout(unittest.TestCase):
     # -------------------------------------------------- checkout_and_send (T020)
 
     def _seed_hold_order_con_receta(self, *, stock=Decimal("1000"), recipe_qty=Decimal("2")):
-        """Mesa ocupada + sesión + orden 'recibida' (como si hubiera nacido con
+        """Mesa ocupada + sesión + orden 'pendiente' (como si hubiera nacido con
         `hold_for_payment=True`, T013), con una variante con receta y turno de
         caja abierto listo para cobrar."""
         db = fx.new_session()
@@ -892,7 +892,7 @@ class TestCheckout(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=stock)
         fx.make_recipe_item(db, variant, insumo, quantity=recipe_qty)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
@@ -905,7 +905,7 @@ class TestCheckout(unittest.TestCase):
 
     def test_checkout_and_send_cobra_descuenta_y_abre_a_cocina(self):
         """Comportamiento nuevo (spec 028, T016), estado ampliado por spec 035
-        (A-52, `registro-de-anomalias.md`): orden 'recibida' (nacida con
+        (A-52, `registro-de-anomalias.md`): orden 'pendiente' (nacida con
         `hold_for_payment=True`) + turno de caja abierto → `checkout_and_send`
         cobra (crea el `Sale`), descuenta inventario, y pasa la orden a
         'pagada' — todo en una sola llamada, sin pasar por
@@ -938,7 +938,7 @@ class TestCheckout(unittest.TestCase):
     def test_checkout_and_send_orden_delivery_suma_el_valor_del_domicilio(self):
         """spec 056, FR-011: este es el camino real que sigue un pedido
         "Domicilio" creado desde la pantalla de creación manual
-        (`hold_for_payment=True` → 'recibida' → checkout_and_send)."""
+        (`hold_for_payment=True` → 'pendiente' → checkout_and_send)."""
         s = self._seed_hold_order_con_receta()
         db, order, shift, method = s["db"], s["order"], s["shift"], s["method"]
         order.order_type = "DELIVERY"
@@ -983,7 +983,7 @@ class TestCheckout(unittest.TestCase):
 
     def test_checkout_and_send_stock_insuficiente_revierte_todo(self):
         """spec 028, T016: sin stock suficiente para descontar al enviar a
-        cocina, la transacción entera revierte — la orden sigue 'recibida' y
+        cocina, la transacción entera revierte — la orden sigue 'pendiente' y
         no queda ni venta ni movimiento de inventario a medias (mismo
         criterio de atomicidad que `_confirm_order_impl`, congelado en
         `test_confirm_order_descuenta_una_vez_y_stock_insuficiente_revierte`)."""
@@ -1001,7 +1001,7 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
         db.refresh(order)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
         ventas = db.execute(
             select(Sale).where(Sale.customer_order_id == order.id)
         ).scalars().all()
@@ -1103,7 +1103,7 @@ class TestCheckout(unittest.TestCase):
         `extra_price=1000`) → total esperado $21.000 (FR-002), no $22.000.
         `compute_checkout_preview` y `confirm_cash_payment_attempt` (efectivo, "Pagos
         por confirmar") deben coincidir exactamente en ese total."""
-        s = self._seed_order_con_receta(order_status="recibida")
+        s = self._seed_order_con_receta(order_status="pendiente")
         db, order, variant = s["db"], s["order"], s["variant"]
         group = fx.make_option_group(
             db, selection_mode="cantidad", pricing_type="incluido", min_select=0, max_select=1,
@@ -1176,7 +1176,7 @@ class TestVigenciaCongelada(unittest.TestCase):
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
         order = fx.make_customer_order(
-            db, ts, status="recibida", channel="POS",
+            db, ts, status="pendiente", channel="POS",
             promotion_evaluated_at=promo_evaluated_at,
         )
         fx.make_order_item(db, order, variant, quantity=qty, estado_cocina="pendiente")

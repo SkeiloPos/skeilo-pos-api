@@ -21,10 +21,10 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
     `status` es el ciclo del pedido, **no** el de cocina (ese vive por ítem, en
     `order_items.estado_cocina`):
 
-        recibida → abierta → bloqueada → pagada
+        pendiente → abierta → bloqueada → pagada
                  ↘  cancelada (terminal, desde cualquier estado no terminal)
 
-    - `recibida`: el comensal la envió desde el QR pero **aún no descuenta stock**;
+    - `pendiente`: toda orden nueva, de cualquier canal, nace así -- **aún no descuenta stock**;
     - `abierta`: confirmada por staff — aquí y solo aquí se descontó el inventario;
     - `bloqueada`: congelada para cobro (lock optimista por `version`);
     - `pagada` / `cancelada`: terminales.
@@ -77,6 +77,14 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
     delivery_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
 
     status: Mapped[str] = mapped_column(String(12), nullable=False, server_default="abierta")
+
+    # spec 146 (FR-002): estado de pago, independiente de `status` — una orden
+    # puede estar en `status='pendiente'` con `payment_status='PAID'` si el pago
+    # se confirmó en el mismo acto de creación (venta de mostrador pagada de
+    # inmediato) sin que la orden haya sido confirmada operativamente todavía.
+    payment_status: Mapped[str] = mapped_column(
+        String(10), nullable=False, server_default="UNPAID"
+    )
 
     # spec 063 (FR-021, A-64): hoy `CustomerOrder` no tiene ningún campo de
     # descuento. Se fija en el cobro (`pay_order`, `_close_unified`, `_close_split`)
@@ -174,8 +182,12 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
             name="ck_customer_order_order_type",
         ),
         CheckConstraint(
-            "status IN ('recibida', 'abierta', 'bloqueada', 'pagada', 'cancelada')",
+            "status IN ('pendiente', 'abierta', 'bloqueada', 'pagada', 'cancelada')",
             name="ck_customer_order_status",
+        ),
+        CheckConstraint(
+            "payment_status IN ('UNPAID', 'PAID', 'PARTIAL')",
+            name="ck_customer_order_payment_status",
         ),
         CheckConstraint(
             "delivery_fee IS NULL OR delivery_fee >= 0",

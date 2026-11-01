@@ -323,7 +323,7 @@ def make_customer_order(
     kw.setdefault("customer_name", participant.display_label or participant.display_name)
     kw.setdefault("channel", "QR_MENU")
     kw.setdefault("order_type", "DINE_IN")
-    kw.setdefault("status", "recibida")
+    kw.setdefault("status", "pendiente")
     kw.setdefault("created_at", datetime.now())
     obj = CustomerOrder(**kw)
     db.add(obj)

@@ -283,7 +283,7 @@ def compute_bill(
 
 def _assert_closable(db: Session, orders: list[CustomerOrder]) -> None:
     """Una sesión no se cierra con pedidos sin confirmar ni con comida en curso."""
-    sin_confirmar = [o for o in orders if o.status == "recibida"]
+    sin_confirmar = [o for o in orders if o.status == "pendiente"]
     if sin_confirmar:
         raise HTTPException(
             status.HTTP_409_CONFLICT,

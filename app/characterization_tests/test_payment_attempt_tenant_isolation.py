@@ -36,7 +36,7 @@ class TestPaymentAttemptTenantIsolation(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         attempt = fx.make_payment_attempt(db, order, nequi, status="pendiente")

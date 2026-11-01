@@ -33,7 +33,7 @@ class TestSalesDuplicatePaymentMethod(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, quantity=1)
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)

@@ -139,7 +139,7 @@ def _fixture(db):
     return product.id, group.id, fresa.id, choco.id, grande.id, pequena.id, op_fresa.id
 
 
-def _order(db, variant_id, option_ids, *, quantity=1, status="recibida"):
+def _order(db, variant_id, option_ids, *, quantity=1, status="pendiente"):
     order = CustomerOrder(channel="QR_MENU", order_type="DINE_IN", status=status)
     db.add(order); db.flush()
     item = OrderItem(order_id=order.id, product_variant_id=variant_id, quantity=quantity,
