@@ -11,6 +11,7 @@ from app.core.error_middleware import (
     OperationalLogMiddleware,
     RequestIdMiddleware,
     register_error_handlers,
+    register_module_error_handler,
 )
 from app.core.redis import token_blocklist
 from app.core.event_bus import event_bus
@@ -126,6 +127,8 @@ def create_app()->FastAPI:
     )
     app.add_middleware(RequestIdMiddleware, path_prefix=SUPER_ADMIN_ERROR_PREFIX)
     register_error_handlers(app, path_prefix=SUPER_ADMIN_ERROR_PREFIX)
+    # spec 141 (A-151): el 403 por módulo no incluido lleva `code`/`module` en toda la API.
+    register_module_error_handler(app)
     # spec 074 (FR-015–FR-021): log operativo de toda petición mutativa fuera
     # de super-admin. Sin `path_prefix`: el filtrado de alcance (método y
     # prefijo excluido) vive dentro de la clase. Se agrega de último a
