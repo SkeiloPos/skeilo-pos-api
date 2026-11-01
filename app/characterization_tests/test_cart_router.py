@@ -236,7 +236,7 @@ class TestCartRouter(unittest.TestCase):
         """CONGELA comportamiento actual: `events.order_created` se publica
         DESPUÉS de que la transacción de `service.submit_cart` ya hizo
         commit — en el momento de la llamada, una consulta SQL fresca sobre
-        `db` ya ve el pedido `recibida`.
+        `db` ya ve el pedido `pendiente`.
 
         Actualizado por spec 038 (FR-003/FR-004, research.md Decisión 9): ya
         no queda ninguna fila de `Cart` para el participante en ese momento
@@ -275,9 +275,9 @@ class TestCartRouter(unittest.TestCase):
             result = asyncio.run(cart_router.submit_cart(body, _FakeRequest(), ctx))
 
         spy.assert_called_once()
-        self.assertEqual(seen["order_status"], "recibida")
+        self.assertEqual(seen["order_status"], "pendiente")
         self.assertIsNone(seen["cart_exists"])
-        self.assertEqual(result.status, "recibida")
+        self.assertEqual(result.status, "pendiente")
 
     def test_submit_cart_segundo_intento_responde_ya_fue_enviado(self):
         """spec 038, US2 (Acceptance Scenarios 1-2 / CA-3, CA-4, FR-007):
@@ -345,7 +345,7 @@ class TestCartRouter(unittest.TestCase):
     def test_cancel_my_order_endpoint(self):
         """CONGELA comportamiento actual: `POST /cart/orders/{order_id}/cancel`
         delega en `service.cancel_my_order` y responde igual que la función
-        de servicio ya congelada (`recibida` cancela, `en_preparacion`
+        de servicio ya congelada (`pendiente` cancela, `en_preparacion`
         responde 409)."""
         db, table, ts, participant = self._seed_session()
         variant = self._seed_variant(db)

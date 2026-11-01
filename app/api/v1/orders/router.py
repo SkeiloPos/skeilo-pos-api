@@ -261,7 +261,7 @@ def confirm_order(
     user: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    """`recibida` → `abierta`. Es el único punto donde el pedido del comensal
+    """`pendiente` → `abierta`. Es el único punto donde el pedido del comensal
     compromete stock; hasta aquí no había tocado inventario."""
     checkout.confirm_order(db, order_id, user, request_id=current_request_id(request))
     order = _load_order(db, order_id)
@@ -796,7 +796,7 @@ def checkout_and_send(
     tenant: Tenant = Depends(get_tenant),
 ):
     """Solo para comandas creadas con `hold_for_payment=True` (status
-    'recibida'): cobra la orden y, en la misma transacción, la envía a cocina
+    'pendiente'): cobra la orden y, en la misma transacción, la envía a cocina
     (descuenta inventario) — spec 028, T016."""
     sale = checkout.checkout_and_send(
         db, order_id, body, user, request_id=current_request_id(request), tenant=tenant
@@ -991,11 +991,11 @@ def get_order(order_id: UUID, db: Session = Depends(get_db), _: User = Depends(g
 
 # `PATCH /{order_id}/status` se eliminó a propósito: asignaba cualquier estado sin
 # validar la transición y sin tocar inventario, así que permitía pasar un pedido de
-# 'recibida' a 'abierta' esquivando `confirm_order` —el único punto que descuenta
+# 'pendiente' a 'abierta' esquivando `confirm_order` —el único punto que descuenta
 # stock— y dejaba el inventario sobrestimado sin que nadie se enterara.
 #
 # Cada transición legítima tiene su endpoint, con sus reglas:
-#   recibida → abierta    POST /orders/{id}/confirm      (descuenta inventario)
+#   pendiente → abierta    POST /orders/{id}/confirm      (descuenta inventario)
 #   abierta  → bloqueada  POST /orders/{id}/block        (valida la preparación)
 #   → pagada              POST /table-sessions/{id}/close (cobra y libera la mesa)
 #   → cancelada           POST /orders/{id}/cancel       (revierte lo no preparado)

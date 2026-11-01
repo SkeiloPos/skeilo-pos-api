@@ -62,7 +62,7 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         db.commit()
 
         o1 = _seed_active_order(db, order_type="DINE_IN", status="abierta")
-        o2 = _seed_active_order(db, order_type="TAKEAWAY", status="recibida")
+        o2 = _seed_active_order(db, order_type="TAKEAWAY", status="pendiente")
         o3 = _seed_active_order(db, order_type="DELIVERY", status="bloqueada")
         db.commit()
 
@@ -88,7 +88,7 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         shift = fx.make_cash_shift(db, register=register)
         db.commit()
         o1 = _seed_active_order(db, order_type="DINE_IN", status="abierta")
-        o2 = _seed_active_order(db, order_type="TAKEAWAY", status="recibida")
+        o2 = _seed_active_order(db, order_type="TAKEAWAY", status="pendiente")
         db.commit()
 
         bloqueado = router.close_shift(shift.id, ShiftClose(), db)
@@ -155,7 +155,7 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         db.commit()
         # El pedido activo no tiene relación alguna con `register_b` ni con
         # ninguna caja -- research.md D1 acepta esta consecuencia.
-        _seed_active_order(db, order_type="DELIVERY", status="recibida")
+        _seed_active_order(db, order_type="DELIVERY", status="pendiente")
         db.commit()
 
         resultado = router.close_shift(shift_b.id, ShiftClose(), db)

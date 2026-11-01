@@ -10,7 +10,7 @@ preparación reingresaba insumos que físicamente ya se habían usado y sobresti
 el inventario en silencio hasta el conteo físico.
 
 Reglas verificadas:
-  - pedido `recibida`              → cero movimientos (nunca se descontó);
+  - pedido `pendiente`              → cero movimientos (nunca se descontó);
   - ítem `pendiente` en `abierta`  → entrada real, el stock vuelve;
   - ítem `en_preparacion`+         → sin movimiento, el stock NO vuelve (pérdida);
   - mixto                          → solo se revierte la parte pendiente.
@@ -177,14 +177,14 @@ def main():
         creados: list = []
 
         try:
-            # --- 1. pedido 'recibida': nunca descontó, cancelar no mueve nada -----
-            order = _make_order(db, variant, table, status="recibida",
+            # --- 1. pedido 'pendiente': nunca descontó, cancelar no mueve nada -----
+            order = _make_order(db, variant, table, status="pendiente",
                                 estados=["pendiente", "pendiente"])
             creados.append(order.id)
             antes = _stock(db, item_id)
             checkout.cancel_order(db, order.id, CancelIn(motivo="test"), user)
-            _check("cancelar 'recibida' no genera movimientos", _movimientos(db, order.id), [])
-            _check("cancelar 'recibida' no cambia el stock", _stock(db, item_id), antes)
+            _check("cancelar 'pendiente' no genera movimientos", _movimientos(db, order.id), [])
+            _check("cancelar 'pendiente' no cambia el stock", _stock(db, item_id), antes)
 
             # --- 2. 'abierta' con todo pendiente: reversa completa ----------------
             order = _make_order(db, variant, table, status="abierta",

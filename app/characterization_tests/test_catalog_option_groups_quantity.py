@@ -341,9 +341,17 @@ class EndToEndQuantityConsumptionTests(unittest.TestCase):
         """Spec 117 (A-126): este test documentaba el *bug* que esta spec corrige --
         `self._seed` usa un grupo `selection_mode='cantidad'` (vía `_grupo_cantidad`), así
         que desde A-126 su adición se cobra/consume por línea, sin multiplicarse por la
-        cantidad de producto. Actualizado citando esa decisión (Principio III): antes
-        descontaba `per_unit(10) × cantidad_línea(2) × cantidad_opción(3) = 60`; ahora
-        descuenta `per_unit(10) × cantidad_opción(3) = 30`, sin la cantidad de línea."""
+        cantidad de producto: descuenta `per_unit(10) × cantidad_opción(3) = 30`, sin la
+        cantidad de línea (2).
+
+        A-150 (spec 146): `create_order` ya no descuenta inventario -- nace 'pendiente'
+        sin movimientos. El único punto de descuento es la confirmación
+        (`checkout._deduct_and_open`, el núcleo común de `confirm_order`/
+        `checkout_and_send`), que este test ejercita directamente para seguir probando
+        la misma cadena T032-T036 encadenada end-to-end, ahora en el punto donde
+        realmente ocurre el descuento."""
+        from app.api.v1.orders import checkout
+
         db = fx.new_session()
         variant, insumo, opt = self._seed(db)
         db.commit()
@@ -357,6 +365,16 @@ class EndToEndQuantityConsumptionTests(unittest.TestCase):
             )],
         )
         order = orders_service.create_order(db, data, uuid4())
+        self.assertEqual(order.status, "pendiente")
+        self.assertEqual(
+            db.execute(
+                select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
+            ).scalars().all(),
+            [],
+        )
+
+        checkout._deduct_and_open(db, order, fx.make_user_double())
+        db.commit()
 
         self.assertEqual(order.status, "abierta")
         movimientos = db.execute(

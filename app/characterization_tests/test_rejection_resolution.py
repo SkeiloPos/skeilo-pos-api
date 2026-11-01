@@ -32,7 +32,7 @@ class TestRetryLimit(unittest.TestCase):
         table = cfx.make_dining_table(db)
         ts = cfx.make_table_session(db, table=table)
         participant = cfx.make_participant(db, table_session=ts)
-        order = cfx.make_customer_order(db, participant, status="recibida")
+        order = cfx.make_customer_order(db, participant, status="pendiente")
         nequi = cfx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         db.commit()
         return db, participant, order, nequi

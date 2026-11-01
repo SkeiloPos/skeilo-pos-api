@@ -50,7 +50,7 @@ class TestCartPaymentAttempts(unittest.TestCase):
 
     # ------------------------------------------------------------- Helpers
 
-    def _seed_order(self, *, order_status: str = "recibida"):
+    def _seed_order(self, *, order_status: str = "pendiente"):
         db = fx.new_session()
         table = fx.make_dining_table(db)
         ts = fx.make_table_session(db, table=table)
@@ -283,7 +283,7 @@ class TestCartPaymentAttempts(unittest.TestCase):
 
         order = service.submit_cart(db, participant, efectivo.id)
 
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
         attempt = order.current_payment_attempt
         self.assertEqual(attempt.status, "pendiente")
         self.assertTrue(attempt.is_cash)

@@ -250,7 +250,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         return db, participant, method
 
     def _seed_orden_recibida(self, *, is_cash=True, receipt=None):
-        """Orden 'recibida' con su ítem y un intento de pago pendiente — el
+        """Orden 'pendiente' con su ítem y un intento de pago pendiente — el
         punto de partida de aprobar/rechazar/confirmar efectivo."""
         db = fx.new_session()
         table = fx.make_dining_table(db)
@@ -261,7 +261,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
-        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = (
             fx.make_payment_method(db, name="Efectivo", is_cash=True) if is_cash
@@ -296,7 +296,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         return orders_service.create_order(db, data, user_id=user.id, user=user), user
 
     def _seed_hold_order_con_receta(self):
-        """Mesa + orden 'recibida' (como si hubiera nacido con
+        """Mesa + orden 'pendiente' (como si hubiera nacido con
         `hold_for_payment=True`, T013) con una variante con receta, y turno de
         caja abierto — el punto de partida de `checkout_and_send` (T040)."""
         db = fx.new_session()
@@ -307,7 +307,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
-        order = fx.make_customer_order(db, ts, status="recibida", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
@@ -478,7 +478,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         self.assertEqual(evento["details"]["reason"], "cliente se retiró")
         self.assertIs(evento["details"]["inventory_loss"], True)
 
-        # (b) el propio comensal, sobre una orden 'recibida' (nada descontado).
+        # (b) el propio comensal, sobre una orden 'pendiente' (nada descontado).
         db2, order2, _ = self._seed_orden_recibida()
         participant = db2.get(SessionParticipant, order2.participant_id)
 
@@ -521,19 +521,28 @@ class TestOrderAuditIntegration(unittest.TestCase):
         self.assertEqual(ctx2.exception.status_code, 409)
         rec2.assert_not_called()
 
-        # (c) comanda manual con una variante sin receta → 409, sin evento.
+        # (c) comanda manual TAKEAWAY con mesa asociada → 422, sin evento.
+        #
+        # A-150 (spec 146): `create_order` ya no descuenta inventario, así que una
+        # variante sin receta ya no rechaza la creación (ese 409 se desplazó a la
+        # confirmación) — se reemplaza por otra validación que sigue fallando en la
+        # creación misma (spec 055, research.md Decisión 5).
         db3 = fx.new_session()
         category = fx.make_category(db3)
         product = fx.make_product(db3, category=category)
         variant = fx.make_variant(db3, product=product, price=PRECIO)
+        table = fx.make_dining_table(db3, status="libre")
         db3.commit()
         data = OrderCreate(
             channel=OrderChannel.POS,
+            order_type=OrderType.TAKEAWAY,
+            dining_table_id=table.id,
             items=[OrderItemIn(product_variant_id=variant.id, quantity=1)],
         )
         with mock.patch.object(orders_service, "record_order_audit_event") as rec3:
-            with self.assertRaises(HTTPException):
+            with self.assertRaises(HTTPException) as ctx3:
                 orders_service.create_order(db3, data, user_id=uuid4())
+        self.assertEqual(ctx3.exception.status_code, 422)
         rec3.assert_not_called()
 
     # ------------------------------------------ actor automático/manual (T027)

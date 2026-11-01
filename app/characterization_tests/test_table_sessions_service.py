@@ -105,7 +105,7 @@ class TestTableSessionsService(unittest.TestCase):
 
     def test_has_billable_orders_true_y_false(self):
         """CONGELA comportamiento actual (`service.py:64-71`): una sesión con un
-        pedido `recibida`/`abierta` (no terminal) devuelve `True`; con solo
+        pedido `pendiente`/`abierta` (no terminal) devuelve `True`; con solo
         pedidos `cancelada`/`pagada` devuelve `False`."""
         db, table, ts = self._seed_bare_session()
         category = fx.make_category(db)

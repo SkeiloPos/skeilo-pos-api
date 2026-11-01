@@ -21,7 +21,7 @@ from app.models.dining_table import DiningTable
 # Misma tupla que `cart/service.py:82` y `orders/service.py:69` — repetida
 # aquí por el mismo motivo que ya documentan esos dos módulos (evitar un
 # import cruzado entre paquetes de API hermanos).
-_NON_TERMINAL_ORDER_STATUSES = ("recibida", "abierta", "bloqueada")
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "abierta", "bloqueada")
 
 # Un único predicado de "activo" para el conteo y para la lista (US6, FR-023):
 # así no pueden divergir.
@@ -40,7 +40,7 @@ class ActiveOrderRow:
 
 
 def list_active_orders(db: Session) -> list[ActiveOrderRow]:
-    """Pedidos `recibida`/`abierta`/`bloqueada` de todo el tenant, más
+    """Pedidos `pendiente`/`abierta`/`bloqueada` de todo el tenant, más
     antiguo primero — el filtro de "activo" no distingue canal
     (`DINE_IN`/`TAKEAWAY`/`DELIVERY`/`NULL`, data-model.md §1.6)."""
     rows = db.execute(

@@ -363,7 +363,7 @@ class TestSessionClosedNotifications(unittest.TestCase):
         from app.api.v1.cart import service as cart_service
         from app.characterization_tests import cart_fixtures as cf
         db, table, ts, ana = self._seed(comensal_cerrado=True)
-        orden = cf.make_customer_order(db, ana, status="recibida")
+        orden = cf.make_customer_order(db, ana, status="pendiente")
         db.commit()
 
         def cancelar(*_a, **_kw):
@@ -533,7 +533,7 @@ class TestSessionClosedNotifications(unittest.TestCase):
 
         # Y ese contexto rechaza con 401 a un comensal cerrado que aún tiene una cuenta pendiente.
         db, table, ts, ana = self._seed(comensal_cerrado=True)
-        cf.make_customer_order(db, ana, status="recibida")
+        cf.make_customer_order(db, ana, status="pendiente")
         db.commit()
         with self._open(db, ana, ts) as qr:
             exc = self._401(qr)

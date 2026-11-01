@@ -454,7 +454,7 @@ class TestCartService(unittest.TestCase):
     # ------------------------------------------------------------- cancel_my_order (T019)
 
     def test_cancel_my_order_recibida_se_cancela(self):
-        """CONGELA comportamiento actual: un pedido en 'recibida' (sin
+        """CONGELA comportamiento actual: un pedido en 'pendiente' (sin
         ítems en cocina, porque aún no se confirmó) se cancela sin
         restricción.
 
@@ -465,7 +465,7 @@ class TestCartService(unittest.TestCase):
         efectivo = self._seed_efectivo(db)
         service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
         order = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
         cancelled = service.cancel_my_order(db, participant, order.id, "Me equivoqué de sabor")
 
@@ -474,9 +474,9 @@ class TestCartService(unittest.TestCase):
     def test_cancel_my_order_aceptado_para_cocina_sin_cobrar_409(self):
         """Comportamiento NUEVO: un pedido "aceptado para cocina" sin cobrar
         (`kitchen.accept_order_for_kitchen` -- `POST /orders/{id}/start-preparation`)
-        queda con `status` aún en `'recibida'` pero sus ítems ya
+        queda con `status` aún en `'pendiente'` pero sus ítems ya
         `en_preparacion`. Antes de este fix, `cancel_my_order` solo miraba
-        `estado_cocina` cuando `status != 'recibida'`, así que el comensal
+        `estado_cocina` cuando `status != 'pendiente'`, así que el comensal
         podía seguir cancelando un pedido que cocina ya estaba preparando.
         Ahora responde 409 igual que `test_cancel_my_order_en_preparacion_409`."""
         db, table, ts, participant = self._seed_session()
@@ -484,12 +484,12 @@ class TestCartService(unittest.TestCase):
         efectivo = self._seed_efectivo(db)
         service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
         order = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
         from app.api.v1.orders import kitchen
         kitchen.accept_order_for_kitchen(db, order.id)
         db.refresh(order)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
         with self.assertRaises(HTTPException) as ctx:
             service.cancel_my_order(db, participant, order.id, "Ya no quiero")
@@ -658,7 +658,7 @@ class TestCartService(unittest.TestCase):
 
     def test_submit_cart_elimina_carrito_y_abre_uno_nuevo_tras_pedido(self):
         """CONGELA comportamiento corregido — spec 038 (FR-003/FR-004): un
-        carrito con ítems se confirma en una `CustomerOrder` 'recibida' y el
+        carrito con ítems se confirma en una `CustomerOrder` 'pendiente' y el
         carrito del participante se ELIMINA físicamente (no queda ninguna
         fila, ni 'confirmado' ni de ningún otro status) en la misma
         transacción del pedido. Antes de esta spec la fila quedaba
@@ -680,7 +680,7 @@ class TestCartService(unittest.TestCase):
         order = service.submit_cart(db, participant, efectivo.id)
 
         self.assertIsInstance(order, CustomerOrder)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
         self.assertEqual(len(order.items), 1)
         self.assertEqual(order.items[0].quantity, 2)
         self.assertEqual(order.current_payment_attempt.payment_method_id, efectivo.id)

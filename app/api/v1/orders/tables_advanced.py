@@ -34,7 +34,7 @@ def _table_occupied_by_order(order: CustomerOrder) -> bool:
     ocupar la mesa de inmediato, sin mirar cocina; ahora que
     `checkout_and_send` puede dejar una orden `'pagada'` con comida todavía
     en preparación (spec 028: se cobra antes de enviar a cocina), esa señal
-    ya no basta por sí sola. Cualquier otro estado (`'recibida'`, `'abierta'`,
+    ya no basta por sí sola. Cualquier otro estado (`'pendiente'`, `'abierta'`,
     `'bloqueada'`) sigue ocupando la mesa sin condición, igual que antes."""
     if order.status == "cancelada":
         return False
@@ -48,7 +48,7 @@ def _order_locked_for_move_or_merge(order: CustomerOrder) -> bool:
     035, A-52). Distinto de `_table_occupied_by_order`: una orden
     `'cancelada'` siempre lo impide (igual que antes de esta spec) aunque
     nunca ocupe la mesa por sí sola; una orden no-terminal
-    (`'recibida'`/`'abierta'`/`'bloqueada'`) nunca lo impide (igual que
+    (`'pendiente'`/`'abierta'`/`'bloqueada'`) nunca lo impide (igual que
     antes). Una orden `'pagada'` lo impide solo mientras le queden ítems sin
     terminar de preparar — antes de esta spec, `'pagada'` siempre lo impedía,
     sin mirar cocina."""
