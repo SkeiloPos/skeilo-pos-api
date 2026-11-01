@@ -477,9 +477,10 @@ def update_supplier_item(
 
 
 # ============================ Compras ============================
+# Spec 141 (A-150): Compras ya no tiene un gate propio; las gobierna el del router
+# (`inventario`), igual que Proveedores.
 @router.get(
     "/purchases", response_model=Page[PurchaseResponse], summary="Listar compras",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def list_purchases(
     page: int = Query(1, ge=1),
@@ -497,7 +498,6 @@ def list_purchases(
 @router.post(
     "/purchases", response_model=PurchaseResponse, status_code=status.HTTP_201_CREATED,
     summary="Registrar compra (da alta de stock total)",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def create_purchase(
     body: PurchaseCreate,
@@ -513,7 +513,6 @@ def create_purchase(
 @router.post(
     "/purchases/order", response_model=PurchaseResponse, status_code=status.HTTP_201_CREATED,
     summary="Crear orden de compra (draft, sin alta de stock) — RF-022",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def create_purchase_order(
     body: PurchaseOrderCreate,
@@ -529,7 +528,6 @@ def create_purchase_order(
 @router.put(
     "/purchases/{purchase_id}", response_model=PurchaseResponse,
     summary="Registrar compra editando un borrador/orden existente (convierte en recibida) — spec 140",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def update_purchase(
     purchase_id: UUID,
@@ -546,7 +544,6 @@ def update_purchase(
 @router.put(
     "/purchases/{purchase_id}/order", response_model=PurchaseResponse,
     summary="Actualizar una orden de compra / borrador existente (sin alta de stock) — spec 140",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def update_purchase_order(
     purchase_id: UUID,
@@ -563,7 +560,6 @@ def update_purchase_order(
 @router.post(
     "/purchases/{purchase_id}/receive", response_model=PurchaseResponse,
     summary="Recibir una orden de compra (parcial o total) — RF-022",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def receive_purchase(
     purchase_id: UUID,
@@ -579,7 +575,6 @@ def receive_purchase(
 @router.post(
     "/purchases/{purchase_id}/void", response_model=PurchaseResponse,
     summary="Anular una compra confirmada (spec 134)",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def void_purchase(
     purchase_id: UUID,
@@ -594,7 +589,6 @@ def void_purchase(
 @router.delete(
     "/purchases/{purchase_id}", status_code=status.HTTP_204_NO_CONTENT,
     summary="Eliminar una orden de compra / borrador pendiente (hard-delete) — spec 140",
-    dependencies=[Depends(require_module_access("compras"))],
 )
 def delete_purchase(
     purchase_id: UUID,
