@@ -12,7 +12,6 @@ class ResourceUsage(BaseModel):
 
 class ModuleAccess(BaseModel):
     inventario: bool
-    compras: bool
     promociones: bool
 
 

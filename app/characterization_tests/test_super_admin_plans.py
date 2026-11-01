@@ -21,7 +21,7 @@ from fastapi import HTTPException
 
 from app.characterization_tests import plan_fixtures as fx
 from app.api.v1.super_admin import plans_router as router
-from app.api.v1.super_admin.schemas import PlanCreate, PlanUpdate
+from app.api.v1.super_admin.schemas import PlanCreate, PlanResponse, PlanUpdate
 from app.core.plan_limits import enforce_plan_limit
 
 
@@ -41,7 +41,7 @@ class TestSuperAdminPlans(unittest.TestCase):
         self.assertEqual(created.cajas_limit, 0)
         self.assertEqual(created.usuarios_limit, 0)
         self.assertFalse(created.inventario_access)
-        self.assertFalse(created.compras_access)
+        self.assertFalse(hasattr(created, "compras_access"))  # spec 141: el módulo ya no existe
 
         listed = router.list_plans(db)
         self.assertEqual([p.name for p in listed], ["Básico"])
@@ -107,6 +107,35 @@ class TestSuperAdminPlans(unittest.TestCase):
         solo_mensual = router.create_plan(PlanCreate(name="Starter", precio_mensual="19900.00"), db)
         self.assertIsNotNone(solo_mensual.precio_mensual)
         self.assertIsNone(solo_mensual.precio_anual)
+
+    # ---------------------------------------------------------- spec 141: sin `compras_access`
+
+    def test_la_respuesta_de_un_plan_no_contiene_compras_access(self):
+        """FR-022, A-152: `compras_access` desaparece de crear/listar/editar."""
+        db = fx.new_session()
+        created = router.create_plan(PlanCreate(name="Con inventario", inventario_access=True), db)
+
+        for plan in (created, *router.list_plans(db)):
+            cuerpo = PlanResponse.model_validate(plan).model_dump()
+            self.assertNotIn("compras_access", cuerpo)
+            self.assertTrue(cuerpo["inventario_access"])
+            self.assertIn("promociones_access", cuerpo)
+        self.assertNotIn("compras_access", PlanResponse.model_fields)
+
+    def test_un_payload_con_compras_access_se_acepta_e_ignora_sin_error_de_validacion(self):
+        """Research H5: Pydantic ignora campos extra, así que un front viejo (o un
+        script) que aún envíe `compras_access` no recibe 422 ni cambia el plan."""
+        db = fx.new_session()
+        entrada = PlanCreate.model_validate({"name": "Viejo", "inventario_access": False, "compras_access": True})
+        self.assertFalse(hasattr(entrada, "compras_access"))
+
+        created = router.create_plan(entrada, db)
+        self.assertFalse(created.inventario_access)  # `compras_access` no se traduce en nada: se ignora
+
+        cambio = PlanUpdate.model_validate({"compras_access": True})
+        self.assertEqual(cambio.model_dump(exclude_unset=True), {})
+        updated = router.update_plan(created.id, cambio, db)
+        self.assertFalse(updated.inventario_access)
 
 
 if __name__ == "__main__":

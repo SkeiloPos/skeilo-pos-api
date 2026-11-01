@@ -31,6 +31,25 @@ class InsufficientStockError(HTTPException):
         self.item_name = item_name
 
 
+class ModuleNotInPlanError(HTTPException):
+    """El plan vigente del tenant no incluye el módulo que pide la operación (spec 141, A-151).
+
+    Es `HTTPException(403)` para que los `except HTTPException` existentes la sigan atrapando y para
+    conservar la semántica de siempre. `detail` sigue siendo **siempre un `str`** (FR-007): es el texto que
+    los clientes ya leen hoy. `code` y `module` viajan aparte en el cuerpo (ver `register_module_error_handler`
+    en `app/core/error_middleware.py`) para que el front distinga este 403 de los de rol, límite o plan vencido.
+    """
+
+    code = "MODULE_NOT_IN_PLAN"
+
+    def __init__(self, module: str, label: str):
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Tu plan actual no incluye el módulo de {label}.",
+        )
+        self.module = module
+
+
 class PendingPaymentExit(HTTPException):
     """Un comensal intenta salir del Menú QR con un pago propio sin confirmar (spec 130, A-139).
 

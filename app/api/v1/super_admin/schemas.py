@@ -140,7 +140,6 @@ class PlanCreate(BaseModel):
     metodos_pago_activos_limit: Optional[int] = Field(0, ge=0)
 
     inventario_access: bool = False
-    compras_access: bool = False
     promociones_access: bool = False
 
     precio_mensual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
@@ -163,7 +162,6 @@ class PlanUpdate(BaseModel):
     metodos_pago_activos_limit: Optional[int] = Field(None, ge=0)
 
     inventario_access: Optional[bool] = None
-    compras_access: Optional[bool] = None
     promociones_access: Optional[bool] = None
 
     precio_mensual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
@@ -182,7 +180,6 @@ class PlanResponse(BaseModel):
     metodos_pago_activos_limit: Optional[int] = None
 
     inventario_access: bool
-    compras_access: bool
     promociones_access: bool
 
     precio_mensual: Optional[Decimal] = None

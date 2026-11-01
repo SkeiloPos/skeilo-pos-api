@@ -72,6 +72,7 @@ from starlette.responses import JSONResponse, Response
 
 from app.core.config import settings
 from app.core.domain_errors import DomainError
+from app.core.exceptions import ModuleNotInPlanError
 from app.core.error_response import (
     envelope_from_domain_error,
     envelope_from_http_exception,
@@ -335,3 +336,27 @@ def register_error_handlers(app: FastAPI, path_prefix: str, *, module: str = "su
         # igual por claridad y por si algún día deja de ser exclusivo.
         status_code, body = envelope_from_domain_error(exc, _request_id(request))
         return JSONResponse(body, status_code=status_code)
+
+
+# ==========================================================================
+# Módulo no incluido en el plan (spec 141, A-151)
+# ==========================================================================
+
+
+def register_module_error_handler(app: FastAPI) -> None:
+    """Responde el 403 por módulo no incluido con `{detail, code, module}` en **toda** la API.
+
+    Es deliberadamente independiente de `register_error_handlers` (que solo cubre `/api/v1/super-admin` y
+    delega en el handler por defecto fuera de ese prefijo): Starlette elige el handler recorriendo el MRO de
+    la excepción, así que este tipo más específico gana sobre el de `HTTPException` sin alterar el
+    comportamiento de ningún otro rechazo (rol, límite, plan vencido). Ningún módulo gobernado por plan vive
+    bajo `/api/v1/super-admin`, así que los dos mecanismos no se solapan.
+    """
+
+    @app.exception_handler(ModuleNotInPlanError)
+    async def _module_not_in_plan_handler(request: Request, exc: ModuleNotInPlanError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "code": exc.code, "module": exc.module},
+            headers=getattr(exc, "headers", None),
+        )
