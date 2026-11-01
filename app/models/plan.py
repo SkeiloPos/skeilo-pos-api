@@ -8,11 +8,15 @@ from app.core.models import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Nivel de suscripción administrado por el Super Admin (spec 033). Ocho
+    """Nivel de suscripción administrado por el Super Admin (spec 033). Siete
     características fijas: cinco límites numéricos (NULL = ilimitado, default
-    0 = bloqueado) y tres accesos de módulo (default false = bloqueado) —
+    0 = bloqueado) y dos accesos de módulo (default false = bloqueado) —
     research.md Decisión 1. No configurar una característica explícitamente
-    produce el mismo bloqueo que configurarla en su default (FR-002)."""
+    produce el mismo bloqueo que configurarla en su default (FR-002).
+
+    Spec 141 (A-150): los módulos son `inventario` (que incluye Proveedores y
+    Compras) y `promociones`; el antiguo `compras_access` se absorbió en
+    `inventario_access` y se eliminó."""
 
     __tablename__ = "plans"
 
@@ -35,7 +39,6 @@ class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     metodos_pago_activos_limit: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     inventario_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
-    compras_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     promociones_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
     # Precios de referencia (spec 033, ampliación precio/duración/renovación).

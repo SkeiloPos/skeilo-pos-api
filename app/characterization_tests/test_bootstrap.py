@@ -42,6 +42,8 @@ class TestBootstrapCaminoFeliz(unittest.TestCase):
 
         self.assertEqual(result["tenant"], tenant)
         self.assertEqual(result["plan"], expected_plan)
+        # spec 141 (FR-022, A-152): `plan.modules` trae solo `inventario` y `promociones`.
+        self.assertEqual(set(result["plan"]["modules"]), {"inventario", "promociones"})
         self.assertEqual(
             [n.id for n in result["notifications"].items],
             [n.id for n in expected_notifications.items],
