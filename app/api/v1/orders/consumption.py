@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 from app.core import inventory_reasons as reasons
 from fastapi import HTTPException
 
-from app.catalog_engine import ChosenOption, sold_out_detail
+from app.catalog_engine import ChosenOption
+from app.catalog_engine.availability import stock_error_to_conflict
 from app.core.exceptions import InsufficientStockError
 from app.models.option import Option
 from app.models.order_item import OrderItem
@@ -83,11 +84,18 @@ def deduct_order_items(
     misma transacción (consolidación, confirmación de pedido).
 
     Rechaza el lote entero si alguna línea no consumiría nada: mejor parar y
-    configurar la receta que emitir una venta que descuadra el inventario."""
+    configurar la receta que emitir una venta que descuadra el inventario.
+
+    Spec 148 (A-153, research.md D6): el guardia final convierte
+    `InsufficientStockError` (400) al 409 unificado, igual que
+    `deduct_order_items_naming_product`."""
     ensure_consumes_inventory(db, entries)
     lock_consumption(db, entries)
     for item, options in entries:
-        deduct_order_item(db, item, options, user_id, reference_id)
+        try:
+            deduct_order_item(db, item, options, user_id, reference_id)
+        except InsufficientStockError as exc:
+            raise stock_error_to_conflict(db, exc, item.product_variant_id) from exc
 
 
 def deduct_order_items_naming_product(
@@ -99,18 +107,19 @@ def deduct_order_items_naming_product(
     """Igual que `deduct_order_items`, pero si un insumo se agota responde con un `detail` que
     nombra el PRODUCTO (spec 089, A-96, FR-029; research D18) en vez de solo el insumo. Es lo que
     usan los tres caminos donde el cajero agrega líneas a una orden (crear la orden, agregar un
-    ítem, reemplazar una línea): así el mensaje dice qué producto quitar. El status se conserva
-    (400) y, como siempre, el `except HTTPException` del llamador hace rollback total."""
+    ítem, reemplazar una línea): así el mensaje dice qué producto quitar. Como siempre, el
+    `except HTTPException` del llamador hace rollback total.
+
+    Spec 148 (A-153, research.md D6): el status pasa de 400 a 409 unificado
+    (`stock_error_to_conflict`) -- carrera entre `ensure_orderable` (chequeo
+    preventivo) y este descuento real; conserva `producto`/`insumo`."""
     ensure_consumes_inventory(db, entries)
     lock_consumption(db, entries)
     for item, options in entries:
         try:
             deduct_order_item(db, item, options, user_id, reference_id)
         except InsufficientStockError as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=sold_out_detail(db, item.product_variant_id, exc),
-            ) from exc
+            raise stock_error_to_conflict(db, exc, item.product_variant_id) from exc
 
 
 def reverse_order_items(
@@ -171,11 +180,50 @@ def check_addition_availability(
     db: Session, order_item: OrderItem, chosen_option: ChosenOption, *, extra_context: str = "",
 ) -> None:
     """Chequeo preventivo (sin lock) de UNA adición post-hoc — mismo filtro que
-    `plan_addition_consumption`, para no exigir de más contando la receta base."""
+    `plan_addition_consumption`, para no exigir de más contando la receta base.
+
+    NO TOCAR el 409 legado que arma aquí (research.md D6): lo comparten
+    `orders/additions.py` y `sales/complementary.py` (pagos complementarios,
+    fuera del contrato de la spec 148). `additions.py` usa
+    `check_addition_availability_unified` (abajo) para el 409 nuevo; este
+    sigue intacto para que `sales/complementary.py` no cambie."""
     required: dict[UUID, Decimal] = defaultdict(Decimal)
     for line in plan_addition_consumption(db, order_item, chosen_option):
         required[line.inventory_item_id] += line.quantity
     check_availability(db, dict(required), extra_context=extra_context)
+
+
+def check_addition_availability_unified(
+    db: Session, order_item: OrderItem, chosen_option: ChosenOption, *, extra_context: str = "",
+) -> None:
+    """Spec 148 (A-153, research.md D6): mismo chequeo que
+    `check_addition_availability`, pero con el 409 unificado (`agotados[]`,
+    mismo formato que el resto del contrato). Solo para `orders/additions.py`
+    -- `sales/complementary.py` sigue usando la versión legada arriba, sin
+    cambios (fuera de este contrato)."""
+    from app.catalog_engine.availability import SoldOutItem, stock_conflict_for_required
+    from app.models.product import Product
+    from app.models.product_variant import ProductVariant
+
+    required: dict[UUID, Decimal] = defaultdict(Decimal)
+    for line in plan_addition_consumption(db, order_item, chosen_option):
+        required[line.inventory_item_id] += line.quantity
+    if not required:
+        return
+    row = db.execute(
+        select(Product.id, Product.name)
+        .join(ProductVariant, ProductVariant.product_id == Product.id)
+        .where(ProductVariant.id == order_item.product_variant_id)
+    ).first()
+    product_id, product_name = row if row else (order_item.product_variant_id, str(order_item.product_variant_id))
+    item = SoldOutItem(
+        id=chosen_option.option.id, tipo="opcion",
+        nombre=f"{product_name} · {chosen_option.option.name}",
+        producto_id=product_id, motivo="inventario",
+    )
+    conflict = stock_conflict_for_required(db, dict(required), item, extra_context=extra_context)
+    if conflict is not None:
+        raise conflict
 
 
 def deduct_addition(

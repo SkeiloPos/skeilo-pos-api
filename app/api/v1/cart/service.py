@@ -57,12 +57,12 @@ from app.models.payment import PaymentMethod
 from app.models.product_variant import ProductVariant
 from app.api.v1.catalog.line_pricing import (
     check_availability,
-    ensure_product_available,
     ensure_products_available,
     load_valid_options,
     required_consumption,
 )
 from app.api.v1.catalog.schemas import ToppingSelectionIn
+from app.catalog_engine.availability import OrderableLine, ensure_orderable
 from app.api.v1.catalog.service import resolve_principal_variant
 from app.api.v1.cash.service import resolve_dine_in_table_order
 from app.api.v1.orders.checkout import compute_checkout_preview, line_discount_snapshot
@@ -254,6 +254,19 @@ def _chosen_from_cart_rows(db: Session, item: CartItem) -> list[ChosenOption]:
     return [ChosenOption(opt, rows[opt.id].quantity, rows[opt.id].per_line) for opt in options]
 
 
+def _orderable_line_from_cart_item(db: Session, item: CartItem) -> "OrderableLine":
+    """Spec 148 (A-153, research.md D6): la línea del carrito ya guardada,
+    lista para `ensure_orderable` -- mismas fuentes que `_cart_consumption`
+    (opciones por `_chosen_from_cart_rows`, adiciones por `item.toppings`)."""
+    from app.catalog_engine.availability import OrderableLine
+
+    return OrderableLine(
+        variant_id=item.product_variant_id, quantity=item.quantity,
+        options=_chosen_from_cart_rows(db, item),
+        topping_product_ids=[t.topping_product_id for t in item.toppings],
+    )
+
+
 def _mark_addons(db: Session, options: list[ChosenOption]) -> list[ChosenOption]:
     """spec 089 (A-94) + spec 117 (A-126): marca `per_line=True` las opciones de grupos
     con recargo del Menú QR (089) y, en todo canal, las de un grupo "Por cantidad" (117)
@@ -440,7 +453,6 @@ def add_item(
     variant = get_or_404(db, ProductVariant, data.product_variant_id, "Variant not found")
     if not variant.active:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Variante inactiva: {variant.id}")
-    ensure_product_available(variant)
 
     options = _mark_addons(
         db, load_valid_options(db, data.options, variant=variant, quantity=data.quantity)
@@ -448,7 +460,25 @@ def add_item(
     # spec 129 (FR-009): adiciones (productos-topping) elegidas para esta línea.
     resolved_toppings = _resolve_cart_toppings(db, variant.product_id, data.toppings)
 
-    # Disponibilidad: consumo del carrito actual + la línea nueva (producto + adiciones).
+    # Spec 148 (A-153, research.md D6): chequeo preventivo UNIFICADO -- antes
+    # solo `ensure_product_available` (marca manual); ahora también
+    # inventario (receta/opciones/adiciones) y cantidad agregada de TODO el
+    # carrito (producto + la línea nueva), conservando las claves del
+    # carrito QR (`insumo`/`disponible`/`requerido`/`contexto`).
+    new_line = OrderableLine(
+        variant_id=variant.id, quantity=data.quantity, options=options,
+        topping_product_ids=[tv.product_id for tv, _q in resolved_toppings],
+    )
+    ensure_orderable(
+        db,
+        [_orderable_line_from_cart_item(db, ci) for ci in cart.items] + [new_line],
+        toppings_inventory=True, extra_context="carrito",
+    )
+    # Nota (deviation, spec 148): `OrderableLine.topping_product_ids` no lleva
+    # cantidad (T066), así que la aggregate de CANTIDAD de una adición (pedir
+    # más de lo que alcanza, no solo "existe/no existe") sigue validándose
+    # con el `check_availability` legado -- mismo 409 de siempre (claves
+    # iguales), sin `agotados[]` SOLO en este caso límite.
     required = _cart_consumption(db, cart)
     for iid, need in required_consumption(db, variant.id, data.quantity, options).items():
         required[iid] += need
@@ -574,7 +604,6 @@ def update_item(
 
     new_qty = data.quantity if data.quantity is not None else item.quantity
     variant = get_or_404(db, ProductVariant, item.product_variant_id, "Variant not found")
-    ensure_product_available(variant)
 
     adjusted_options: list[AdjustedOptionOut] = []
     if data.options is not None:
@@ -606,8 +635,20 @@ def update_item(
             for t in item.toppings
         ]
 
-    # Disponibilidad: resto del carrito (sin esta línea) + la línea editada
-    # (producto + adiciones).
+    # Spec 148 (A-153, research.md D6): chequeo preventivo UNIFICADO -- resto
+    # del carrito (sin esta línea) + la línea editada.
+    edited_line = OrderableLine(
+        variant_id=variant.id, quantity=new_qty, options=options,
+        topping_product_ids=[tv.product_id for tv, _q in resolved_toppings],
+    )
+    ensure_orderable(
+        db,
+        [_orderable_line_from_cart_item(db, ci) for ci in cart.items if ci.id != item_id]
+        + [edited_line],
+        toppings_inventory=True, extra_context="carrito",
+    )
+    # Nota (deviation, spec 148): ver `add_item` -- la cantidad agregada de
+    # una adición sigue validándose con `check_availability` (legado).
     required = _cart_consumption(db, cart, exclude_item_id=item_id)
     for iid, need in required_consumption(db, variant.id, new_qty, options).items():
         required[iid] += need
@@ -1032,6 +1073,16 @@ def submit_cart(
             },
         )
 
+    # Spec 148 (A-153, research.md D6): chequeo preventivo UNIFICADO de
+    # inventario/cantidad sobre TODO el carrito (la marca manual ya se
+    # validó arriba con `ensure_products_available`, que ahora también
+    # delega en el 409 unificado). Deviation: la cantidad agregada de una
+    # adición sigue validándose con `check_availability` (legado) -- ver
+    # nota de `add_item`.
+    ensure_orderable(
+        db, [_orderable_line_from_cart_item(db, ci) for ci in cart.items],
+        toppings_inventory=True, extra_context="envío de pedido",
+    )
     check_availability(db, _cart_consumption(db, cart), extra_context="envío de pedido")
 
     # spec 087 (FR-006, A-86): segundo punto de creación de CustomerOrder que

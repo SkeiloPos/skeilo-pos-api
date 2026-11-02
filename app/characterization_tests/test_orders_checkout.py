@@ -605,9 +605,12 @@ class TestCheckout(unittest.TestCase):
         fx.make_payment_attempt(db, order2, metodo, status="confirmado")
         db.commit()
 
+        # A-153 (spec 148, research.md D6): el status pasa de 400 a 409
+        # unificado (`stock_error_to_conflict`) -- la atomicidad no cambia.
         with self.assertRaises(HTTPException) as ctx:
             checkout.confirm_order(db, order2.id, user)
-        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("agotados", ctx.exception.detail)
         db.refresh(order2)
         self.assertEqual(order2.status, "pendiente")
         movimientos2 = db.execute(
@@ -1109,7 +1112,10 @@ class TestCheckout(unittest.TestCase):
         cocina, la transacción entera revierte — la orden sigue 'pendiente' y
         no queda ni venta ni movimiento de inventario a medias (mismo
         criterio de atomicidad que `_confirm_order_impl`, congelado en
-        `test_confirm_order_descuenta_una_vez_y_stock_insuficiente_revierte`)."""
+        `test_confirm_order_descuenta_una_vez_y_stock_insuficiente_revierte`).
+
+        A-153 (spec 148, research.md D6): el status pasa de 400 a 409
+        unificado (`stock_error_to_conflict`) -- la atomicidad no cambia."""
         s = self._seed_hold_order_con_receta(stock=Decimal("1"), recipe_qty=Decimal("2"))
         db, order, insumo = s["db"], s["order"], s["insumo"]
         shift, method = s["shift"], s["method"]
@@ -1121,7 +1127,8 @@ class TestCheckout(unittest.TestCase):
         )
         with self.assertRaises(HTTPException) as ctx:
             checkout.checkout_and_send(db, order.id, data, cashier)
-        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("agotados", ctx.exception.detail)
 
         db.refresh(order)
         self.assertEqual(order.status, "pendiente")

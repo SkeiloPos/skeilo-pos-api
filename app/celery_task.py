@@ -1,10 +1,12 @@
 from uuid import UUID
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.core.db import with_db
 from app.core.mail import send_email, create_message
 from app.core.timezone import utc_now_naive
+from app.core.availability_hooks import install_availability_hooks
 from app.api.v1.inventory.import_ import procesar_archivo_importacion
 from app.models.inventory_import_job import InventoryImportJob
 from app.api.v1.products.import_ import procesar_archivo_importacion as procesar_archivo_importacion_productos
@@ -13,6 +15,13 @@ from app.models.product_import_job import ProductImportJob
 c_app = Celery("pos")
 
 c_app.config_from_object("app.core.config")
+
+
+@worker_process_init.connect
+def _install_availability_hooks(**kwargs) -> None:
+    # spec 148: solo el proceso del worker instala el gancho de sesión -- igual
+    # criterio que `main.py` (instalación explícita, nunca al importar).
+    install_availability_hooks()
 
 
 @c_app.task
