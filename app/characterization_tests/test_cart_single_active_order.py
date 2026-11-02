@@ -44,7 +44,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         """Acceptance Scenario 1 (US6)."""
         db, participant, variant, efectivo = self._seed_session_con_carrito()
         first = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(first.status, "recibida")
+        self.assertEqual(first.status, "pendiente")
 
         # Nuevo carrito abierto tras el submit (mismo patrón que
         # `_get_or_create_open_cart`); se le agrega un ítem para poder
@@ -68,12 +68,40 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         self.assertEqual(order.channel, "QR_MENU")
         self.assertEqual(order.order_type, "DINE_IN")
 
-    def test_segunda_orden_tras_finalizar_la_primera_se_permite(self):
-        """Acceptance Scenario 2 (US6): 'finalizada' = pagada o cancelada
-        (research.md spec 024, Decisión 8)."""
+    def test_segunda_orden_mientras_la_primera_sigue_entregada_sigue_bloqueada(self):
+        """Acceptance Scenario 2 (US6), reescrito spec 147: 'finalizada' ya
+        no incluye 'pagada' (no existe) -- `_NON_TERMINAL_ORDER_STATUSES` de
+        `cart/service.py` es ahora `('pendiente', 'entregada')`, así que una
+        orden `'entregada'` (antes 'pagada') sigue activa y sigue bloqueando
+        una segunda orden del mismo comensal. Esto es intencional (FR-002a):
+        el comensal sigue agregando ítems a la MISMA orden ya entregada, no
+        abre una paralela. Solo `'cancelada'` libera el cupo (ver el test
+        siguiente)."""
         db, participant, variant, efectivo = self._seed_session_con_carrito()
         first = service.submit_cart(db, participant, efectivo.id)
-        first.status = "pagada"
+        first.status = "entregada"
+        db.commit()
+
+        cart2 = fx.make_cart(db, participant=participant)
+        fx.make_cart_item(db, cart2, variant)
+        db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            service.submit_cart(db, participant, efectivo.id)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_segunda_orden_con_la_primera_entregada_y_pagada_se_permite(self):
+        """Corrección post-implementación de spec 147 (data-model.md, mismo
+        criterio que `idx_active_order_per_participant`): una orden
+        `'entregada'` + `payment_status='PAID'` está cerrada -- a diferencia
+        del test anterior (misma `entregada` pero sin pagar), esta SÍ debe
+        liberar el cupo. Bug reportado en producción: el comensal de una
+        mesa ya entregada y pagada no podía enviar una ronda nueva porque
+        `submit_cart` solo miraba `status`, nunca `payment_status`."""
+        db, participant, variant, efectivo = self._seed_session_con_carrito()
+        first = service.submit_cart(db, participant, efectivo.id)
+        first.status = "entregada"
+        first.payment_status = "PAID"
         db.commit()
 
         cart2 = fx.make_cart(db, participant=participant)
@@ -81,8 +109,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         db.commit()
 
         second = service.submit_cart(db, participant, efectivo.id)
-        self.assertNotEqual(second.id, first.id)
-        self.assertEqual(second.status, "recibida")
+        self.assertEqual(second.status, "pendiente")
 
     def test_segunda_orden_tras_cancelar_la_primera_se_permite(self):
         db, participant, variant, efectivo = self._seed_session_con_carrito()
@@ -95,7 +122,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         db.commit()
 
         second = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(second.status, "recibida")
+        self.assertEqual(second.status, "pendiente")
 
     # ------------------------------------------- Confirmación duplicada (T011)
 
@@ -145,7 +172,7 @@ class TestCartSingleActiveOrder(unittest.TestCase):
         restricción nueva."""
         db, participant, variant, efectivo = self._seed_session_con_carrito()
         fx.make_customer_order(
-            db, participant, participant_id=None, channel="POS", status="abierta",
+            db, participant, participant_id=None, channel="POS", status="pendiente",
         )
         db.commit()
 
@@ -155,16 +182,17 @@ class TestCartSingleActiveOrder(unittest.TestCase):
 
     def test_submit_cart_permite_qr_si_la_comanda_manual_ya_es_terminal(self):
         """Contraste del test anterior: una comanda de mostrador/mesero
-        'pagada' o 'cancelada' ya no es 'activa', así que no bloquea un
-        pedido nuevo por QR en la misma mesa."""
+        'cancelada' (spec 147: único valor terminal ahora) ya no es
+        'activa', así que no bloquea un pedido nuevo por QR en la misma
+        mesa."""
         db, participant, variant, efectivo = self._seed_session_con_carrito()
         fx.make_customer_order(
-            db, participant, participant_id=None, channel="POS", status="pagada",
+            db, participant, participant_id=None, channel="POS", status="cancelada",
         )
         db.commit()
 
         order = service.submit_cart(db, participant, efectivo.id)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
 
 if __name__ == "__main__":

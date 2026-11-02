@@ -157,7 +157,7 @@ class CartSoldOutTests(unittest.TestCase):
 
         order = service.submit_cart(db, participant, efectivo.id)
 
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
 
 if __name__ == "__main__":

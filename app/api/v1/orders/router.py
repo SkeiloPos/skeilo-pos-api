@@ -37,7 +37,7 @@ from app.api.v1.sales.schemas import ComplementaryPaymentIn, SaleResponse
 from app.api.v1.orders.schemas import (
     TableCreate, TableUpdate, TableResponse, TableQrTokenResponse,
     OrderCreate, OrderResponse, OrderItemIn, OrderType,
-    OrderItemResponse, KitchenTransitionIn, VoidItemIn,
+    VoidItemIn,
     BlockIn, CancelIn, CheckoutAndSendIn, PayIn, BillResponse,
     CheckoutPreviewResponse, DraftPreviewIn,
     TableStatusUpdate, MoveOrderIn, MergeOrdersIn, MergeResponse, GroupBillResponse,
@@ -261,7 +261,7 @@ def confirm_order(
     user: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    """`recibida` → `abierta`. Es el único punto donde el pedido del comensal
+    """`pendiente` → `abierta`. Es el único punto donde el pedido del comensal
     compromete stock; hasta aquí no había tocado inventario."""
     checkout.confirm_order(db, order_id, user, request_id=current_request_id(request))
     order = _load_order(db, order_id)
@@ -379,93 +379,44 @@ def consolidate(
     return _load_order(db, order.id)
 
 
-# ============================ Preparación ============================
-@router.patch(
-    "/items/{item_id}/kitchen",
-    response_model=OrderItemResponse,
-    summary="Avanzar la preparación de un ítem (pendiente→en_preparacion→listo)",
-)
-def kitchen_transition(
-    item_id: UUID, body: KitchenTransitionIn,
-    db: Session = Depends(get_db), _: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
-):
-    """Devuelve `rt_v`: la versión del evento que acaba de emitir esta escritura.
-
-    Sirve para que una pantalla que parchea el ítem en local (escritura
-    optimista) pueda descartar un evento en vuelo de otra terminal que llegue
-    justo después y revierta visualmente lo que el usuario ya vio.
-
-    `pendiente → listo` es un salto legal: quien toma el pedido es quien lo
-    prepara, así que la terminal lo marca de un toque.
-    """
-    item = kitchen.transition_kitchen(db, item_id, body)
-    order = db.get(CustomerOrder, item.order_id)
-    entry_id = events.item_kitchen_changed(
-        tenant.id,
-        order_id=item.order_id,
-        table_session_id=order.table_session_id if order else None,
-        item_id=item.id,
-        estado_cocina=item.estado_cocina,
-    )
-    out = OrderItemResponse.model_validate(item)
-    if entry_id is not None:
-        out.rt_v = events.version_of(entry_id)
-    return out
-
-
+# ============================ Recepción (a pedido del usuario) ==============
 @router.post(
-    "/{order_id}/start-preparation",
+    "/{order_id}/receive",
     response_model=OrderResponse,
-    summary="Aceptar el pedido para cocina, sin cobrarlo todavía",
+    summary="Recibir un pedido recién llegado (idempotente, sin cobrar ni descontar inventario)",
 )
-def start_preparation(
+def receive_order(
     order_id: UUID,
     db: Session = Depends(get_db), _: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    """"Aceptar pedido" sin cobrar: deja que cocina empiece mientras el pago
-    sigue pendiente de revisión. Reutiliza `item_kitchen_changed` (mismo
-    evento que `kitchen_transition`/`order_ready`) -- ya viaja al canal de
-    sesión del comensal, así que no hace falta un evento ni un canal nuevo
-    para que "Mis pedidos" se entere."""
-    order, cambiados = kitchen.accept_order_for_kitchen(db, order_id)
-    for it in cambiados:
-        events.item_kitchen_changed(
-            tenant.id,
-            order_id=order.id,
-            table_session_id=order.table_session_id,
-            item_id=it.id,
-            estado_cocina=it.estado_cocina,
-        )
-    return _load_order(db, order.id)
+    """A pedido del usuario: el cajero "recibe" el pedido QR apenas llega
+    (`pendiente` → `confirmado`), sin cocina ni pago -- paso previo a
+    "Entregar", que a su vez sigue siendo distinto de cobrar. Deliberadamente
+    en una ruta propia, `/receive`, no `/confirm`: esa ya existe arriba
+    (`confirm_order`) con un significado totalmente distinto (descuenta
+    inventario, exige un intento de pago ya confirmado)."""
+    kitchen.receive_order(db, order_id, tenant_id=tenant.id)
+    return _load_order(db, order_id)
 
 
+# ============================ Entrega (spec 147) ============================
 @router.post(
-    "/{order_id}/ready",
+    "/{order_id}/deliver",
     response_model=OrderResponse,
-    summary="Marcar como listos todos los ítems en curso de la orden",
+    summary="Entregar el pedido completo con un solo clic (idempotente)",
 )
-def order_ready(
+def deliver_order(
     order_id: UUID,
     db: Session = Depends(get_db), _: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    """Lo que la terminal necesita para cobrar sin ir ítem por ítem.
-
-    Emite un evento por ítem cambiado en lugar de uno agregado: las pantallas ya
-    escuchan `order.item_kitchen_changed`, y un tipo nuevo obligaría a tocarlas
-    todas para no ganar nada."""
-    order, cambiados = kitchen.mark_order_ready(db, order_id)
-    for it in cambiados:
-        events.item_kitchen_changed(
-            tenant.id,
-            order_id=order.id,
-            table_session_id=order.table_session_id,
-            item_id=it.id,
-            estado_cocina=it.estado_cocina,
-        )
-    return _load_order(db, order.id)
+    """Spec 147 (FR-001/FR-002/FR-002a/FR-011): única acción de entrega, sin
+    paso por ítem individual. Reemplaza semánticamente a `PATCH
+    /items/{id}/kitchen`, `POST /{id}/start-preparation` y `POST /{id}/ready`
+    (retirados, FR-002/research.md R4)."""
+    kitchen.deliver_order(db, order_id, tenant_id=tenant.id)
+    return _load_order(db, order_id)
 
 
 @router.post(
@@ -796,7 +747,7 @@ def checkout_and_send(
     tenant: Tenant = Depends(get_tenant),
 ):
     """Solo para comandas creadas con `hold_for_payment=True` (status
-    'recibida'): cobra la orden y, en la misma transacción, la envía a cocina
+    'pendiente'): cobra la orden y, en la misma transacción, la envía a cocina
     (descuenta inventario) — spec 028, T016."""
     sale = checkout.checkout_and_send(
         db, order_id, body, user, request_id=current_request_id(request), tenant=tenant
@@ -824,6 +775,14 @@ def checkout_and_send(
             tenant.id, order_id=order.id, table_session_id=order.table_session_id
         )
         events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+        # Spec 147 ciclo 2: sin mesa, `checkout.checkout_and_send` ya dejó el
+        # pedido `'entregada'` en la misma transacción (ver su comentario) --
+        # avisa en tiempo real igual que `deliver_order` (kitchen.py) para
+        # que la grilla de mesas/terminal no necesite un sondeo para verlo.
+        if order.dining_table_id is None:
+            events.order_delivered(
+                tenant.id, order_id=order.id, table_session_id=order.table_session_id
+            )
     return sale
 
 
@@ -932,6 +891,9 @@ def list_orders(
     date_from: date | None = Query(None, description="Fecha inicial (inclusive) sobre created_at."),
     date_to: date | None = Query(None, description="Fecha final (inclusive) sobre created_at."),
     q: str | None = Query(None, description="Búsqueda por nombre de cliente o identificador de la orden."),
+    entregadas_sin_cobrar: bool = Query(
+        False, description="Spec 147 (FR-014/SC-003): solo entregada+UNPAID, independiente de 'status'.",
+    ),
     db: Session = Depends(get_db),
     tenant: Tenant = Depends(get_tenant),
     _: User = Depends(get_current_user),
@@ -971,6 +933,7 @@ def list_orders(
         date_from=date_from,
         date_to=date_to,
         q=q,
+        entregadas_sin_cobrar=entregadas_sin_cobrar,
     )
     effective_size = size or 20
     effective_page = service.clamp_page(db, stmt, page or 1, effective_size)
@@ -990,12 +953,16 @@ def get_order(order_id: UUID, db: Session = Depends(get_db), _: User = Depends(g
 
 
 # `PATCH /{order_id}/status` se eliminó a propósito: asignaba cualquier estado sin
-# validar la transición y sin tocar inventario, así que permitía pasar un pedido de
-# 'recibida' a 'abierta' esquivando `confirm_order` —el único punto que descuenta
-# stock— y dejaba el inventario sobrestimado sin que nadie se enterara.
+# validar la transición y sin tocar inventario, así que permitía pasar un pedido
+# esquivando `confirm_order` —el único punto que descuenta stock— y dejaba el
+# inventario sobrestimado sin que nadie se enterara.
 #
-# Cada transición legítima tiene su endpoint, con sus reglas:
-#   recibida → abierta    POST /orders/{id}/confirm      (descuenta inventario)
-#   abierta  → bloqueada  POST /orders/{id}/block        (valida la preparación)
-#   → pagada              POST /table-sessions/{id}/close (cobra y libera la mesa)
-#   → cancelada           POST /orders/{id}/cancel       (revierte lo no preparado)
+# Spec 147 colapsó el modelo a 3 estados (`pendiente, entregada, cancelada`),
+# con el pago (`payment_status`) y la preparación (`estado_cocina`,
+# por ítem) completamente independientes. Cada transición legítima tiene su
+# endpoint, con sus reglas:
+#   (confirma, sin mover status) POST /orders/{id}/confirm       (descuenta inventario)
+#   pendiente → entregada         POST /orders/{id}/deliver       (entrega completa, idempotente)
+#   (paga, sin mover status)      POST /orders/{id}/pay           (payment_status -> PAID)
+#   → cancelada                   POST /orders/{id}/cancel        (revierte lo no entregado)
+#   libera la mesa                POST /table-sessions/{id}/release (exige 0 órdenes abiertas)

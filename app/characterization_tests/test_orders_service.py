@@ -4,9 +4,13 @@ actual, specs/017-caracterizacion-orders, Historia 5) más `order_has_sale`/
 characterization tests (no existía comportamiento previo que congelar), son
 la verificación de la señal "pedido ya pagado" introducida por esa spec.
 
-`create_order` es la comanda directa de mostrador/mesero que nace ya
-`abierta` (confirmada) y descuenta inventario al crearse, porque no vuelve a
-pasar por `confirm_order`.
+`create_order` es la comanda directa de mostrador/mesero. Antes de spec 146
+(A-150) nacía ya `abierta` (confirmada) y descontaba inventario al crearse,
+salvo `hold_for_payment=True`. Desde A-150, todo canal nace siempre en
+`pendiente`/`payment_status='UNPAID'`, sin descontar inventario — el
+descuento se mueve al punto de confirmación (`checkout.checkout_and_send`/
+`confirm_order`), igual que ya hacía el flujo QR. Estos tests se actualizan
+explícitamente citando A-150 (`registro-de-anomalias.md`), no en silencio.
 
 El caso de contraste directo con **A-04** (`create_order` sí pasa `variant` a
 `load_valid_options`, a diferencia de `consolidation.add_item_to_table`) ya
@@ -49,11 +53,12 @@ class TestService(unittest.TestCase):
 
     # ------------------------------------------------------------ create_order (T048)
 
-    def test_create_order_nace_abierta_y_descuenta_inventario(self):
-        """CONGELA comportamiento actual (`service.py:37+`, spec.md Historia
-        5, escenario 1): variante con receta y opciones válidas →
-        `create_order` nace en status 'abierta' (no 'recibida') con el
-        inventario ya descontado — no vuelve a pasar por `confirm_order`."""
+    def test_create_order_nace_pendiente_sin_descontar_inventario(self):
+        """A-150 (spec 146): variante con receta y opciones válidas →
+        `create_order` nace en status 'pendiente'/'UNPAID', sin descontar
+        inventario — el descuento se mueve a la confirmación. Antes de A-150
+        nacía 'abierta' con el inventario ya descontado aquí mismo; este test
+        reemplaza esa caracterización (citada arriba)."""
         db = fx.new_session()
         variant, insumo, option = self._seed_variant_con_receta_y_opciones(db)
         db.commit()
@@ -65,21 +70,24 @@ class TestService(unittest.TestCase):
         )
         order = service.create_order(db, data, uuid4())
 
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "pendiente")
+        self.assertEqual(order.payment_status, "UNPAID")
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()
-        self.assertEqual(len(movimientos), 1)
+        self.assertEqual(movimientos, [])
         db.refresh(insumo)
-        self.assertEqual(Decimal(insumo.current_stock), Decimal("998"))
+        self.assertEqual(Decimal(insumo.current_stock), Decimal("1000"))
 
     # ----------------------------------------------- create_order sin receta (T049)
 
-    def test_create_order_variante_sin_receta_rechaza(self):
-        """CONGELA comportamiento actual: variante sin receta asociada → la
-        guarda de `deduct_order_items` rechaza la creación con 409, migrando
-        el caso de `test_receta_obligatoria.py` correspondiente a este
-        camino (research.md §5, SC-007)."""
+    def test_create_order_variante_sin_receta_ya_no_rechaza_en_la_creacion(self):
+        """A-150 (spec 146): la creación ya no descuenta inventario, así que
+        la guarda de `deduct_order_items` (que exigía receta) ya no se
+        ejecuta aquí — una variante sin receta crea la orden igual, en
+        'pendiente'. Ese rechazo 409 se desplaza al punto de confirmación
+        (`checkout.py`), no a la creación. Reemplaza la caracterización
+        anterior (que exigía 409 en la creación), citada arriba."""
         db = fx.new_session()
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -91,9 +99,8 @@ class TestService(unittest.TestCase):
             customer_name="Cliente de prueba",
             items=[OrderItemIn(product_variant_id=variant_sin_receta.id, quantity=1)],
         )
-        with self.assertRaises(HTTPException) as ctx:
-            service.create_order(db, data, uuid4())
-        self.assertEqual(ctx.exception.status_code, 409)
+        order = service.create_order(db, data, uuid4())
+        self.assertEqual(order.status, "pendiente")
 
     # ------------------------------------------- create_order abre sesión (T050)
 
@@ -127,10 +134,12 @@ class TestService(unittest.TestCase):
 
     # ------------------------------------- create_order hold_for_payment (T019)
 
-    def test_create_order_hold_for_payment_nace_recibida_sin_descontar(self):
-        """Comportamiento nuevo (spec 028, T013): con `hold_for_payment=True`
-        la comanda nace 'recibida' (no 'abierta') y no descuenta inventario —
-        el descuento se mueve a `checkout.checkout_and_send`, al cobrar."""
+    def test_create_order_hold_for_payment_no_cambia_el_comportamiento_de_creacion(self):
+        """A-150 (spec 146): desde que todo canal nace 'pendiente' sin
+        descontar inventario, `hold_for_payment=True` deja de tener efecto
+        observable en la creación (antes la distinguía de 'abierta' con
+        descuento inmediato, spec 028 T013) — el resultado es idéntico al de
+        `hold_for_payment` ausente/`False`."""
         db = fx.new_session()
         variant, insumo, option = self._seed_variant_con_receta_y_opciones(db)
         db.commit()
@@ -143,7 +152,7 @@ class TestService(unittest.TestCase):
         )
         order = service.create_order(db, data, uuid4())
 
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()
@@ -154,7 +163,7 @@ class TestService(unittest.TestCase):
     def test_create_order_hold_for_payment_con_channel_qr_400(self):
         """spec 028, T013: `hold_for_payment` es exclusivo de mostrador/mesero
         — combinado con `channel='QR_MENU'` es 400 (ese canal ya tiene su
-        propio flujo 'recibida' vía `/cart/submit`)."""
+        propio flujo 'pendiente' vía `/cart/submit`)."""
         db = fx.new_session()
         variant, insumo, option = self._seed_variant_con_receta_y_opciones(db)
         db.commit()
@@ -178,7 +187,7 @@ class TestService(unittest.TestCase):
         db = fx.new_session()
         table = fx.make_dining_table(db, status="ocupada")
         ts = fx.make_table_session(db, table=table)
-        fx.make_customer_order(db, ts, channel="QR_MENU", status="recibida")
+        fx.make_customer_order(db, ts, channel="QR_MENU", status="pendiente")
         variant, insumo, option = self._seed_variant_con_receta_y_opciones(db)
         db.commit()
 
@@ -193,13 +202,14 @@ class TestService(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 409)
 
     def test_create_order_permite_si_el_pedido_qr_ya_es_terminal(self):
-        """Contraste del test anterior: un pedido QR 'pagada' ya no es
-        'activo', así que no bloquea una comanda nueva de mostrador/mesero en
-        la misma mesa."""
+        """Contraste del test anterior: un pedido QR 'cancelada' (spec 147:
+        único valor terminal ahora, _NON_TERMINAL_ORDER_STATUSES =
+        ('pendiente','entregada')) ya no es 'activo', así que no bloquea una
+        comanda nueva de mostrador/mesero en la misma mesa."""
         db = fx.new_session()
         table = fx.make_dining_table(db, status="ocupada")
         ts = fx.make_table_session(db, table=table)
-        fx.make_customer_order(db, ts, channel="QR_MENU", status="pagada")
+        fx.make_customer_order(db, ts, channel="QR_MENU", status="cancelada")
         variant, insumo, option = self._seed_variant_con_receta_y_opciones(db)
         db.commit()
 
@@ -210,7 +220,7 @@ class TestService(unittest.TestCase):
             items=[OrderItemIn(product_variant_id=variant.id, quantity=1, options=[OptionSelectionIn(option_id=option.id)])],
         )
         order = service.create_order(db, data, uuid4())
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "pendiente")  # A-150: todo canal nace 'pendiente'
 
     # ---------------------------------------------- spec 055: "Para Llevar"
 
@@ -268,7 +278,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(order.channel, "POS")
         self.assertIsNone(order.dining_table_id)
         self.assertEqual(order.customer_name, "Consumidor final")
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
 
     # ---------------------- spec 055, FR-006/FR-007: combinaciones canal/tipo
 
@@ -720,10 +730,10 @@ class TestCreateOrderDelivery(unittest.TestCase):
 
 class TestOrderHasSale(unittest.TestCase):
     """Spec 029 (D2/D3 de research.md): `order_has_sale`/`paid_order_ids` son
-    la señal real de "este pedido ya está pagado" — no `CustomerOrder.status`,
-    que nunca llega a `"pagada"` en los caminos QR/mostrador vigentes
-    (`checkout_and_send`/`_confirm_order_impl` dejan la orden en `"abierta"`
-    a propósito, con la `Sale` ya emitida)."""
+    una señal defensiva de "este pedido ya está pagado" para los caminos
+    QR/mostrador legados -- desde spec 146/147, `payment_status` ya es la
+    señal primaria y confiable, fijada en la misma transacción que la
+    `Sale`; `order_has_sale` queda como red de seguridad adicional."""
 
     def _seed_order_con_sale(self, *, order_status: str) -> tuple:
         db = fx.new_session()
@@ -746,17 +756,18 @@ class TestOrderHasSale(unittest.TestCase):
 
     def test_order_has_sale_true_sobre_orden_abierta_con_sale_camino_qr_mostrador(self):
         """El caso real que motivó la spec: `checkout_and_send`/
-        `_confirm_order_impl` dejan la orden en 'abierta' con la `Sale` ya
-        emitida — `order_has_sale` debe reconocerlo como pagado aunque
+        `_confirm_order_impl` dejan la orden `'pendiente'` (spec 147: ya no
+        existe `'abierta'`) con la `Sale` ya emitida — `order_has_sale` debe
+        reconocerlo como pagado aunque
         `status` nunca haya llegado a 'pagada'."""
-        db, order = self._seed_order_con_sale(order_status="abierta")
+        db, order = self._seed_order_con_sale(order_status="pendiente")
 
         self.assertTrue(service.order_has_sale(db, order.id))
 
     def test_order_has_sale_false_sobre_orden_abierta_sin_sale(self):
         db = fx.new_session()
         ts = fx.make_table_session(db)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         db.commit()
 
         self.assertFalse(service.order_has_sale(db, order.id))
@@ -772,8 +783,8 @@ class TestOrderHasSale(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS", order_type="DELIVERY")
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS", order_type="DELIVERY")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         db.commit()
 
         self.assertFalse(service.order_has_sale(db, order.id))
@@ -781,9 +792,9 @@ class TestOrderHasSale(unittest.TestCase):
     def test_paid_order_ids_resuelve_en_bloque_para_una_lista_de_pedidos(self):
         """Versión en bloque: una sola consulta para todo un listado, en vez
         de N — el pedido sin `Sale` no aparece en el resultado."""
-        db, pagado = self._seed_order_con_sale(order_status="abierta")
+        db, pagado = self._seed_order_con_sale(order_status="pendiente")
         ts = fx.make_table_session(db)
-        sin_pagar = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        sin_pagar = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         db.commit()
 
         resultado = service.paid_order_ids(db, [pagado.id, sin_pagar.id])
@@ -818,21 +829,21 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         return db, ts, order
 
     def test_excluye_pedido_pagado_de_sesion_ya_cerrada(self):
-        db, _, order = self._seed(session_status="closed", order_status="abierta", con_sale=True)
+        db, _, order = self._seed(session_status="closed", order_status="pendiente", con_sale=True)
 
         resultado = service.list_orders(db, active_sessions_only=True)
 
         self.assertNotIn(order.id, [o.id for o in resultado])
 
     def test_conserva_pedido_sin_pagar_de_sesion_ya_cerrada_caso_huerfano(self):
-        db, _, order = self._seed(session_status="closed", order_status="abierta", con_sale=False)
+        db, _, order = self._seed(session_status="closed", order_status="pendiente", con_sale=False)
 
         resultado = service.list_orders(db, active_sessions_only=True)
 
         self.assertIn(order.id, [o.id for o in resultado])
 
     def test_conserva_pedido_pagado_de_sesion_activa(self):
-        db, _, order = self._seed(session_status="active", order_status="abierta", con_sale=True)
+        db, _, order = self._seed(session_status="active", order_status="pendiente", con_sale=True)
 
         resultado = service.list_orders(db, active_sessions_only=True)
 
@@ -843,7 +854,7 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         ts = fx.make_table_session(db)  # solo para satisfacer la firma del fixture
         order = fx.make_customer_order(
             db, ts, table_session_id=None, dining_table_id=None,
-            status="abierta", channel="POS",
+            status="pendiente", channel="POS",
         )
         db.commit()
 
@@ -852,7 +863,7 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         self.assertIn(order.id, [o.id for o in resultado])
 
     def test_sin_el_parametro_el_resultado_no_cambia_respecto_a_hoy(self):
-        db, _, order = self._seed(session_status="closed", order_status="abierta", con_sale=True)
+        db, _, order = self._seed(session_status="closed", order_status="pendiente", con_sale=True)
 
         resultado = service.list_orders(db)
 
@@ -1051,20 +1062,27 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         self.assertEqual(Decimal(self.queso.current_stock), Decimal("1"))
         self.assertEqual(self.db.execute(select(InventoryMovement)).scalars().all(), [])
 
-    def test_create_order_nombra_el_producto_agotado_y_no_deja_lineas_a_medias(self):
+    def test_create_order_ya_no_valida_el_agotado_en_la_creacion(self):
+        """A-150 (spec 146): `create_order` ya no descuenta inventario, así
+        que esta guarda (que vivía en `deduct_order_items_naming_product`) ya
+        no se ejecuta en la creación -- la orden se crea en 'pendiente' con
+        el insumo intacto. El 400 nombrando el producto agotado se desplaza
+        al punto de confirmación (`checkout.py`). Reemplaza la
+        caracterización anterior (que exigía el 400 en la creación)."""
         data = OrderCreate(
             channel=OrderChannel.POS, customer_name="Cliente de prueba",
             items=[OrderItemIn(product_variant_id=self.variant.id, quantity=1)],
         )
-        with self.assertRaises(HTTPException) as ctx:
-            service.create_order(self.db, data, uuid4())
-        self._assert_named(ctx.exception)
-        self._assert_nothing_left()
+        order = service.create_order(self.db, data, uuid4())
+        self.assertEqual(order.status, "pendiente")
+        self.db.expire_all()
+        self.assertEqual(Decimal(self.queso.current_stock), Decimal("1"))
+        self.assertEqual(self.db.execute(select(InventoryMovement)).scalars().all(), [])
 
     def test_add_item_to_order_nombra_el_producto_agotado(self):
         from app.api.v1.orders import consolidation
         ts = fx.make_table_session(self.db)
-        order = fx.make_customer_order(self.db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(self.db, ts, status="pendiente", channel="POS")
         self.db.commit()
         with self.assertRaises(HTTPException) as ctx:
             consolidation.add_item_to_order(
@@ -1079,7 +1097,7 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         from app.api.v1.orders import kitchen
         from app.api.v1.orders.schemas import VoidItemIn
         ts = fx.make_table_session(self.db)
-        order = fx.make_customer_order(self.db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(self.db, ts, status="pendiente", channel="POS")
         otro = fx.make_variant(self.db, product=self.product, price=PRECIO)
         fx.make_recipe_item(self.db, otro, self.queso, quantity=Decimal("0.1"))
         original = fx.make_order_item(
@@ -1098,7 +1116,7 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         self._assert_named(ctx.exception)
         self.db.expire_all()
         # Rollback total: la línea original sigue viva y sin reversa.
-        self.assertNotEqual(self.db.get(type(original), original.id).estado_cocina, "anulado")
+        self.assertNotEqual(self.db.get(type(original), original.id).estado_cocina, "cancelado")
 
 
 class TestCreateOrderPersistsDiscounts118(unittest.TestCase):

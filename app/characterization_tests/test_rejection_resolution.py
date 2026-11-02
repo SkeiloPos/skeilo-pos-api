@@ -19,7 +19,9 @@ from app.characterization_tests import cart_fixtures as cfx
 from app.characterization_tests import orders_fixtures as ofx
 from app.api.v1.cart import service as cart_service
 from app.api.v1.orders import checkout
+from app.core import inventory_reasons
 from app.models.audit_log import AuditLog
+from app.models.inventory_movement import InventoryMovement
 from app.models.order_payment_attempt import OrderPaymentAttempt
 
 
@@ -32,7 +34,7 @@ class TestRetryLimit(unittest.TestCase):
         table = cfx.make_dining_table(db)
         ts = cfx.make_table_session(db, table=table)
         participant = cfx.make_participant(db, table_session=ts)
-        order = cfx.make_customer_order(db, participant, status="recibida")
+        order = cfx.make_customer_order(db, participant, status="pendiente")
         nequi = cfx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         db.commit()
         return db, participant, order, nequi
@@ -99,8 +101,17 @@ class TestCancelacionPorImpago(unittest.TestCase):
         category = ofx.make_category(db)
         product = ofx.make_product(db, category=category)
         variant = ofx.make_variant(db, product=product, price=Decimal("18000"))
-        order = ofx.make_customer_order(db, ts, participant=participant, status="abierta")
-        ofx.make_order_item(db, order, variant, estado_cocina="en_preparacion")
+        # Spec 147: el ítem ya 'entregado' (antes 'en_preparacion') y un
+        # InventoryMovement real marcan que el insumo ya se descontó y
+        # consumió -- la pérdida (no reversa) es la rama que este test
+        # ejercita.
+        order = ofx.make_customer_order(db, ts, participant=participant, status="entregada")
+        item = ofx.make_order_item(db, order, variant, estado_cocina="entregado")
+        db.add(InventoryMovement(
+            inventory_item_id=ofx.make_inventory_item(db, current_stock=Decimal("1000")).id,
+            type="out", quantity=Decimal("1"), reason=inventory_reasons.VENTA,
+            reference_type=inventory_reasons.REF_ORDER, reference_id=order.id,
+        ))
         nequi = ofx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         ofx.make_payment_attempt(
             db, order, nequi, status="rechazado", rejection_reason="monto_no_coincide",

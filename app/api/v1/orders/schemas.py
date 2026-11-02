@@ -32,22 +32,29 @@ class OrderType(str, Enum):
 
 
 class OrderStatus(str, Enum):
-    """Ciclo del pedido. El estado de cocina es por ítem (`estado_cocina`)."""
-    #: Enviada por el comensal desde el QR; todavía no descuenta inventario.
-    RECIBIDA = "recibida"
-    #: Confirmada por staff: aquí se descontó el stock.
-    ABIERTA = "abierta"
-    BLOQUEADA = "bloqueada"
-    PAGADA = "pagada"
+    """Ciclo del pedido (spec 147: colapsado a 3 estados). El estado de cocina
+    es por ítem (`estado_cocina`); el de pago es independiente (`payment_status`)."""
+    #: Estado inicial para toda orden nueva, de cualquier canal.
+    PENDIENTE = "pendiente"
+    #: Entregada con la acción única "Entregar" (POST /orders/{id}/deliver,
+    #: spec 147); no implica nada sobre el pago.
+    ENTREGADA = "entregada"
     CANCELADA = "cancelada"
 
 
+class PaymentStatus(str, Enum):
+    """Estado de pago de la orden, independiente de `OrderStatus` (spec 146;
+    colapsado a 2 valores en spec 147)."""
+    UNPAID = "UNPAID"
+    PAID = "PAID"
+
+
 class KitchenStatus(str, Enum):
-    """Estado de preparación por ítem, independiente del status de pago."""
+    """Estado de preparación por ítem (spec 147: colapsado a 3 estados), sin
+    acción propia — sigue siempre el de su pedido (FR-022)."""
     PENDIENTE = "pendiente"
-    EN_PREPARACION = "en_preparacion"
-    LISTO = "listo"
-    ANULADO = "anulado"
+    ENTREGADO = "entregado"
+    CANCELADO = "cancelado"
 
 
 # ---------- Mesas ----------
@@ -148,11 +155,11 @@ class OrderCreate(BaseModel):
     notes: str | None = Field(None, max_length=500)
     items: list[OrderItemIn] = Field(..., min_length=1)
     #: Terminal de Mesas modo híbrido (spec 028): comanda de mostrador/mesero
-    #: que nace en 'recibida' en lugar de 'abierta' — el staff cobra primero
+    #: que nace en 'pendiente' en lugar de 'abierta' — el staff cobra primero
     #: (`POST /orders/{id}/checkout-and-send`) y recién ahí se descuenta
     #: inventario y se envía a cocina. Solo aplica a `channel=POS`; combinado
     #: con `channel=QR_MENU` es 400 (ese canal ya tiene su propio flujo
-    #: `recibida` vía `/cart/submit`).
+    #: `pendiente` vía `/cart/submit`).
     hold_for_payment: bool = False
     #: spec 111 (FR-011, RN4): generado por el cliente una sola vez por intento de "Crear
     #: pedido"; reenviado sin cambios si ese mismo intento se reintenta por una falla de red.
@@ -297,6 +304,8 @@ class OrderResponse(BaseModel):
     channel: str
     order_type: str | None = None
     status: str
+    # spec 146 (FR-002, A-150): estado de pago, independiente de `status`.
+    payment_status: str
     version: int
     table_session_id: UUID | None = None
     participant_id: UUID | None = None

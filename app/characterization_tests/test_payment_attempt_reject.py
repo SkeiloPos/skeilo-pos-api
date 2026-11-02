@@ -60,7 +60,7 @@ class TestTableRepeatRejection(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         attempt = fx.make_payment_attempt(db, order, nequi, status="pendiente")
         db.commit()
@@ -122,7 +122,7 @@ class TestSegundoRechazoEnElDiaLocal(unittest.TestCase):
             participant = fx.make_participant(db, table_session=ts)
             product = fx.make_product(db, category=fx.make_category(db))
             variant = fx.make_variant(db, product=product, price=PRECIO)
-            order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+            order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
             fx.make_order_item(db, order, variant, estado_cocina="pendiente")
             attempt = fx.make_payment_attempt(db, order, metodo, status="pendiente")  # created_at = instante
             db.commit()

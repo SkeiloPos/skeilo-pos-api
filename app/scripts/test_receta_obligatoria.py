@@ -105,7 +105,7 @@ def _staff(db) -> User:
     return user
 
 
-def _order(db, variants, *, status="recibida"):
+def _order(db, variants, *, status="pendiente"):
     """Pedido con una línea por variante dada."""
     order = CustomerOrder(channel="QR_MENU", order_type="DINE_IN", status=status)
     db.add(order); db.flush()
@@ -140,7 +140,7 @@ def _cleanup(schema, product_id, item_id):
         db.execute(text(f'''
             DELETE FROM "{schema}".customer_orders WHERE id NOT IN (
                 SELECT order_id FROM "{schema}".order_items) AND channel = 'QR_MENU'
-                AND status = 'recibida'
+                AND status = 'pendiente'
         '''))
         db.execute(text(f'''DELETE FROM "{schema}".recipe_items WHERE product_variant_id IN (
                 SELECT id FROM "{schema}".product_variants WHERE product_id = :p)'''),
@@ -181,7 +181,7 @@ def main():
             print("  ok  · el error nombra la variante a configurar")
 
         with with_db(schema) as db:
-            _check("el pedido sigue 'recibida'", db.get(CustomerOrder, oid).status, "recibida")
+            _check("el pedido sigue 'pendiente'", db.get(CustomerOrder, oid).status, "pendiente")
             _check("y no escribió ningún movimiento", _movs(db, oid), 0)
             _check("el stock no se movió", _stock(db, item_id), STOCK_INICIAL)
 
@@ -194,8 +194,11 @@ def main():
         with with_db(schema) as db:
             checkout.confirm_order(db, oid2, _staff(db))
         with with_db(schema) as db:
-            _check("con receta el pedido pasa a 'abierta'",
-                   db.get(CustomerOrder, oid2).status, "abierta")
+            # Spec 147: confirmar ya no mueve `status` (no existe 'abierta');
+            # el pedido sigue 'pendiente' hasta que se entregue. La señal de
+            # "ya confirmado" es el movimiento de inventario, no el status.
+            _check("con receta el pedido sigue 'pendiente'",
+                   db.get(CustomerOrder, oid2).status, "pendiente")
             _check("y escribe un movimiento por insumo", _movs(db, oid2), 1)
             _check("descontando la cantidad de la receta",
                    _stock(db, item_id), STOCK_INICIAL - POR_UNIDAD)
@@ -221,7 +224,7 @@ def main():
         # Es lo que garantiza que consolidación y adición de ítem tampoco puedan
         # colarse: comparten esta función.
         with with_db(schema) as db:
-            order4 = _order(db, [db.get(ProductVariant, sin_id)], status="abierta")
+            order4 = _order(db, [db.get(ProductVariant, sin_id)], status="pendiente")
             db.commit()
             entries = [(it, []) for it in order4.items]
             _expect_409(

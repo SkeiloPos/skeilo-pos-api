@@ -156,7 +156,7 @@ def main():
         t3 = _nueva_mesa(schema); mesas.append(t3)
         with with_db(schema) as db:
             c = cart_service.open_session(db, tenant_id, db.get(DiningTable, t3), "Ana")
-        _pedido(schema, t3, c.participant_id, c.table_session_id, "abierta")
+        _pedido(schema, t3, c.participant_id, c.table_session_id, "pendiente")
 
         with with_db(schema) as db:
             cart_service.leave_session(db, db.get(SessionParticipant, c.participant_id))
@@ -197,7 +197,7 @@ def main():
         t7 = _nueva_mesa(schema); mesas.append(t7)
         with with_db(schema) as db:
             g = cart_service.open_session(db, tenant_id, db.get(DiningTable, t7), "Ana")
-        _pedido(schema, t7, g.participant_id, g.table_session_id, "abierta")
+        _pedido(schema, t7, g.participant_id, g.table_session_id, "pendiente")
         _envejecer(schema, g.participant_id, settings.EMPTY_SESSION_TTL_MINUTES + 1)
 
         sweep_orphan_sessions()

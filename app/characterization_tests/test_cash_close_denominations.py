@@ -285,7 +285,7 @@ class TestRechazosDelCierre(unittest.TestCase):
         """research.md R4: 422 y no 409 si hay pedidos activos Y un total del cliente."""
         db, shift = _nuevo_turno()
         ts = fx.make_table_session(db)
-        fx.make_customer_order(db, ts, order_type="DINE_IN", status="abierta",
+        fx.make_customer_order(db, ts, order_type="DINE_IN", status="pendiente",
                                customer_name="Cliente de prueba")
         db.commit()
         body = ShiftClose.model_validate({"counted_amount": 95000})
@@ -299,7 +299,7 @@ class TestRechazosDelCierre(unittest.TestCase):
         from fastapi.responses import JSONResponse
         db, shift = _nuevo_turno()
         ts = fx.make_table_session(db)
-        fx.make_customer_order(db, ts, order_type="DINE_IN", status="abierta",
+        fx.make_customer_order(db, ts, order_type="DINE_IN", status="pendiente",
                                customer_name="Cliente de prueba")
         db.commit()
         body = ShiftClose(denominations=[_line(100000, 1), _line(10000, 1), _line(5000, 1)])

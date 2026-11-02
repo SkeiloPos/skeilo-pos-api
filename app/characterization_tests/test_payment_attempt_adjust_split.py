@@ -33,7 +33,7 @@ class TestPaymentAttemptAdjustSplit(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=total)
-        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         db.commit()
         return db, order

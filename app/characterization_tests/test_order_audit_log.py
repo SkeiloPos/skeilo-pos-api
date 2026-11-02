@@ -37,7 +37,9 @@ from app.api.v1.orders.schemas import (
     CancelIn, CheckoutAndSendIn, OrderChannel, OrderCreate, OrderItemIn, OrderType,
 )
 from app.api.v1.sales.schemas import PaymentIn
+from app.core import inventory_reasons
 from app.core.config import settings
+from app.models.inventory_movement import InventoryMovement
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -250,7 +252,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         return db, participant, method
 
     def _seed_orden_recibida(self, *, is_cash=True, receipt=None):
-        """Orden 'recibida' con su ítem y un intento de pago pendiente — el
+        """Orden 'pendiente' con su ítem y un intento de pago pendiente — el
         punto de partida de aprobar/rechazar/confirmar efectivo."""
         db = fx.new_session()
         table = fx.make_dining_table(db)
@@ -261,7 +263,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
-        order = fx.make_customer_order(db, ts, participant=participant, status="recibida")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = (
             fx.make_payment_method(db, name="Efectivo", is_cash=True) if is_cash
@@ -296,7 +298,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         return orders_service.create_order(db, data, user_id=user.id, user=user), user
 
     def _seed_hold_order_con_receta(self):
-        """Mesa + orden 'recibida' (como si hubiera nacido con
+        """Mesa + orden 'pendiente' (como si hubiera nacido con
         `hold_for_payment=True`, T013) con una variante con receta, y turno de
         caja abierto — el punto de partida de `checkout_and_send` (T040)."""
         db = fx.new_session()
@@ -307,7 +309,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
-        order = fx.make_customer_order(db, ts, status="recibida", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
@@ -391,7 +393,10 @@ class TestOrderAuditIntegration(unittest.TestCase):
         with mock.patch.object(checkout, "record_order_audit_event") as rec:
             result = checkout.confirm_order(db, order.id, user)
 
-        self.assertEqual(result.status, "abierta")  # la transición sí ocurrió
+        # Spec 147: confirmar ya no mueve `status` (no existe 'abierta') --
+        # sigue 'pendiente'; la transición que sí ocurrió es el descuento de
+        # inventario (verificado por el evento ORDER_CONFIRMED mismo).
+        self.assertEqual(result.status, "pendiente")
         eventos = _eventos(rec, OrderAuditEventType.ORDER_CONFIRMED)
         self.assertEqual(len(eventos), 1)
         self.assertEqual(eventos[0]["order_id"], order.id)
@@ -455,12 +460,20 @@ class TestOrderAuditIntegration(unittest.TestCase):
     def test_cancel_order_emite_order_cancelled_por_staff_y_por_comensal(self):
         """FR-009: `initiated_by` distingue las dos rutas de entrada, y
         `inventory_loss` marca si algún ítem ya consumido no volvió al stock."""
-        # (a) staff, con un ítem ya 'en_preparacion' sobre una orden abierta:
-        # ese insumo ya se combinó, no vuelve al inventario → pérdida.
+        # (a) staff, con un ítem ya 'entregado' sobre una orden 'entregada'
+        # ya descontada (spec 147: el inventario descontado ya no se infiere
+        # de `status`, se verifica con un `InventoryMovement` real -- ver
+        # `checkout.cancel_order`): ese insumo ya se combinó, no vuelve al
+        # inventario → pérdida.
         db, order, _ = self._seed_orden_recibida()
-        order.status = "abierta"
+        order.status = "entregada"
         for item in order.items:
-            item.estado_cocina = "en_preparacion"
+            item.estado_cocina = "entregado"
+        db.add(InventoryMovement(
+            inventory_item_id=fx.make_inventory_item(db, current_stock=Decimal("1000")).id,
+            type="out", quantity=Decimal("1"), reason=inventory_reasons.VENTA,
+            reference_type=inventory_reasons.REF_ORDER, reference_id=order.id,
+        ))
         db.commit()
         user = _staff()
 
@@ -478,7 +491,7 @@ class TestOrderAuditIntegration(unittest.TestCase):
         self.assertEqual(evento["details"]["reason"], "cliente se retiró")
         self.assertIs(evento["details"]["inventory_loss"], True)
 
-        # (b) el propio comensal, sobre una orden 'recibida' (nada descontado).
+        # (b) el propio comensal, sobre una orden 'pendiente' (nada descontado).
         db2, order2, _ = self._seed_orden_recibida()
         participant = db2.get(SessionParticipant, order2.participant_id)
 
@@ -521,19 +534,28 @@ class TestOrderAuditIntegration(unittest.TestCase):
         self.assertEqual(ctx2.exception.status_code, 409)
         rec2.assert_not_called()
 
-        # (c) comanda manual con una variante sin receta → 409, sin evento.
+        # (c) comanda manual TAKEAWAY con mesa asociada → 422, sin evento.
+        #
+        # A-150 (spec 146): `create_order` ya no descuenta inventario, así que una
+        # variante sin receta ya no rechaza la creación (ese 409 se desplazó a la
+        # confirmación) — se reemplaza por otra validación que sigue fallando en la
+        # creación misma (spec 055, research.md Decisión 5).
         db3 = fx.new_session()
         category = fx.make_category(db3)
         product = fx.make_product(db3, category=category)
         variant = fx.make_variant(db3, product=product, price=PRECIO)
+        table = fx.make_dining_table(db3, status="libre")
         db3.commit()
         data = OrderCreate(
             channel=OrderChannel.POS,
+            order_type=OrderType.TAKEAWAY,
+            dining_table_id=table.id,
             items=[OrderItemIn(product_variant_id=variant.id, quantity=1)],
         )
         with mock.patch.object(orders_service, "record_order_audit_event") as rec3:
-            with self.assertRaises(HTTPException):
+            with self.assertRaises(HTTPException) as ctx3:
                 orders_service.create_order(db3, data, user_id=uuid4())
+        self.assertEqual(ctx3.exception.status_code, 422)
         rec3.assert_not_called()
 
     # ------------------------------------------ actor automático/manual (T027)
@@ -750,7 +772,9 @@ class TestOrderAuditIntegration(unittest.TestCase):
             sale = checkout.checkout_and_send(db, order.id, data, cashier)
 
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")  # la transición sí ocurrió
+        # Spec 147: checkout_and_send ya no mueve `status` a 'pagada' (no
+        # existe) -- deja `payment_status='PAID'`.
+        self.assertEqual(order.payment_status, "PAID")
 
         confirmados = _eventos(rec, OrderAuditEventType.ORDER_CONFIRMED)
         self.assertEqual(len(confirmados), 1)

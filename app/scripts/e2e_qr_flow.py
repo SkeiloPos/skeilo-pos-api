@@ -6,7 +6,7 @@
 Recorre el camino entero y comprueba las invariantes que importan:
 
     QR → dos comensales en la misma mesa → cada uno arma su carrito →
-    envían pedido (`recibida`, sin tocar stock) → cocina NO los ve todavía →
+    envían pedido (`pendiente`, sin tocar stock) → cocina NO los ve todavía →
     staff confirma (aquí y solo aquí baja el inventario) → cocina los ve →
     entrega → cuenta con split por comensal → cobro `split` (una venta por
     persona) → arqueo de caja cuadrado → mesa liberada.
@@ -267,8 +267,8 @@ def main():
         # --- envío de pedidos ----------------------------------------------
         o1 = api("POST", "/api/v1/cart/submit", headers=h1).json()
         o2 = api("POST", "/api/v1/cart/submit", headers=h2).json()
-        check("el pedido enviado queda 'recibida'",
-              [o1["status"], o2["status"]], ["recibida", "recibida"])
+        check("el pedido enviado queda 'pendiente'",
+              [o1["status"], o2["status"]], ["pendiente", "pendiente"])
         check("enviar el pedido tampoco toca el inventario", stock(fx), stock_0)
 
         # --- confirmación por staff: aquí baja el stock --------------------
@@ -277,12 +277,12 @@ def main():
         check("confirmar descuenta 3 unidades × 2 de receta",
               stock_0 - stock(fx), POR_UNIDAD * 3)
 
-        # --- la terminal marca los pedidos listos ---------------------------
+        # --- la terminal entrega los pedidos (spec 147: acción única) ------
         for o in (o1, o2):
-            listo = api("POST", f"/api/v1/orders/{o['id']}/ready").json()
-            check("marcar listo deja todos los ítems en 'listo'",
-                  {it["estado_cocina"] for it in listo["items"]}, {"listo"})
-        note("la terminal marcó ambos pedidos listos, una llamada por pedido")
+            entregado = api("POST", f"/api/v1/orders/{o['id']}/deliver").json()
+            check("entregar deja todos los ítems en 'entregado'",
+                  {it["estado_cocina"] for it in entregado["items"]}, {"entregado"})
+        note("la terminal entregó ambos pedidos, una llamada por pedido")
 
         # --- cuenta con split ----------------------------------------------
         bill = api("GET", f"/api/v1/table-sessions/{ts_id}/bill").json()

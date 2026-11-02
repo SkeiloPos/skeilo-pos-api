@@ -45,6 +45,7 @@ from app.api.v1.orders.schemas import (
 )
 from app.api.v1.sales.schemas import PaymentIn
 from app.api.v1.promotions import service as promotions
+from app.core import inventory_reasons
 from app.models.audit_log import AuditLog
 from app.models.cart import Cart
 from app.models.inventory_movement import InventoryMovement
@@ -54,10 +55,26 @@ from app.models.sale import Sale
 PRECIO = Decimal("10000")
 
 
+def _seed_fake_deduction(db, order_id):
+    """Spec 147: `cancel_order`/`_confirm_order_impl` ya no infieren "¿se
+    descontó inventario?" de `status` (no distingue 'pendiente, confirmada'
+    de 'pendiente, nunca confirmada' -- ambas son `'pendiente'`); miran si ya
+    existe un `InventoryMovement` real (`reference_type=REF_ORDER,
+    reference_id=order.id, type='out', reason=VENTA`). Los fixtures de este
+    módulo insertan ítems directamente, sin pasar por `deduct_order_items`,
+    así que los tests que necesitan simular "esta orden ya descontó stock"
+    siembran ese movimiento aquí explícitamente."""
+    db.add(InventoryMovement(
+        inventory_item_id=uuid4(), type="out", quantity=Decimal("1"),
+        reason=inventory_reasons.VENTA, reference_type=inventory_reasons.REF_ORDER,
+        reference_id=order_id,
+    ))
+
+
 class TestCheckout(unittest.TestCase):
     # ------------------------------------------------------------- Helpers
 
-    def _seed_order_con_receta(self, *, order_status="abierta", table_status="ocupada"):
+    def _seed_order_con_receta(self, *, order_status="entregada", table_status="ocupada"):
         """Mesa ocupada + sesión + orden 'POS', con una variante que sí
         descuenta inventario (receta con stock de sobra)."""
         db = fx.new_session()
@@ -83,40 +100,42 @@ class TestCheckout(unittest.TestCase):
 
     # -------------------------------------------------------- block_order (T022)
 
-    def test_block_order_bloquea_y_409_con_items_pendientes(self):
-        """CONGELA comportamiento actual (`checkout.py:71-125`, spec.md
-        Historia 2, escenario 1): orden 'abierta' sin ítems pendientes en
-        cocina + versión correcta → pasa a 'bloqueada'; con al menos un
-        ítem 'pendiente'/'en_preparacion' → 409 con el detalle de los ítems
-        sin terminar."""
-        s = self._seed_order_con_receta()
+    def test_block_order_ya_no_exige_cocina_terminada_solo_version_y_no_cancelada(self):
+        """Comportamiento reescrito spec 147 (FR-004/FR-010, T021): ya no
+        existe el status intermedio `'bloqueada'` ni el gate de "ítems sin
+        terminar en cocina" -- el cobro no depende del estado de entrega.
+        `block_order` solo reclama la orden (lock optimista por `version`,
+        para que el frontend detecte un doble clic) y rechaza únicamente una
+        orden ya `'cancelada'` (transición inválida). Antes: una orden
+        'abierta' con un ítem 'pendiente' en cocina respondía 409; ahora
+        pasa igual, sin tocar `status`."""
+        s = self._seed_order_con_receta(order_status="pendiente")
         db, order, variant = s["db"], s["order"], s["variant"]
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         db.commit()
 
         result = checkout.block_order(db, order.id, BlockIn(version=0))
-        self.assertEqual(result.status, "bloqueada")
+        self.assertEqual(result.status, "pendiente")
         self.assertEqual(result.version, 1)
 
-        s2 = self._seed_order_con_receta()
-        db2, order2, variant2 = s2["db"], s2["order"], s2["variant"]
-        fx.make_order_item(db2, order2, variant2, estado_cocina="pendiente")
-        db2.commit()
+        s2 = self._seed_order_con_receta(order_status="cancelada")
+        db2, order2 = s2["db"], s2["order"]
 
         with self.assertRaises(HTTPException) as ctx:
             checkout.block_order(db2, order2.id, BlockIn(version=0))
         self.assertEqual(ctx.exception.status_code, 409)
-        self.assertIn("items", ctx.exception.detail)
 
     # ------------------------------------------------------- compute_bill (T023)
 
-    def test_compute_bill_a01_camino_b_incluye_pagada_sin_descuentos(self):
+    def test_compute_bill_a01_camino_b_incluye_entregada_sin_descuentos(self):
         """CONGELA comportamiento actual — A-01 camino B
-        (`checkout.compute_bill:127-190`, sin caller de producción conocido):
-        tabla con órdenes 'abierta'/'pagada'/'cancelada' → el total incluye
-        'abierta' y 'pagada' (excluye 'cancelada'), sin aplicar ningún
-        descuento aunque haya una promoción activa — código muerto pero
-        peligroso si se reactiva (spec.md Historia 2, escenario 8)."""
+        (`checkout.compute_bill:127-190`, sin caller de producción conocido),
+        literales reescritos spec 147: tabla con órdenes
+        'pendiente'/'entregada'/'cancelada' → el total incluye 'pendiente' y
+        'entregada' (excluye 'cancelada'; el filtro es `status != 'cancelada'`,
+        ya no depende de 'pagada'), sin aplicar ningún descuento aunque haya
+        una promoción activa — código muerto pero peligroso si se reactiva
+        (spec.md Historia 2, escenario 8)."""
         db = fx.new_session()
         table = fx.make_dining_table(db)
         ts = fx.make_table_session(db, table=table)
@@ -124,10 +143,10 @@ class TestCheckout(unittest.TestCase):
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
 
-        order_abierta = fx.make_customer_order(db, ts, status="abierta")
-        fx.make_order_item(db, order_abierta, variant, quantity=1)
-        order_pagada = fx.make_customer_order(db, ts, status="pagada")
-        fx.make_order_item(db, order_pagada, variant, quantity=1)
+        order_pendiente = fx.make_customer_order(db, ts, status="pendiente")
+        fx.make_order_item(db, order_pendiente, variant, quantity=1)
+        order_entregada = fx.make_customer_order(db, ts, status="entregada")
+        fx.make_order_item(db, order_entregada, variant, quantity=1)
         order_cancelada = fx.make_customer_order(db, ts, status="cancelada")
         fx.make_order_item(db, order_cancelada, variant, quantity=1)
 
@@ -141,7 +160,7 @@ class TestCheckout(unittest.TestCase):
         resp = checkout.compute_bill(db, table.id)
 
         order_ids = {ol.order_id for ol in resp.orders}
-        self.assertEqual(order_ids, {order_abierta.id, order_pagada.id})
+        self.assertEqual(order_ids, {order_pendiente.id, order_entregada.id})
         # `checkout.compute_bill` es código muerto que nunca aplicó descuentos.
         self.assertEqual(resp.total, PRECIO * 2)
 
@@ -232,15 +251,16 @@ class TestCheckout(unittest.TestCase):
 
     def test_pay_order_construye_sale_real_con_promocion_activa(self):
         """CONGELA comportamiento actual (`checkout.pay_order`), reescrito para el
-        modelo por conjunto de variantes (spec 063, A-58…A-65; FR-021): orden
-        'bloqueada' + turno abierto + promoción `percent` activa sobre el
-        conjunto → `pay_order` construye el `Sale` real con el descuento sumado,
-        `promotion_id` poblado (una sola promoción) y `applied_promotions` con la
-        entrada agregada."""
+        modelo por conjunto de variantes (spec 063, A-58…A-65; FR-021) y para
+        spec 147 (FR-003/FR-004: ya no existe 'bloqueada', el cobro se permite
+        en cualquier status salvo 'cancelada'): orden 'entregada' + turno
+        abierto + promoción `percent` activa sobre el conjunto → `pay_order`
+        construye el `Sale` real con el descuento sumado, `promotion_id`
+        poblado (una sola promoción) y `applied_promotions` con la entrada
+        agregada."""
         s = self._seed_order_con_receta()
         db, order, variant = s["db"], s["order"], s["variant"]
         fx.make_order_item(db, order, variant, quantity=1)
-        order.status = "bloqueada"
         promo = fx.make_promotion(db, status="active")
         fx.add_rule_to_promotion(
             db, promo, type="percent", value=Decimal("10"), min_qty=1,
@@ -266,7 +286,9 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(sale.applied_promotions[0]["promotion_id"], str(promo.id))
         self.assertEqual(Decimal(sale.applied_promotions[0]["amount"]), esperado_descuento)
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        # Spec 147 (FR-003): pagar no toca `status`; solo `payment_status`.
+        self.assertEqual(order.status, "entregada")
+        self.assertEqual(order.payment_status, "PAID")
         self.assertEqual(order.discount, esperado_descuento)
         self.assertEqual(order.applied_promotions[0]["promotion_id"], str(promo.id))
 
@@ -291,7 +313,6 @@ class TestCheckout(unittest.TestCase):
 
         fx.make_order_item(db, order, v1, quantity=1)
         fx.make_order_item(db, order, v2, quantity=1)
-        order.status = "bloqueada"
 
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
@@ -321,7 +342,6 @@ class TestCheckout(unittest.TestCase):
         order.order_type = "DELIVERY"
         order.delivery_fee = Decimal("6000")
         fx.make_order_item(db, order, variant, quantity=1)
-        order.status = "bloqueada"
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
         method = fx.make_payment_method(db)
@@ -341,7 +361,6 @@ class TestCheckout(unittest.TestCase):
         s = self._seed_order_con_receta()
         db, order, variant = s["db"], s["order"], s["variant"]
         fx.make_order_item(db, order, variant, quantity=1)
-        order.status = "bloqueada"
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
         method = fx.make_payment_method(db)
@@ -379,7 +398,7 @@ class TestCheckout(unittest.TestCase):
         # No emitió venta ni cambió el estado del pedido.
         self.assertEqual(db.execute(select(Sale)).scalars().all(), [])
         db.refresh(order)
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "entregada")
 
     def test_checkout_preview_pedido_sin_promocion_discount_cero(self):
         """FR-004: sin promoción vigente el descuento es 0."""
@@ -435,8 +454,8 @@ class TestCheckout(unittest.TestCase):
         conteo de unidades para el umbral, ni en el total."""
         s = self._seed_order_con_receta()
         db, order, variant = s["db"], s["order"], s["variant"]
-        fx.make_order_item(db, order, variant, quantity=1, estado_cocina="listo")
-        fx.make_order_item(db, order, variant, quantity=3, estado_cocina="anulado")
+        fx.make_order_item(db, order, variant, quantity=1, estado_cocina="entregado")
+        fx.make_order_item(db, order, variant, quantity=3, estado_cocina="cancelado")
         db.commit()
 
         preview = checkout.compute_checkout_preview(db, order.id)
@@ -450,15 +469,17 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_checkout_preview_409_si_el_pedido_ya_no_es_cobrable(self):
-        """`pagada`/`cancelada` → 409 (contracts/preview-cobro-pedido.md)."""
-        for estado in ("pagada", "cancelada"):
-            s = self._seed_order_con_receta(order_status=estado)
-            db, order, variant = s["db"], s["order"], s["variant"]
-            fx.make_order_item(db, order, variant, quantity=1)
-            db.commit()
-            with self.assertRaises(HTTPException) as ctx:
-                checkout.compute_checkout_preview(db, order.id)
-            self.assertEqual(ctx.exception.status_code, 409)
+        """`cancelada` → 409 (contracts/preview-cobro-pedido.md). Spec 147:
+        ya no existe `'pagada'` -- `TERMINAL` se redujo a solo `'cancelada'`,
+        el único status que de verdad impide cobrar (FR-004: el resto,
+        incluido un pedido ya pagado, sigue siendo "cobrable")."""
+        s = self._seed_order_con_receta(order_status="cancelada")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        fx.make_order_item(db, order, variant, quantity=1)
+        db.commit()
+        with self.assertRaises(HTTPException) as ctx:
+            checkout.compute_checkout_preview(db, order.id)
+        self.assertEqual(ctx.exception.status_code, 409)
 
     # -------------------------------------- spec 073: compute_draft_preview (US5)
 
@@ -528,9 +549,11 @@ class TestCheckout(unittest.TestCase):
     def test_confirm_order_descuenta_una_vez_y_stock_insuficiente_revierte(self):
         """CONGELA comportamiento actual (`checkout.confirm_order:366-390` +
         `checkout._confirm_order_impl:313-363`, spec.md Historia 2, escenario
-        4): pedido 'recibida' con ítems válidos → pasa a 'abierta' y descuenta
-        inventario exactamente una vez; con stock insuficiente de un insumo,
-        la transacción entera revierte y el pedido sigue 'recibida'.
+        4; status reescrito spec 147 -- ya no pasa a `'abierta'`, sigue
+        `'pendiente'` hasta la entrega): pedido 'pendiente' con ítems válidos
+        → descuenta inventario exactamente una vez; con stock insuficiente de
+        un insumo, la transacción entera revierte y el pedido sigue
+        'pendiente'.
 
         Actualizado por spec 024-pagos-ordenes-mesa (FR-017, Principio III):
         `confirm_order` ahora exige un intento de pago `confirmado` antes de
@@ -559,14 +582,16 @@ class TestCheckout(unittest.TestCase):
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("2"))
         metodo = fx.make_payment_method(db, name="Efectivo", is_cash=True)
 
-        order = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
         fx.make_payment_attempt(db, order, metodo, status="confirmado")
         db.commit()
         user = self._user()
 
         resultado = checkout.confirm_order(db, order.id, user)
-        self.assertEqual(resultado.status, "abierta")
+        # Spec 147: ya no hay transición `pendiente -> abierta`; el pedido
+        # sigue `'pendiente'` hasta que se entregue (FR-001/FR-002).
+        self.assertEqual(resultado.status, "pendiente")
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()
@@ -575,7 +600,7 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(Decimal(insumo.current_stock), Decimal("3"))
 
         # Stock insuficiente para un segundo pedido (necesita 10, sobran 3).
-        order2 = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order2 = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order2, variant, quantity=5, estado_cocina="pendiente")
         fx.make_payment_attempt(db, order2, metodo, status="confirmado")
         db.commit()
@@ -584,7 +609,7 @@ class TestCheckout(unittest.TestCase):
             checkout.confirm_order(db, order2.id, user)
         self.assertEqual(ctx.exception.status_code, 400)
         db.refresh(order2)
-        self.assertEqual(order2.status, "recibida")
+        self.assertEqual(order2.status, "pendiente")
         movimientos2 = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order2.id)
         ).scalars().all()
@@ -594,12 +619,16 @@ class TestCheckout(unittest.TestCase):
 
     def test_cancel_order_reversa_asimetrica_segun_estado_cocina(self):
         """CONGELA comportamiento actual (`checkout.cancel_order:357-464`,
-        spec.md Historia 2, escenario 5): orden con ítems en 'pendiente',
-        'en_preparacion', 'listo', 'anulado' → solo el 'pendiente' genera una
-        entrada real de inventario; 'en_preparacion'/'listo' no vuelven al
-        stock (se registran como pérdida en `audit_logs`); 'anulado' ya se
-        resolvió antes. Migra el escenario de reversa de
-        `test_cancel_inventory.py`."""
+        spec.md Historia 2, escenario 5), literales reescritos spec 147 (4
+        estados de ítem → 3: `'en_preparacion'`→`'pendiente'`/`'listo'`→
+        `'entregado'`/`'anulado'`→`'cancelado'`): orden con ítems en
+        'pendiente' (uno ya descontado -- orden previamente confirmada -- y
+        otro recién agregado sin descontar todavía), 'entregado', 'cancelado'
+        → solo el 'pendiente' YA DESCONTADO genera una entrada real de
+        inventario; 'entregado' no vuelve al stock (se registra como pérdida
+        en `audit_logs`); 'cancelado' ya se resolvió antes; el 'pendiente'
+        sin descontar (orden nunca confirmada) no genera ningún movimiento.
+        Migra el escenario de reversa de `test_cancel_inventory.py`."""
         db = fx.new_session()
         ts = fx.make_table_session(db)
         category = fx.make_category(db)
@@ -608,11 +637,11 @@ class TestCheckout(unittest.TestCase):
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("2"))
 
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
-        item_en_prep = fx.make_order_item(db, order, variant, estado_cocina="en_preparacion")
-        item_listo = fx.make_order_item(db, order, variant, estado_cocina="listo")
-        fx.make_order_item(db, order, variant, estado_cocina="pendiente")
-        fx.make_order_item(db, order, variant, estado_cocina="anulado")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
+        item_entregado = fx.make_order_item(db, order, variant, estado_cocina="entregado")
+        item_pendiente_descontado = fx.make_order_item(db, order, variant, estado_cocina="pendiente")
+        fx.make_order_item(db, order, variant, estado_cocina="cancelado")
+        _seed_fake_deduction(db, order.id)
         db.commit()
         user = self._user()
 
@@ -620,10 +649,11 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(resultado.status, "cancelada")
 
         movimientos = db.execute(
-            select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
+            select(InventoryMovement).where(
+                InventoryMovement.reference_id == order.id, InventoryMovement.type == "in",
+            )
         ).scalars().all()
         self.assertEqual(len(movimientos), 1)
-        self.assertEqual(movimientos[0].type, "in")
 
         logs = db.execute(
             select(AuditLog).where(
@@ -632,23 +662,111 @@ class TestCheckout(unittest.TestCase):
         ).scalars().all()
         self.assertEqual(len(logs), 1)
         perdidos_ids = {p["order_item_id"] for p in logs[0].payload["items_perdidos"]}
-        self.assertEqual(perdidos_ids, {str(item_en_prep.id), str(item_listo.id)})
+        self.assertEqual(perdidos_ids, {str(item_entregado.id)})
+
+        # FR-007: todos los ítems quedan forzados a 'cancelado' junto al pedido.
+        db.refresh(item_pendiente_descontado)
+        db.refresh(item_entregado)
+        self.assertEqual(item_pendiente_descontado.estado_cocina, "cancelado")
+        self.assertEqual(item_entregado.estado_cocina, "cancelado")
+
+    # --------------------- cancel_order: entregada+UNPAID/PAID (spec 147, T039) ---------
+
+    def test_cancel_order_permite_entregada_unpaid_con_motivo(self):
+        """Comportamiento NUEVO (spec 147, FR-007/FR-008, Historia 4,
+        Acceptance Scenario 1): un pedido `'entregada'`+`'UNPAID'` se cancela
+        con `motivo` obligatorio -- queda `'cancelada'`, sus ítems
+        `'cancelado'`, y el motivo se registra en `OrderCancelLog`."""
+        from app.models.order_cancel_log import OrderCancelLog
+
+        s = self._seed_order_con_receta(order_status="entregada")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
+        db.commit()
+        user = self._user()
+
+        resultado = checkout.cancel_order(
+            db, order.id, CancelIn(motivo="Cliente no contestó"), user,
+        )
+        self.assertEqual(resultado.status, "cancelada")
+        self.assertTrue(all(it.estado_cocina == "cancelado" for it in resultado.items))
+
+        log = db.execute(
+            select(OrderCancelLog).where(OrderCancelLog.order_id == order.id)
+        ).scalar_one()
+        self.assertEqual(log.motivo, "Cliente no contestó")
+
+    def test_cancel_order_409_si_entregada_paid_requiere_reembolso(self):
+        """Comportamiento NUEVO (spec 147, FR-009, Historia 4, Acceptance
+        Scenario 3): un pedido `'entregada'`+`'PAID'` rechaza la cancelación
+        -- requiere un proceso de reembolso, fuera de alcance de este spec."""
+        s = self._seed_order_con_receta(order_status="entregada")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        order.payment_status = "PAID"
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
+        db.commit()
+        user = self._user()
+
+        with self.assertRaises(HTTPException) as ctx:
+            checkout.cancel_order(db, order.id, CancelIn(motivo="prueba"), user)
+        self.assertEqual(ctx.exception.status_code, 409)
+        db.refresh(order)
+        self.assertEqual(order.status, "entregada")
+
+    def test_cancel_order_409_si_ya_cancelada_transicion_invalida(self):
+        """Comportamiento NUEVO (spec 147, FR-010, Historia 4, Acceptance
+        Scenario 4): sobre un pedido ya `'cancelada'`, cancelar de nuevo
+        rechaza como transición inválida -- ningún estado cambia."""
+        s = self._seed_order_con_receta(order_status="cancelada")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        fx.make_order_item(db, order, variant, estado_cocina="cancelado")
+        db.commit()
+        user = self._user()
+
+        with self.assertRaises(HTTPException) as ctx:
+            checkout.cancel_order(db, order.id, CancelIn(motivo="prueba"), user)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_cancel_order_sin_motivo_422(self):
+        """FR-008: el motivo es obligatorio -- ya exigido estructuralmente
+        por `CancelIn` (`Field(..., min_length=1)`), no un comportamiento
+        nuevo de spec 147, pero sí una de las aserciones explícitas que pide
+        T039."""
+        with self.assertRaises(ValidationError):
+            CancelIn(motivo="")
+
+    def test_cancel_order_409_si_entregada_paid_no_bloquea_entrega_ni_liberacion(self):
+        """Historia 4, Independent Test: tras cancelar `'entregada'`+`'UNPAID'`,
+        la orden queda `'cancelada'` -- FR-016 (spec 147) nunca cuenta una
+        orden `'cancelada'` como abierta, así que no puede bloquear la
+        liberación de la mesa (verificado end-to-end en
+        `test_table_sessions_service.py`; aquí solo se confirma el status
+        final de la orden desde este módulo)."""
+        s = self._seed_order_con_receta(order_status="entregada")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
+        db.commit()
+        user = self._user()
+
+        resultado = checkout.cancel_order(db, order.id, CancelIn(motivo="prueba"), user)
+        self.assertEqual(resultado.status, "cancelada")
 
     def test_cancel_order_409_si_orden_ya_tiene_sale_spec_029(self):
-        """Comportamiento NUEVO (spec 029, hotfix #4): igual que `void_item`
-        (`test_orders_kitchen.py::test_void_item_409_si_orden_abierta_con_sale_camino_qr_mostrador_spec_029`),
+        """Comportamiento NUEVO (spec 029, hotfix #4; reescrito spec 147):
+        igual que `void_item`
+        (`test_orders_kitchen.py::test_void_item_409_si_sale_existe_pero_payment_status_no_se_actualizo_spec_029`),
         `cancel_order` debe reconocer un pedido ya cobrado por la `Sale`
-        asociada, no por `status` — los caminos QR/mostrador dejan la orden
-        en `"abierta"` a propósito tras el pago (research.md D2). Sin este
-        chequeo, se podía "rechazar" un pedido ya pagado y dejar su `Sale`
-        huérfana."""
+        asociada, no solo por `payment_status` — un camino QR/mostrador
+        legado puede dejar la `Sale` emitida sin que `payment_status` llegara
+        a `'PAID'` (research.md D2). Sin este chequeo, se podía "rechazar" un
+        pedido ya pagado y dejar su `Sale` huérfana."""
         db = fx.new_session()
         ts = fx.make_table_session(db)
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
-        fx.make_order_item(db, order, variant, estado_cocina="pendiente")
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="UNPAID", channel="POS")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         shift = fx.make_cash_shift(db)
         cashier = fx.make_user_double()
         sale = Sale(
@@ -664,7 +782,7 @@ class TestCheckout(unittest.TestCase):
             checkout.cancel_order(db, order.id, CancelIn(motivo="prueba"), cashier)
         self.assertEqual(ctx.exception.status_code, 409)
         db.refresh(order)
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "entregada")
         self.assertIsNotNone(
             db.execute(select(Sale).where(Sale.id == sale.id)).scalar_one_or_none()
         )
@@ -681,7 +799,7 @@ class TestCheckout(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = fx.make_payment_method(db, is_cash=True)
         attempt = fx.make_payment_attempt(db, order, method, status="pendiente")
@@ -704,7 +822,7 @@ class TestCheckout(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="QR_MENU")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="QR_MENU")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = fx.make_payment_method(db, is_cash=False)
         attempt = fx.make_payment_attempt(
@@ -731,7 +849,7 @@ class TestCheckout(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         db.commit()
         user = self._user()
@@ -747,7 +865,7 @@ class TestCheckout(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         method = fx.make_payment_method(db, is_cash=True)
         confirmado = fx.make_payment_attempt(db, order, method, status="confirmado")
@@ -802,7 +920,7 @@ class TestCheckout(unittest.TestCase):
 
         category = fx.make_category(db)
         variant = fx.make_variant(db, product=fx.make_product(db, category=category))
-        order = fx.make_customer_order(db, ts, status="abierta")
+        order = fx.make_customer_order(db, ts, status="pendiente")
         fx.make_order_item(db, order, variant)
         db.commit()
 
@@ -815,7 +933,7 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(ts.status, "closed")
         self.assertIsNone(ts.closed_by_user_id)
         db.refresh(order)
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "pendiente")
         db.refresh(participant)
         self.assertEqual(participant.status, "closed")
 
@@ -823,15 +941,17 @@ class TestCheckout(unittest.TestCase):
 
     def test_release_table_409_con_ordenes_activas_y_libera_sin_ellas(self):
         """CONGELA comportamiento actual (`checkout.release_table:528+`,
-        spec.md Historia 2, escenario 6): mesa con órdenes activas sin
-        cerrar → 409 con el detalle de las órdenes bloqueantes, sin liberar
-        la mesa; sin órdenes activas → la mesa queda 'libre' y sus sesiones
-        'active' se cierran en cascada (`close_table_sessions`,
+        spec.md Historia 2, escenario 6), criterio de bloqueo reescrito spec
+        147 (FR-016, ya no existe 'pagada'): mesa con órdenes activas
+        ('pendiente', o 'entregada'+'UNPAID') sin cerrar → 409 con el detalle
+        de las órdenes bloqueantes, sin liberar la mesa; sin órdenes activas
+        (orden 'entregada'+'PAID', cerrada) → la mesa queda 'libre' y sus
+        sesiones 'active' se cierran en cascada (`close_table_sessions`,
         `close_participants`)."""
         db = fx.new_session()
         table = fx.make_dining_table(db, status="ocupada")
         ts = fx.make_table_session(db, table=table)
-        order = fx.make_customer_order(db, ts, status="abierta")
+        order = fx.make_customer_order(db, ts, status="pendiente")
         db.commit()
 
         with self.assertRaises(HTTPException) as ctx:
@@ -840,7 +960,8 @@ class TestCheckout(unittest.TestCase):
         db.refresh(table)
         self.assertEqual(table.status, "ocupada")
 
-        order.status = "pagada"
+        order.status = "entregada"
+        order.payment_status = "PAID"
         db.commit()
 
         result = checkout.release_table(db, table.id, closed_by=self._user())
@@ -881,7 +1002,7 @@ class TestCheckout(unittest.TestCase):
     # -------------------------------------------------- checkout_and_send (T020)
 
     def _seed_hold_order_con_receta(self, *, stock=Decimal("1000"), recipe_qty=Decimal("2")):
-        """Mesa ocupada + sesión + orden 'recibida' (como si hubiera nacido con
+        """Mesa ocupada + sesión + orden 'pendiente' (como si hubiera nacido con
         `hold_for_payment=True`, T013), con una variante con receta y turno de
         caja abierto listo para cobrar."""
         db = fx.new_session()
@@ -892,7 +1013,7 @@ class TestCheckout(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=stock)
         fx.make_recipe_item(db, variant, insumo, quantity=recipe_qty)
-        order = fx.make_customer_order(db, ts, status="recibida", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
@@ -905,13 +1026,14 @@ class TestCheckout(unittest.TestCase):
 
     def test_checkout_and_send_cobra_descuenta_y_abre_a_cocina(self):
         """Comportamiento nuevo (spec 028, T016), estado ampliado por spec 035
-        (A-52, `registro-de-anomalias.md`): orden 'recibida' (nacida con
-        `hold_for_payment=True`) + turno de caja abierto → `checkout_and_send`
-        cobra (crea el `Sale`), descuenta inventario, y pasa la orden a
-        'pagada' — todo en una sola llamada, sin pasar por
-        `OrderPaymentAttempt` (eso es exclusivo del flujo QR). Antes de spec
-        035 quedaba en 'abierta' pese a ya tener venta; ver research.md
-        Decisión 1."""
+        (A-52, `registro-de-anomalias.md`), status reescrito spec 147: orden
+        'pendiente' (nacida con `hold_for_payment=True`) + turno de caja
+        abierto → `checkout_and_send` cobra (crea el `Sale`), descuenta
+        inventario, y marca `payment_status='PAID'` — todo en una sola
+        llamada, sin pasar por `OrderPaymentAttempt` (eso es exclusivo del
+        flujo QR). `status` no se toca (FR-003/FR-004): sigue 'pendiente'
+        hasta la entrega, independiente del pago. Antes de spec 147 pasaba a
+        'pagada' de una vez (spec 035, revirtiendo research.md Decisión 1)."""
         s = self._seed_hold_order_con_receta()
         db, order, insumo = s["db"], s["order"], s["insumo"]
         shift, method = s["shift"], s["method"]
@@ -926,7 +1048,8 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(sale.total, PRECIO)
         self.assertEqual(sale.customer_name, "Consumidor Final")
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.status, "pendiente")
+        self.assertEqual(order.payment_status, "PAID")
         self.assertEqual(order.version, 1)
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
@@ -938,7 +1061,7 @@ class TestCheckout(unittest.TestCase):
     def test_checkout_and_send_orden_delivery_suma_el_valor_del_domicilio(self):
         """spec 056, FR-011: este es el camino real que sigue un pedido
         "Domicilio" creado desde la pantalla de creación manual
-        (`hold_for_payment=True` → 'recibida' → checkout_and_send)."""
+        (`hold_for_payment=True` → 'pendiente' → checkout_and_send)."""
         s = self._seed_hold_order_con_receta()
         db, order, shift, method = s["db"], s["order"], s["shift"], s["method"]
         order.order_type = "DELIVERY"
@@ -983,7 +1106,7 @@ class TestCheckout(unittest.TestCase):
 
     def test_checkout_and_send_stock_insuficiente_revierte_todo(self):
         """spec 028, T016: sin stock suficiente para descontar al enviar a
-        cocina, la transacción entera revierte — la orden sigue 'recibida' y
+        cocina, la transacción entera revierte — la orden sigue 'pendiente' y
         no queda ni venta ni movimiento de inventario a medias (mismo
         criterio de atomicidad que `_confirm_order_impl`, congelado en
         `test_confirm_order_descuenta_una_vez_y_stock_insuficiente_revierte`)."""
@@ -1001,7 +1124,7 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
         db.refresh(order)
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
         ventas = db.execute(
             select(Sale).where(Sale.customer_order_id == order.id)
         ).scalars().all()
@@ -1103,7 +1226,7 @@ class TestCheckout(unittest.TestCase):
         `extra_price=1000`) → total esperado $21.000 (FR-002), no $22.000.
         `compute_checkout_preview` y `confirm_cash_payment_attempt` (efectivo, "Pagos
         por confirmar") deben coincidir exactamente en ese total."""
-        s = self._seed_order_con_receta(order_status="recibida")
+        s = self._seed_order_con_receta(order_status="pendiente")
         db, order, variant = s["db"], s["order"], s["variant"]
         group = fx.make_option_group(
             db, selection_mode="cantidad", pricing_type="incluido", min_select=0, max_select=1,
@@ -1176,7 +1299,7 @@ class TestVigenciaCongelada(unittest.TestCase):
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
         order = fx.make_customer_order(
-            db, ts, status="recibida", channel="POS",
+            db, ts, status="pendiente", channel="POS",
             promotion_evaluated_at=promo_evaluated_at,
         )
         fx.make_order_item(db, order, variant, quantity=qty, estado_cocina="pendiente")
@@ -1266,7 +1389,7 @@ class TestVigenciaCongelada(unittest.TestCase):
         # El NULL real es para las ventas de mostrador directas (`sales/service`)
         # o el histórico; se caracteriza en `test_orders_checkout` sobre
         # `build_sale` sin el kwarg — aquí basta con no romper el camino.
-        order.status = "bloqueada"
+        # Spec 147: `pay_order` ya no exige ningún status intermedio.
         db.commit()
         sale = checkout.pay_order(
             db, order.id, PayIn(cash_shift_id=shift.id, payments=[self._pago(method.id, Decimal("8000"))]),

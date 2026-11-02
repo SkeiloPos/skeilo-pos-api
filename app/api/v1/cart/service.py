@@ -9,7 +9,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -85,8 +85,25 @@ from app.core.timezone import utc_now_naive
 #: Estados no terminales de `CustomerOrder` — mientras el comensal tenga una
 #: orden en alguno de estos, no puede crear otra (spec 024, FR-005/FR-006;
 #: research.md spec 024, Decisión 8, mismo criterio de "terminal" que ya usa
-#: `checkout.TERMINAL`/`mark_order_ready`).
-_NON_TERMINAL_ORDER_STATUSES = ("recibida", "abierta", "bloqueada")
+#: `checkout.TERMINAL`/`mark_order_ready`). Spec 147: colapsado a 2 estados;
+#: `'confirmado'` se agregó después (a pedido del usuario, paso de recepción
+#: explícito entre `'pendiente'` y `'entregada'`) y cuenta igual que
+#: `'pendiente'` -- ninguno de los dos es entrega ni pago.
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "confirmado", "entregada")
+
+#: "¿Esta orden cuenta como activa para el comensal?" — mismo criterio que
+#: `idx_active_order_per_participant` (`models/customer_order.py`, spec 147
+#: "Corrección post-implementación"): `'pendiente'`/`'confirmado'` siempre
+#: cuentan, pero `'entregada'` solo cuenta mientras siga `'UNPAID'`; una
+#: `'entregada'` ya `'PAID'` está cerrada y no debe bloquear un pedido nuevo
+#: del mismo comensal. Antes de esta corrección, `submit_cart` solo miraba
+#: `status` (sin `payment_status`) y por eso rechazaba con 409 pedidos nuevos
+#: de comensales con una cuenta ya entregada y pagada (bug reportado en
+#: producción).
+_ACTIVE_ORDER_CLAUSE = or_(
+    CustomerOrder.status.in_(("pendiente", "confirmado")),
+    and_(CustomerOrder.status == "entregada", CustomerOrder.payment_status == "UNPAID"),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -670,15 +687,15 @@ def cancel_my_order(
     tenant_id: int | None = None,
     request_id: str | None = None,
 ) -> CustomerOrder:
-    """Cancelación por el propio comensal. Solo hasta que cocina empieza:
+    """Cancelación por el propio comensal. Solo hasta que cocina empieza
+    (spec 147: ya no hay paso intermedio por ítem -- solo `'pendiente'` y
+    `'entregado'`/`'cancelado'`):
 
-    - `recibida`: siempre, salvo que ya se haya "aceptado para cocina" sin
-      cobrar (`POST /orders/{id}/start-preparation`) -- ahí ya hay ítems
-      `en_preparacion` aunque el pago siga pendiente y `status` no se haya
-      movido de `recibida`;
-    - `abierta`: solo si **todos** sus ítems siguen `pendiente`;
-    - a partir de `en_preparacion` el insumo ya se combinó y la decisión de cuánto
-      se pierde es del staff, no del cliente.
+    - permitido solo si `status == 'pendiente'` **y** ningún ítem salió de
+      `'pendiente'` todavía;
+    - en cuanto un ítem queda `'entregado'` (la orden ya se entregó, aunque
+      sea parcialmente vía FR-002a) la decisión de cuánto se pierde es del
+      staff, no del cliente.
 
     Delega la política de inventario en `checkout.cancel_order`, que ya sabe qué
     revertir y qué contar como pérdida — y que emite el evento de auditoría
@@ -701,9 +718,9 @@ def cancel_my_order(
         )
     en_cocina = [
         it for it in order.items
-        if it.estado_cocina not in ("pendiente", "anulado")
+        if it.estado_cocina not in ("pendiente", "cancelado")
     ]
-    if en_cocina or order.status not in ("recibida", "abierta"):
+    if en_cocina or order.status not in ("pendiente",):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "El pedido ya está en preparación; pide al personal que lo cancele.",
@@ -796,7 +813,7 @@ def submit_cart(
     transfer_method_id: UUID | None = None,
 ) -> CustomerOrder:
     """Envía el carrito del comensal como pedido: crea una `CustomerOrder` en
-    estado `recibida` con sus líneas **y** su primer `OrderPaymentAttempt`, en
+    estado `pendiente` con sus líneas **y** su primer `OrderPaymentAttempt`, en
     una sola transacción (spec 025, contracts/submit-cart-with-payment.md).
     Antes de esta llamada no existe ningún registro del pedido — no hay
     ningún estado intermedio "sin pago" que el staff pueda ver
@@ -844,7 +861,7 @@ def submit_cart(
     active_order = db.execute(
         select(CustomerOrder.id).where(
             CustomerOrder.participant_id == participant.id,
-            CustomerOrder.status.in_(_NON_TERMINAL_ORDER_STATUSES),
+            _ACTIVE_ORDER_CLAUSE,
         )
     ).scalar_one_or_none()
 
@@ -1031,7 +1048,8 @@ def submit_cart(
             customer_name=participant.display_label or participant.display_name,
             channel="QR_MENU",
             order_type="DINE_IN",
-            status="recibida",
+            status="pendiente",
+            payment_status="UNPAID",
             user_id=None,  # lo envió el comensal, no un usuario del sistema
             cash_shift_id=cash_shift_id,
             table_order_number=table_order_number,
@@ -1257,7 +1275,7 @@ def create_payment_attempt(
     garantía última; este chequeo solo da un 409 con mensaje claro en vez de
     dejar que la violación de índice llegue como error crudo."""
     order = _load_own_order(db, participant_id, order_id)
-    if order.status != "recibida":
+    if order.status != "pendiente":
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f"La orden no admite un nuevo intento de pago (status={order.status})",

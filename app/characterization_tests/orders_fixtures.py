@@ -296,16 +296,22 @@ def make_customer_order(
     db: Session, table_session: TableSession, participant: SessionParticipant | None = None,
     **kw
 ) -> CustomerOrder:
-    """`kw.setdefault(status="abierta")` — ni recién recibido ni terminal,
-    cobrable de inmediato; los tests que ejercitan A-01/A-16/Historia 2 lo
-    sobreescriben explícitamente."""
+    """`kw.setdefault(status="pendiente")` (spec 147: `'abierta'` ya no
+    existe, y con solo 3 estados no hay forma de distinguir por status "recién
+    recibido" de "confirmado pero no entregado" -- ambos son `'pendiente'`
+    ahora. `'pendiente'` es además el único no-cancelada que no implica nada
+    sobre si ya se descontó inventario, igual que antes; `payment_status`
+    sigue en `'UNPAID'` por defecto, también cobrable de inmediato bajo
+    FR-004). Los tests que necesitan un pedido ya confirmado/entregado/pagado
+    lo sobreescriben explícitamente -- no asuman el default, decidan el
+    estado que su escenario necesita."""
     kw.setdefault("id", _uid())
     kw.setdefault("table_session_id", table_session.id)
     kw.setdefault("participant_id", participant.id if participant is not None else None)
     kw.setdefault("dining_table_id", table_session.dining_table_id)
     kw.setdefault("channel", "POS")
     kw.setdefault("order_type", "DINE_IN")
-    kw.setdefault("status", "abierta")
+    kw.setdefault("status", "pendiente")
     kw.setdefault("created_at", datetime.now())
     obj = CustomerOrder(**kw)
     db.add(obj)
@@ -314,14 +320,16 @@ def make_customer_order(
 
 
 def make_order_item(db: Session, order: CustomerOrder, variant: ProductVariant, **kw) -> OrderItem:
-    """`kw.setdefault(estado_cocina="listo")` — cobrable de inmediato; los tests
-    que ejercitan cocina en curso o ítems anulados lo sobreescriben."""
+    """`kw.setdefault(estado_cocina="pendiente")` (spec 147: `'listo'` ya no
+    existe; con solo 3 valores, `'pendiente'` es el único que no implica nada
+    sobre si el pedido ya se entregó o canceló). Los tests que ejercitan un
+    ítem ya entregado o cancelado lo sobreescriben explícitamente."""
     kw.setdefault("id", _uid())
     kw.setdefault("order_id", order.id)
     kw.setdefault("product_variant_id", variant.id)
     kw.setdefault("quantity", 1)
     kw.setdefault("unit_price", variant.price)
-    kw.setdefault("estado_cocina", "listo")
+    kw.setdefault("estado_cocina", "pendiente")
     obj = OrderItem(**kw)
     db.add(obj)
     db.flush()

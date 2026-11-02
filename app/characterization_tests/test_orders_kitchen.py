@@ -1,21 +1,15 @@
-"""Las 3 funciones públicas de `app/api/v1/orders/kitchen.py`
-(specs/017-caracterizacion-orders, Historia 3).
+"""`app/api/v1/orders/kitchen.py` (specs/017-caracterizacion-orders, Historia 3;
+reescrito spec 147, A-151).
 
-`transition_kitchen` sigue CONGELADA, independiente del status de pago de la
-orden a propósito (el flujo QR/mostrador vigente cobra antes de que cocina
-termine — bloquearla ahí rompería la operación diaria). `mark_order_ready` ya
-validaba parcialmente (**A-16**). `void_item` **dejó de estar congelada
-sobre un pedido ya pagado**: spec 029 (Historia 1, FR-005/006/007) cierra la
-porción `ACCIDENTAL` de A-16 para esta función — anular ya no se permite una
-vez existe un pago registrado (`status == "pagada"` o ya existe una `Sale`
-asociada, ver `research.md` D3 de esa spec) — decisión de negocio explícita,
-no un olvido corregido en silencio.
-
-Documenta también que las transiciones internas de las tres están cerradas a
-una lista blanca sin vía genérica de asignación libre (**A-25 [PROTEGIDA]**),
-invariante que también verifica sobre las otras cuatro funciones públicas de
-`checkout.py` que mutan estado (`block_order`, `confirm_order`, `pay_order`,
-`cancel_order`).
+Spec 147 retira `transition_kitchen`/`_ALLOWED`, `mark_order_ready` y
+`accept_order_for_kitchen` (FR-002/research.md R4): la entrega por ítem
+individual deja de existir, sustituida por la acción única
+`kitchen.deliver_order` (idempotente, FR-001/FR-002a/FR-011). Los tests de
+esas tres funciones retiradas se eliminan aquí (no se comentan ni se dejan en
+rojo) — este módulo pasa a cubrir `deliver_order` y mantiene `void_item`,
+adaptado a `estado_cocina == "cancelado"` (antes `"anulado"`) y al nuevo
+criterio de "pedido ya cobrado" (`payment_status == "PAID"`, ya no
+`status == "pagada"`, que no existe).
 
 Ejecutar solo este módulo:
 
@@ -23,13 +17,14 @@ Ejecutar solo este módulo:
 """
 from decimal import Decimal
 import unittest
+from unittest import mock
 
 from fastapi import HTTPException
 
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.catalog.schemas import OptionSelectionIn
 from app.api.v1.orders import checkout, kitchen
-from app.api.v1.orders.schemas import BlockIn, CancelIn, KitchenTransitionIn, OrderItemIn, PayIn, VoidItemIn
+from app.api.v1.orders.schemas import BlockIn, CancelIn, OrderItemIn, PayIn, VoidItemIn
 from app.api.v1.sales.schemas import PaymentIn
 from app.models.sale import Sale
 
@@ -39,7 +34,7 @@ PRECIO = Decimal("10000")
 class TestKitchen(unittest.TestCase):
     # ------------------------------------------------------------- Helpers
 
-    def _seed_item(self, *, order_status="abierta", estado_cocina="pendiente"):
+    def _seed_item(self, *, order_status="pendiente", estado_cocina="pendiente", payment_status="UNPAID"):
         db = fx.new_session()
         ts = fx.make_table_session(db)
         category = fx.make_category(db)
@@ -47,7 +42,9 @@ class TestKitchen(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
-        order = fx.make_customer_order(db, ts, status=order_status, channel="POS")
+        order = fx.make_customer_order(
+            db, ts, status=order_status, payment_status=payment_status, channel="POS",
+        )
         item = fx.make_order_item(db, order, variant, estado_cocina=estado_cocina)
         db.commit()
         return dict(db=db, ts=ts, order=order, item=item, variant=variant, insumo=insumo)
@@ -55,56 +52,132 @@ class TestKitchen(unittest.TestCase):
     def _user(self):
         return fx.make_user_double()
 
-    # ------------------------------------------------- transition_kitchen (T035)
+    # ------------------------------------------------------ deliver_order (spec 147)
 
-    def test_transition_kitchen_salto_directo_y_retroceso_rechazado(self):
-        """CONGELA comportamiento actual — A-25 [PROTEGIDA]
-        (`kitchen.py:43-60`, spec.md Historia 3, escenario 1): un ítem
-        'pendiente' salta directo a 'listo' (el botón de un toque de la
-        terminal); un ítem 'listo' que intenta retroceder a 'pendiente'
-        responde 409 — la lista blanca `_ALLOWED` solo permite avanzar."""
-        s = self._seed_item(estado_cocina="pendiente")
-        db, item = s["db"], s["item"]
+    def test_deliver_order_pasa_pedido_e_items_pendientes_a_entregado(self):
+        """Comportamiento NUEVO (spec 147, FR-001): pedido `'pendiente'` con
+        ítems `'pendiente'` → una sola llamada a `deliver_order` deja el
+        pedido `'entregada'` y todos sus ítems `'entregado'`, sin tocar
+        `payment_status` (FR-003)."""
+        s = self._seed_item(order_status="pendiente", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
 
-        actualizado = kitchen.transition_kitchen(
-            db, item.id, KitchenTransitionIn(estado_cocina="listo")
-        )
-        self.assertEqual(actualizado.estado_cocina, "listo")
+        with mock.patch("app.core.events.order_delivered") as publicar:
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.status, "entregada")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+        self.assertTrue(all(it.estado_cocina == "entregado" for it in actualizado.items))
+
+    def test_deliver_order_409_si_cancelada(self):
+        """FR-010: un pedido `'cancelada'` rechaza la entrega como transición
+        inválida."""
+        s = self._seed_item(order_status="cancelada", estado_cocina="cancelado")
+        db, order = s["db"], s["order"]
 
         with self.assertRaises(HTTPException) as ctx:
-            kitchen.transition_kitchen(db, item.id, KitchenTransitionIn(estado_cocina="pendiente"))
+            kitchen.deliver_order(db, order.id, tenant_id=1)
         self.assertEqual(ctx.exception.status_code, 409)
 
-    # ----------------------------- transition_kitchen ignora orden (T036, sin cambios)
+    def test_deliver_order_es_idempotente_sin_segundo_evento(self):
+        """FR-011/SC-006: entregar un pedido ya `'entregada'` sin ítems
+        `'pendiente'` nuevos es un no-op exitoso -- no cambia nada y no emite
+        un segundo `order_delivered`."""
+        s = self._seed_item(order_status="entregada", estado_cocina="entregado")
+        db, order = s["db"], s["order"]
 
-    def test_transition_kitchen_no_valida_status_de_la_orden_a16(self):
-        """CONGELA comportamiento actual — A-16 (`kitchen.py:43-60`, spec.md
-        Historia 3, escenario 2): orden ya 'pagada' con ítems aún 'pendiente'
-        → `transition_kitchen` se ejecuta igual, sin ningún error por el
-        status de la orden padre. Sin cambios por spec 029 — bloquear esto
-        rompería el flujo QR/mostrador vigente, donde cocina sigue avanzando
-        ítems después de que el pago ya se registró (ver docstring del
-        módulo)."""
-        s = self._seed_item(order_status="pagada", estado_cocina="pendiente")
-        db, item = s["db"], s["item"]
+        with mock.patch("app.core.events.order_delivered") as publicar:
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1)
+            publicar.assert_not_called()
 
-        actualizado = kitchen.transition_kitchen(
-            db, item.id, KitchenTransitionIn(estado_cocina="en_preparacion")
-        )
-        self.assertEqual(actualizado.estado_cocina, "en_preparacion")
+        self.assertEqual(actualizado.status, "entregada")
+        self.assertTrue(all(it.estado_cocina == "entregado" for it in actualizado.items))
 
-    # ------------------------ void_item ya no anula un pedido pagado (spec 029)
+    def test_deliver_order_re_entrega_fr002a_promueve_solo_el_item_nuevo(self):
+        """FR-002a: un pedido ya `'entregada'` puede recibir un ítem nuevo
+        (nace `'pendiente'`); una segunda `deliver_order` lo promueve sin
+        tocar los ítems ya `'entregado'`, y SÍ emite un segundo evento (hubo
+        un cambio real)."""
+        s = self._seed_item(order_status="entregada", estado_cocina="entregado")
+        db, order, variant = s["db"], s["order"], s["variant"]
+        nuevo = fx.make_order_item(db, order, variant, estado_cocina="pendiente")
+        db.commit()
 
-    def test_void_item_409_si_orden_pagada_spec_029_a16(self):
-        """Comportamiento NUEVO (spec 029, Historia 1, FR-005/006/007 —
-        cierra la porción ACCIDENTAL de A-16 para esta función): orden ya
-        'pagada' con un ítem aún 'pendiente' → `void_item` responde 409 en
-        vez de anular, sin mutar el ítem ni registrar `OrderItemVoidLog`.
-        Antes de esta spec se comportaba igual que `transition_kitchen`
-        (test anterior) — ahora se distingue a propósito, porque anular es
-        una reversa de mercancía ya entregada/cobrada, no una transición de
-        cocina."""
-        s = self._seed_item(order_status="pagada", estado_cocina="pendiente")
+        with mock.patch("app.core.events.order_delivered") as publicar:
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.status, "entregada")
+        nuevo_actualizado = next(it for it in actualizado.items if it.id == nuevo.id)
+        self.assertEqual(nuevo_actualizado.estado_cocina, "entregado")
+
+    # ------------------------------------------------- receive_order (a pedido del usuario)
+
+    def test_receive_order_pasa_pendiente_a_confirmado_sin_tocar_cocina_ni_pago(self):
+        """A pedido del usuario: "Recibir" solo mueve `status`, nunca
+        `estado_cocina` ni `payment_status`."""
+        s = self._seed_item(order_status="pendiente", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        with mock.patch("app.core.events.order_received") as publicar:
+            actualizado = kitchen.receive_order(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.status, "confirmado")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+        self.assertTrue(all(it.estado_cocina == "pendiente" for it in actualizado.items))
+
+    def test_receive_order_409_si_cancelada(self):
+        s = self._seed_item(order_status="cancelada", estado_cocina="cancelado")
+        db, order = s["db"], s["order"]
+
+        with self.assertRaises(HTTPException) as ctx:
+            kitchen.receive_order(db, order.id, tenant_id=1)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_receive_order_es_idempotente_sin_segundo_evento(self):
+        s = self._seed_item(order_status="confirmado", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        with mock.patch("app.core.events.order_received") as publicar:
+            actualizado = kitchen.receive_order(db, order.id, tenant_id=1)
+            publicar.assert_not_called()
+
+        self.assertEqual(actualizado.status, "confirmado")
+
+    def test_receive_order_no_op_si_ya_entregada(self):
+        """Recibir un pedido que ya avanzó a `'entregada'` (p. ej. "Entregar"
+        directo desde `'pendiente'`, sin pasar por "Recibir") no lo retrocede."""
+        s = self._seed_item(order_status="entregada", estado_cocina="entregado")
+        db, order = s["db"], s["order"]
+
+        actualizado = kitchen.receive_order(db, order.id, tenant_id=1)
+        self.assertEqual(actualizado.status, "entregada")
+
+    def test_deliver_order_acepta_confirmado_como_origen(self):
+        """A pedido del usuario: `deliver_order` entrega igual desde
+        `'confirmado'`, no solo desde `'pendiente'`."""
+        s = self._seed_item(order_status="confirmado", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        with mock.patch("app.core.events.order_delivered") as publicar:
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.status, "entregada")
+        self.assertTrue(all(it.estado_cocina == "entregado" for it in actualizado.items))
+
+    # ------------------------ void_item ya no anula un pedido pagado (spec 029/147)
+
+    def test_void_item_409_si_payment_status_paid_spec_029_147(self):
+        """Comportamiento NUEVO (spec 029, Historia 1, FR-005/006/007;
+        criterio reescrito spec 147): pedido con `payment_status == 'PAID'` y
+        un ítem aún `'pendiente'` → `void_item` responde 409 en vez de
+        anular, sin mutar el ítem ni registrar `OrderItemVoidLog`. Antes de
+        spec 147 esto se leía de `status == 'pagada'`; ese valor ya no
+        existe, el pago es independiente del status."""
+        s = self._seed_item(order_status="entregada", payment_status="PAID", estado_cocina="pendiente")
         db, item = s["db"], s["item"]
         user = self._user()
 
@@ -114,13 +187,13 @@ class TestKitchen(unittest.TestCase):
         db.refresh(item)
         self.assertEqual(item.estado_cocina, "pendiente")
 
-    def test_void_item_409_si_orden_abierta_con_sale_camino_qr_mostrador_spec_029(self):
+    def test_void_item_409_si_sale_existe_pero_payment_status_no_se_actualizo_spec_029(self):
         """Comportamiento NUEVO (spec 029): el caso real que motivó la spec,
-        distinto del anterior — `checkout_and_send`/`_confirm_order_impl`
-        dejan la orden en `status="abierta"` a propósito, con la `Sale` ya
-        emitida (nunca llega a `"pagada"`). `void_item` debe rechazar igual,
-        reconociendo el pago por la `Sale` asociada, no por `status`."""
-        s = self._seed_item(order_status="abierta", estado_cocina="listo")
+        distinto del anterior -- un camino QR/mostrador legado puede dejar la
+        `Sale` emitida sin que `payment_status` llegara a `'PAID'` (D2/D3 de
+        research.md). `void_item` debe rechazar igual, reconociendo el pago
+        por la `Sale` asociada, no solo por `payment_status`."""
+        s = self._seed_item(order_status="entregada", payment_status="UNPAID", estado_cocina="entregado")
         db, item, order = s["db"], s["item"], s["order"]
         shift = fx.make_cash_shift(db)
         cashier = fx.make_user_double()
@@ -136,81 +209,18 @@ class TestKitchen(unittest.TestCase):
             kitchen.void_item(db, item.id, VoidItemIn(motivo="prueba"), cashier)
         self.assertEqual(ctx.exception.status_code, 409)
         db.refresh(item)
-        self.assertEqual(item.estado_cocina, "listo")
+        self.assertEqual(item.estado_cocina, "entregado")
 
-    # ---------------------------------------------- mark_order_ready valida (T037)
-
-    def test_mark_order_ready_409_si_orden_pagada_contraste_a16(self):
-        """CONGELA comportamiento actual — A-16 (`kitchen.py:63-90`, spec.md
-        Historia 3, escenario 3): la misma orden 'pagada' con ítems
-        'pendiente' → `mark_order_ready` sí responde 409 citando que la
-        orden ya es terminal, a diferencia de `transition_kitchen`/
-        `void_item` (T036)."""
-        s = self._seed_item(order_status="pagada", estado_cocina="pendiente")
-        db, order = s["db"], s["order"]
-
-        with self.assertRaises(HTTPException) as ctx:
-            kitchen.mark_order_ready(db, order.id)
-        self.assertEqual(ctx.exception.status_code, 409)
-
-    # ------------------------------------- mark_order_ready sí pasa en bloqueada (T038)
-
-    def test_mark_order_ready_pasa_items_en_orden_bloqueada(self):
-        """CONGELA comportamiento actual (`kitchen.py:63-90`, spec.md
-        Historia 3, escenario 4): orden 'bloqueada' (no terminal de pago)
-        con ítems en curso → `mark_order_ready` los pasa a 'listo' sin
-        error — la validación bloquea solo 'pagada'/'cancelada', no
-        'bloqueada' (la porción pendiente de A-16)."""
-        s = self._seed_item(order_status="bloqueada", estado_cocina="en_preparacion")
-        db, order = s["db"], s["order"]
-
-        actualizada, cambiados = kitchen.mark_order_ready(db, order.id)
-        self.assertEqual(len(cambiados), 1)
-        self.assertTrue(all(it.estado_cocina == "listo" for it in cambiados))
-
-    # --------------------------------------- accept_order_for_kitchen (nuevo)
-
-    def test_accept_order_for_kitchen_pasa_pendientes_a_en_preparacion_sin_tocar_status(self):
-        """`accept_order_for_kitchen` ("Aceptar pedido" sin cobrar): mueve los
-        ítems `pendiente` a `en_preparacion` en bloque, sin tocar
-        `CustomerOrder.status` -- el pedido sigue `recibida`, sin descontar
-        inventario ni generar venta. Es la pieza nueva que permite que cocina
-        empiece mientras el pago sigue pendiente de revisión."""
-        s = self._seed_item(order_status="recibida", estado_cocina="pendiente")
-        db, order = s["db"], s["order"]
-
-        actualizada, cambiados = kitchen.accept_order_for_kitchen(db, order.id)
-        self.assertEqual(len(cambiados), 1)
-        self.assertEqual(cambiados[0].estado_cocina, "en_preparacion")
-        self.assertEqual(actualizada.status, "recibida")
-
-    def test_accept_order_for_kitchen_es_idempotente(self):
-        """Una segunda llamada sin ítems `pendiente` que mover no falla --
-        devuelve la orden sin cambios, igual que `mark_order_ready`."""
-        s = self._seed_item(order_status="recibida", estado_cocina="en_preparacion")
-        db, order = s["db"], s["order"]
-
-        actualizada, cambiados = kitchen.accept_order_for_kitchen(db, order.id)
-        self.assertEqual(cambiados, [])
-        self.assertEqual(actualizada.status, "recibida")
-
-    def test_accept_order_for_kitchen_409_si_orden_pagada_o_cancelada(self):
-        """Mismo guard que `mark_order_ready`: una orden ya terminal rechaza
-        la aceptación."""
-        for terminal_status in ("pagada", "cancelada"):
-            s = self._seed_item(order_status=terminal_status, estado_cocina="pendiente")
-            with self.assertRaises(HTTPException) as ctx:
-                kitchen.accept_order_for_kitchen(s["db"], s["order"].id)
-            self.assertEqual(ctx.exception.status_code, 409)
-
-    # ------------------------------------------------------------ void_item (T039)
+    # ------------------------------------------------------------ void_item (T039 original)
 
     def test_void_item_anula_y_reemplaza_con_reversa_y_nuevo_descuento(self):
-        """CONGELA comportamiento actual (`kitchen.py:93-176`, spec.md
-        Historia 3, escenario 5): ítem 'pendiente' con `data.replacement`
-        válido → el original queda 'anulado' (con reversa de inventario, por
-        ser 'pendiente') y se crea uno nuevo 'pendiente' con `void_de`
-        apuntando al original y su propio descuento de inventario."""
+        """CONGELA comportamiento actual (`kitchen.py`, spec.md Historia 3,
+        escenario 5; literal `estado_cocina` reescrito spec 147,
+        `'anulado'` → `'cancelado'`): ítem `'pendiente'` con
+        `data.replacement` válido → el original queda `'cancelado'` (con
+        reversa de inventario, por ser `'pendiente'`) y se crea uno nuevo
+        `'pendiente'` con `void_de` apuntando al original y su propio
+        descuento de inventario."""
         from sqlalchemy import select
         from app.models.inventory_movement import InventoryMovement
 
@@ -229,7 +239,7 @@ class TestKitchen(unittest.TestCase):
         )
 
         original = next(it for it in resultado.items if it.id == item.id)
-        self.assertEqual(original.estado_cocina, "anulado")
+        self.assertEqual(original.estado_cocina, "cancelado")
 
         nuevo = next(it for it in resultado.items if it.void_de == item.id)
         self.assertEqual(nuevo.estado_cocina, "pendiente")
@@ -278,52 +288,39 @@ class TestKitchen(unittest.TestCase):
         self.assertEqual(nuevo.line_total, PRECIO * 2 + Decimal("1000"))
         self.assertTrue(nuevo.options[0].per_line)
 
-    # ----------------------------------- invariante A-25 [PROTEGIDA] de referencia (T040)
+    # ----------------------------- invariante A-25 [PROTEGIDA] de referencia
 
     def test_a25_protegida_ninguna_funcion_acepta_transicion_fuera_de_su_lista_blanca(self):
-        """CONGELA comportamiento actual — A-25 [PROTEGIDA] (spec.md Historia
-        3, escenario 6): de las siete funciones públicas de estos cinco
-        ficheros que mutan `status`/`estado_cocina` (`block_order`,
-        `confirm_order`, `pay_order`, `cancel_order`, `transition_kitchen`,
-        `mark_order_ready`, `void_item`), cada una impone su propia
-        transición validada — ninguna acepta una arbitraria sin pasar por su
-        propia guarda. Este test es de referencia: reutiliza los casos ya
-        congelados en test_orders_checkout.py (T022, T026, T028, T029) y
-        arriba (T035, T037, T039), verificando el contraste directo aquí
-        para las tres funciones de `kitchen.py`."""
-        # transition_kitchen: 'anulado' no está en ningún valor de _ALLOWED.
-        s = self._seed_item(estado_cocina="anulado")
-        db, item = s["db"], s["item"]
-        with self.assertRaises(HTTPException) as ctx:
-            kitchen.transition_kitchen(db, item.id, KitchenTransitionIn(estado_cocina="listo"))
-        self.assertEqual(ctx.exception.status_code, 409)
-
-        # mark_order_ready: orden ya 'cancelada' es terminal.
-        s2 = self._seed_item(order_status="cancelada", estado_cocina="pendiente")
-        with self.assertRaises(HTTPException) as ctx2:
-            kitchen.mark_order_ready(s2["db"], s2["order"].id)
-        self.assertEqual(ctx2.exception.status_code, 409)
-
-        # void_item: un ítem ya anulado no se puede volver a anular.
-        s3 = self._seed_item(estado_cocina="anulado")
+        """CONGELA comportamiento actual -- A-25 [PROTEGIDA] (spec.md
+        Historia 3, escenario 6), adaptado spec 147: de las cinco funciones
+        públicas que mutan `status`/`estado_cocina`/`payment_status`
+        (`block_order`, `confirm_order`, `pay_order`, `cancel_order`,
+        `void_item` -- `deliver_order`/`transition_kitchen`/
+        `mark_order_ready` ya tienen su propio test de rechazo arriba o
+        fueron retirados), cada una impone su propia transición validada
+        sobre el modelo de 3 estados."""
+        # void_item: un ítem ya cancelado no se puede volver a cancelar.
+        s3 = self._seed_item(estado_cocina="cancelado")
         with self.assertRaises(HTTPException) as ctx3:
             kitchen.void_item(s3["db"], s3["item"].id, VoidItemIn(motivo="x"), self._user())
         self.assertEqual(ctx3.exception.status_code, 409)
 
-        # block_order: orden 'bloqueada' no puede volver a bloquearse.
-        s4 = self._seed_item(order_status="bloqueada", estado_cocina="listo")
+        # block_order: orden ya 'cancelada' es transición inválida (spec 147
+        # retiró el status intermedio 'bloqueada' y el gate de cocina, FR-004).
+        s4 = self._seed_item(order_status="cancelada", estado_cocina="cancelado")
         with self.assertRaises(HTTPException) as ctx4:
             checkout.block_order(s4["db"], s4["order"].id, BlockIn(version=0))
         self.assertEqual(ctx4.exception.status_code, 409)
 
-        # confirm_order: orden 'abierta' no está en 'recibida'.
-        s5 = self._seed_item(order_status="abierta", estado_cocina="listo")
+        # confirm_order: orden 'entregada' no está en 'pendiente' (antes: 'abierta').
+        s5 = self._seed_item(order_status="entregada", estado_cocina="entregado")
         with self.assertRaises(HTTPException) as ctx5:
             checkout.confirm_order(s5["db"], s5["order"].id, self._user())
         self.assertEqual(ctx5.exception.status_code, 409)
 
-        # pay_order: orden 'abierta' no está 'bloqueada'.
-        s6 = self._seed_item(order_status="abierta", estado_cocina="listo")
+        # pay_order: orden 'cancelada' es transición inválida (spec 147: ya
+        # no depende de 'bloqueada', FR-004/FR-010).
+        s6 = self._seed_item(order_status="cancelada", estado_cocina="cancelado")
         db6, order6 = s6["db"], s6["order"]
         register = fx.make_cash_register(db6)
         shift = fx.make_cash_shift(db6, register=register)
@@ -337,8 +334,9 @@ class TestKitchen(unittest.TestCase):
             )
         self.assertEqual(ctx6.exception.status_code, 409)
 
-        # cancel_order: orden ya 'pagada' es terminal.
-        s7 = self._seed_item(order_status="pagada", estado_cocina="listo")
+        # cancel_order: orden ya 'entregada'+'PAID' requiere reembolso, fuera
+        # de alcance (spec 147, FR-009) -- ya no existe 'pagada'.
+        s7 = self._seed_item(order_status="entregada", payment_status="PAID", estado_cocina="entregado")
         with self.assertRaises(HTTPException) as ctx7:
             checkout.cancel_order(s7["db"], s7["order"].id, CancelIn(motivo="x"), self._user())
         self.assertEqual(ctx7.exception.status_code, 409)
@@ -362,7 +360,7 @@ class TestVoidItemRevertsDiscounts118(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=Decimal("7000"))
         insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         promo = fx.make_promotion(db)
         fx.add_rule_to_promotion(
             db, promo, type="package_price", value=Decimal("12000"), min_qty=2,

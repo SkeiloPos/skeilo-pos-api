@@ -75,8 +75,9 @@ def get_or_create_table_session_id(db: Session, table_id: UUID) -> UUID:
 
 
 def get_or_create_open_order(db: Session, table_id: UUID, user_id: UUID) -> CustomerOrder:
-    """Pedido `abierta` de la mesa donde acumular las líneas del mesero, creándolo
-    si no hay ninguno (p.ej. porque el único está `bloqueada` en cobro).
+    """Pedido `pendiente` de la mesa donde acumular las líneas del mesero,
+    creándolo si no hay ninguno (spec 147: ya no existe `'abierta'` — todo
+    pedido editable por el mesero, antes de "Entregar", es `'pendiente'`).
 
     Ya no existe el índice único de "una orden abierta por mesa": la mesa puede
     tener varios pedidos a la vez (uno por comensal). Este helper solo agrupa las
@@ -87,7 +88,7 @@ def get_or_create_open_order(db: Session, table_id: UUID, user_id: UUID) -> Cust
         select(CustomerOrder)
         .where(
             CustomerOrder.dining_table_id == table_id,
-            CustomerOrder.status == "abierta",
+            CustomerOrder.status == "pendiente",
             CustomerOrder.channel == "POS",
             CustomerOrder.is_consolidation_order.is_(True),
         )
@@ -102,7 +103,7 @@ def get_or_create_open_order(db: Session, table_id: UUID, user_id: UUID) -> Cust
             channel="POS",
             order_type="DINE_IN",
             is_consolidation_order=True,
-            status="abierta",
+            status="pendiente",
             user_id=user_id,
         )
         db.add(order)
@@ -221,7 +222,9 @@ def add_item_to_order(
     spec 087 (FR-008/FR-009, A-85): reemplaza a `add_item_to_table` -- con
     pedidos paralelos por mesa (FR-007) ya no hay una única "orden abierta de
     la mesa" que resolver de forma implícita; el llamador siempre identifica el
-    pedido exacto al que anexa. Un pedido `pagada`/`cancelada` rechaza el anexo.
+    pedido exacto al que anexa. Un pedido cerrado (`'entregada'`+`'PAID'`) o
+    `cancelada` rechaza el anexo (criterio reescrito spec 147: ya no existe
+    `status == 'pagada'`, el pago es independiente del status).
 
     spec 063 (FR-024): el mecanismo de combo se retira; `combo_id` ya no llega.
 
@@ -230,7 +233,9 @@ def add_item_to_order(
     `orders.toppings.add_topping_to_order_item`; resuelto en esta MISMA transacción
     en vez de con una llamada aparte por adición (N+1 evitable)."""
     order = get_or_404(db, CustomerOrder, order_id, "Order not found")
-    if order.status in ("pagada", "cancelada"):
+    if order.status == "cancelada" or (
+        order.status == "entregada" and order.payment_status == "PAID"
+    ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "Este pedido ya está pagado o cancelado; crea un pedido nuevo.",

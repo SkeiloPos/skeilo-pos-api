@@ -99,8 +99,8 @@ def _sesion_de_mesa(db, instante):
     ts = fx.make_table_session(db, table=table)
     ana = fx.make_participant(db, table_session=ts, display_name="Ana", display_label="Ana")
     variant, _ = _catalogo(db)
-    order = fx.make_customer_order(db, ts, status="abierta", promotion_evaluated_at=instante)
-    fx.make_order_item(db, order, variant, quantity=2, participant_id=ana.id, estado_cocina="listo")
+    order = fx.make_customer_order(db, ts, status="entregada", promotion_evaluated_at=instante)
+    fx.make_order_item(db, order, variant, quantity=2, participant_id=ana.id, estado_cocina="entregado")
     shift = fx.make_cash_shift(db, register=fx.make_cash_register(db))
     efectivo = fx.make_payment_method(db, name="Efectivo", is_cash=True)
     db.commit()
@@ -148,8 +148,8 @@ def _mesas_fusionadas(zona, instante) -> Decimal:
     pedidos = []
     for _ in range(2):
         ts = fx.make_table_session(db, table=fx.make_dining_table(db, status="ocupada"))
-        order = fx.make_customer_order(db, ts, status="abierta", promotion_evaluated_at=instante)
-        fx.make_order_item(db, order, variant, quantity=2, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="entregada", promotion_evaluated_at=instante)
+        fx.make_order_item(db, order, variant, quantity=2, estado_cocina="entregado")
         pedidos.append(order)
     db.commit()
     group_id = tables_advanced.merge_orders(db, [o.id for o in pedidos])["merged_group_id"]
@@ -158,13 +158,13 @@ def _mesas_fusionadas(zona, instante) -> Decimal:
 
 
 def _pedido_qr(instante, *, metodo, mixto=False):
-    """Pedido de comensal por QR en `recibida` con su instante congelado y un intento de pago pendiente."""
+    """Pedido de comensal por QR en `pendiente` con su instante congelado y un intento de pago pendiente."""
     db = fx.new_session()
     ts = fx.make_table_session(db, table=fx.make_dining_table(db))
     participant = fx.make_participant(db, table_session=ts)
     variant, _ = _catalogo(db)
     order = fx.make_customer_order(
-        db, ts, participant=participant, status="recibida", channel="QR_MENU", promotion_evaluated_at=instante,
+        db, ts, participant=participant, status="pendiente", channel="QR_MENU", promotion_evaluated_at=instante,
     )
     fx.make_order_item(db, order, variant, quantity=2, estado_cocina="pendiente")
     kw = {}
@@ -264,8 +264,8 @@ class TestHoraRepetidaDeMadrid(unittest.TestCase):
                 db = fx.new_session()
                 variant, _ = _catalogo(db, desde=time(2, 0), hasta=time(3, 0))
                 ts = fx.make_table_session(db, table=fx.make_dining_table(db, status="ocupada"))
-                order = fx.make_customer_order(db, ts, status="abierta", promotion_evaluated_at=instante)
-                fx.make_order_item(db, order, variant, quantity=2, estado_cocina="listo")
+                order = fx.make_customer_order(db, ts, status="pendiente", promotion_evaluated_at=instante)
+                fx.make_order_item(db, order, variant, quantity=2, estado_cocina="entregado")
                 db.commit()
                 self.assertEqual(
                     checkout.compute_checkout_preview(db, order.id, tenant_en(MADRID)).discount, DESCUENTO
@@ -280,8 +280,8 @@ class TestVentanaDeMadrugadaAlEsteDeUtc(unittest.TestCase):
         db = fx.new_session()
         variant, _ = _catalogo(db, desde=time(0, 0), hasta=time(2, 0))
         ts = fx.make_table_session(db, table=fx.make_dining_table(db, status="ocupada"))
-        order = fx.make_customer_order(db, ts, status="abierta", promotion_evaluated_at=instante)
-        fx.make_order_item(db, order, variant, quantity=2, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="pendiente", promotion_evaluated_at=instante)
+        fx.make_order_item(db, order, variant, quantity=2, estado_cocina="entregado")
         db.commit()
         return checkout.compute_checkout_preview(db, order.id, tenant_en(zona)).discount == DESCUENTO
 

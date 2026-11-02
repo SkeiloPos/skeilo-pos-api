@@ -9,11 +9,13 @@ los ítems sin mirar el estado de cocina, así que cancelar un pedido ya en
 preparación reingresaba insumos que físicamente ya se habían usado y sobrestimaba
 el inventario en silencio hasta el conteo físico.
 
-Reglas verificadas:
-  - pedido `recibida`              → cero movimientos (nunca se descontó);
-  - ítem `pendiente` en `abierta`  → entrada real, el stock vuelve;
-  - ítem `en_preparacion`+         → sin movimiento, el stock NO vuelve (pérdida);
-  - mixto                          → solo se revierte la parte pendiente.
+Reglas verificadas (spec 147: `status` ya no distingue "confirmado"/"sin
+confirmar" -- ambos casos quedan en `'pendiente'`; lo que decide si hubo
+descuento es la existencia de un `InventoryMovement`, no `status`):
+  - pedido `pendiente` sin descuento  → cero movimientos (nunca se descontó);
+  - ítem `pendiente` ya descontado    → entrada real, el stock vuelve;
+  - ítem `entregado`                  → sin movimiento, el stock NO vuelve (pérdida);
+  - mixto                             → solo se revierte la parte pendiente.
 
 Trabaja sobre un tenant real con datos desechables: crea su propio insumo,
 producto, variante y receta, y los borra al terminar. No basta con un rollback
@@ -177,17 +179,17 @@ def main():
         creados: list = []
 
         try:
-            # --- 1. pedido 'recibida': nunca descontó, cancelar no mueve nada -----
-            order = _make_order(db, variant, table, status="recibida",
+            # --- 1. pedido 'pendiente': nunca descontó, cancelar no mueve nada -----
+            order = _make_order(db, variant, table, status="pendiente",
                                 estados=["pendiente", "pendiente"])
             creados.append(order.id)
             antes = _stock(db, item_id)
             checkout.cancel_order(db, order.id, CancelIn(motivo="test"), user)
-            _check("cancelar 'recibida' no genera movimientos", _movimientos(db, order.id), [])
-            _check("cancelar 'recibida' no cambia el stock", _stock(db, item_id), antes)
+            _check("cancelar 'pendiente' no genera movimientos", _movimientos(db, order.id), [])
+            _check("cancelar 'pendiente' no cambia el stock", _stock(db, item_id), antes)
 
-            # --- 2. 'abierta' con todo pendiente: reversa completa ----------------
-            order = _make_order(db, variant, table, status="abierta",
+            # --- 2. ya descontada, ítems 'pendiente': reversa completa -------------
+            order = _make_order(db, variant, table, status="pendiente",
                                 estados=["pendiente", "pendiente"])
             creados.append(order.id)
             entries = [(it, []) for it in order.items]
@@ -203,9 +205,9 @@ def main():
                    sorted(_movimientos(db, order.id)),
                    sorted([("out", POR_UNIDAD)] * 2 + [("in", POR_UNIDAD)] * 2))
 
-            # --- 3. 'abierta' ya en cocina: NO vuelve al stock --------------------
-            order = _make_order(db, variant, table, status="abierta",
-                                estados=["en_preparacion", "listo"])
+            # --- 3. ya entregada en cocina: NO vuelve al stock ---------------------
+            order = _make_order(db, variant, table, status="entregada",
+                                estados=["entregado", "entregado"])
             creados.append(order.id)
             entries = [(it, []) for it in order.items]
             deduct_order_items(db, entries, user.id, reference_id=order.id)
@@ -217,9 +219,10 @@ def main():
             _check("y no escribe ninguna entrada 'in'",
                    [m for m in _movimientos(db, order.id) if m[0] == "in"], [])
 
-            # --- 4. mixto: solo se revierte lo pendiente --------------------------
-            order = _make_order(db, variant, table, status="abierta",
-                                estados=["pendiente", "en_preparacion"])
+            # --- 4. mixto (FR-002a: ítem nuevo tras la entrega): solo se revierte
+            # lo pendiente --------------------------------------------------------
+            order = _make_order(db, variant, table, status="entregada",
+                                estados=["pendiente", "entregado"])
             creados.append(order.id)
             entries = [(it, []) for it in order.items]
             deduct_order_items(db, entries, user.id, reference_id=order.id)

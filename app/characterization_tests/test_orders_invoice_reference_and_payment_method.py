@@ -61,7 +61,7 @@ class _Base(unittest.TestCase):
 
 class TestReferenciaDeFactura(_Base):
     def test_con_venta_e_invoice_la_referencia_es_prefijo_mas_numero_relleno_a_6(self):
-        order = fx.make_customer_order(self.db, self.ts, status="pagada")
+        order = fx.make_customer_order(self.db, self.ts, status="entregada", payment_status="PAID")
         sale = fx.make_sale(self.db, order=order, total=Decimal("16000"))
         self._invoice(sale, prefix="A-", number=4)
         self.db.commit()
@@ -69,7 +69,7 @@ class TestReferenciaDeFactura(_Base):
         self.assertEqual(_get_order(self.db, order.id).invoice_reference, "A-000004")
 
     def test_sin_venta_todavia_la_referencia_es_none_no_un_codigo_inventado(self):
-        order = fx.make_customer_order(self.db, self.ts, status="abierta")
+        order = fx.make_customer_order(self.db, self.ts, status="pendiente")
         self.db.commit()
 
         self.assertIsNone(_get_order(self.db, order.id).invoice_reference)
@@ -77,7 +77,7 @@ class TestReferenciaDeFactura(_Base):
     def test_con_venta_pero_sin_invoice_la_referencia_es_none(self):
         # Caso defensivo: una Sale sin Invoice asociada (no debería ocurrir en
         # el flujo normal, pero D15/RN-005 prohíben inventar un valor igual.
-        order = fx.make_customer_order(self.db, self.ts, status="pagada")
+        order = fx.make_customer_order(self.db, self.ts, status="entregada", payment_status="PAID")
         fx.make_sale(self.db, order=order, total=Decimal("16000"))
         self.db.commit()
 
@@ -89,7 +89,7 @@ class TestMetodoDePago(_Base):
         # El bug reportado: pay_order/checkout_and_send no crean
         # OrderPaymentAttempt, así que current_payment_attempt queda vacío
         # aunque la orden ya esté pagada con un método conocido.
-        order = fx.make_customer_order(self.db, self.ts, status="pagada")
+        order = fx.make_customer_order(self.db, self.ts, status="entregada", payment_status="PAID")
         sale = fx.make_sale(self.db, order=order, total=Decimal("16000"))
         nequi = fx.make_payment_method(self.db, name="Nequi", is_cash=False)
         self._payment(sale, nequi)
@@ -100,7 +100,7 @@ class TestMetodoDePago(_Base):
         self.assertIsNone(result.current_payment_attempt)
 
     def test_sin_venta_todavia_el_metodo_de_pago_es_none(self):
-        order = fx.make_customer_order(self.db, self.ts, status="abierta")
+        order = fx.make_customer_order(self.db, self.ts, status="pendiente")
         self.db.commit()
 
         self.assertIsNone(_get_order(self.db, order.id).payment_method_name)

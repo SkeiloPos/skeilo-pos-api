@@ -123,6 +123,10 @@ _TABLE_SESSIONS_TABLE_NAMES = [
     "sale_items",
     "invoices",
     "invoice_counters",
+    # Spec 147 ciclo 2: `ensure_inventory_deducted` (vía `_deduct_and_open`)
+    # escribe el marcador `AuditLog "order.inventory_confirmed"` al cobrar un
+    # pedido QR que nunca pasó por la revisión de pago.
+    "audit_logs",
 ]
 
 _TABLE_NAMES = _CATALOG_TABLE_NAMES + _TABLE_SESSIONS_TABLE_NAMES
@@ -268,10 +272,11 @@ def make_customer_order(
     kw.setdefault("dining_table_id", table_session.dining_table_id)
     kw.setdefault("channel", "POS")
     kw.setdefault("order_type", "DINE_IN")
-    # Estado por defecto 'abierta': ni recién recibido ni terminal, cobrable de
-    # inmediato — los tests que ejercitan A-01 (recibida/en_preparacion/
-    # cancelada/pagada) lo sobreescriben explícitamente.
-    kw.setdefault("status", "abierta")
+    # Estado por defecto 'entregada' (spec 147: 'abierta' ya no existe) --
+    # cobrable de inmediato y no bloquea `_assert_closable` (exige
+    # status != 'pendiente'). Los tests que ejercitan A-01
+    # (pendiente/cancelada) lo sobreescriben explícitamente.
+    kw.setdefault("status", "entregada")
     kw.setdefault("created_at", datetime.now())
     obj = CustomerOrder(**kw)
     db.add(obj)
@@ -287,10 +292,10 @@ def make_order_item(
     kw.setdefault("product_variant_id", variant.id)
     kw.setdefault("quantity", 1)
     kw.setdefault("unit_price", variant.price)
-    # 'listo': cobrable de inmediato por defecto (no bloquea `_assert_closable`,
-    # que rechaza EN_CURSO = ('pendiente', 'en_preparacion')). Los tests que
-    # ejercitan cocina en curso o ítems anulados lo sobreescriben.
-    kw.setdefault("estado_cocina", "listo")
+    # 'entregado' (spec 147: 'listo' ya no existe): cobrable de inmediato por
+    # defecto, no bloquea `_assert_closable` (EN_CURSO = ('pendiente',)). Los
+    # tests que ejercitan cocina en curso o ítems cancelados lo sobreescriben.
+    kw.setdefault("estado_cocina", "entregado")
     obj = OrderItem(**kw)
     db.add(obj)
     db.flush()

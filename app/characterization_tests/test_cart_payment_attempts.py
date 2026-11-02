@@ -50,7 +50,7 @@ class TestCartPaymentAttempts(unittest.TestCase):
 
     # ------------------------------------------------------------- Helpers
 
-    def _seed_order(self, *, order_status: str = "recibida"):
+    def _seed_order(self, *, order_status: str = "pendiente"):
         db = fx.new_session()
         table = fx.make_dining_table(db)
         ts = fx.make_table_session(db, table=table)
@@ -124,7 +124,9 @@ class TestCartPaymentAttempts(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_create_payment_attempt_409_si_la_orden_no_esta_recibida(self):
-        db, participant, order = self._seed_order(order_status="abierta")
+        # Spec 147: 'abierta' ya no existe; 'entregada' es el valor no-'pendiente'
+        # que sigue disparando el rechazo.
+        db, participant, order = self._seed_order(order_status="entregada")
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         db.commit()
 
@@ -283,7 +285,7 @@ class TestCartPaymentAttempts(unittest.TestCase):
 
         order = service.submit_cart(db, participant, efectivo.id)
 
-        self.assertEqual(order.status, "recibida")
+        self.assertEqual(order.status, "pendiente")
         attempt = order.current_payment_attempt
         self.assertEqual(attempt.status, "pendiente")
         self.assertTrue(attempt.is_cash)

@@ -134,9 +134,35 @@ def close_session(
     user: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    """Cierra en cascada: cobra, marca los pedidos `pagada`, cierra a los
-    comensales, abandona sus carritos y libera la mesa. Todo en una transacción."""
+    """Cierra en cascada: cobra (deja `payment_status='PAID'`; `status` ya
+    estaba `'entregada'`, exigido por `_assert_closable`, spec 147), cierra a
+    los comensales, abandona sus carritos y libera la mesa. Todo en una
+    transacción."""
     return service.close_session(
+        db, table_session_id, body, user,
+        invoice_prefix=tenant.invoice_prefix or "",
+        tenant_id=tenant.id,
+        tenant=tenant,
+    )
+
+
+@router.post(
+    "/{table_session_id}/charge",
+    response_model=CloseSessionResponse,
+    summary="Cobrar la sesión sin liberar la mesa (billing_mode unified o split)",
+)
+def charge_session(
+    table_session_id: UUID,
+    body: CloseSessionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    """Igual que `/close` (cobra: deja `payment_status='PAID'`; `status` ya
+    estaba `'entregada'`), pero sin cerrar la sesión ni liberar la mesa -- el
+    cliente puede seguir sentado después de pagar. Libérala después con
+    `POST /{table_session_id}/release`."""
+    return service.charge_session(
         db, table_session_id, body, user,
         invoice_prefix=tenant.invoice_prefix or "",
         tenant_id=tenant.id,
@@ -147,7 +173,7 @@ def close_session(
 @router.post(
     "/{table_session_id}/release",
     response_model=ReleaseSessionResponse,
-    summary="Liberar una sesión ya completamente pagada (sin nada por cobrar)",
+    summary="Liberar manualmente una mesa sin órdenes abiertas (spec 147, FR-015/FR-016)",
 )
 def release_paid_session(
     table_session_id: UUID,
