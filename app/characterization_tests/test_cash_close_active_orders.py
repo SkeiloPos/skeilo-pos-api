@@ -34,7 +34,7 @@ from app.api.v1.cash.schemas import ShiftClose
 _NOTA_CIERRE = "Cierre de prueba sin conteo (spec 121: D-1/D-2)"
 
 
-def _seed_active_order(db, *, order_type: str, status: str = "abierta", **kw):
+def _seed_active_order(db, *, order_type: str, status: str = "pendiente", **kw):
     """Pedido activo de cualquier canal. `TAKEAWAY`/`DELIVERY` no tienen
     mesa/sesión real (research.md D1) -- se crea una sesión descartable solo
     para satisfacer la firma de la factory y se anula explícitamente."""
@@ -61,9 +61,11 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         shift = fx.make_cash_shift(db, register=register)
         db.commit()
 
-        o1 = _seed_active_order(db, order_type="DINE_IN", status="abierta")
+        o1 = _seed_active_order(db, order_type="DINE_IN", status="pendiente")
         o2 = _seed_active_order(db, order_type="TAKEAWAY", status="pendiente")
-        o3 = _seed_active_order(db, order_type="DELIVERY", status="bloqueada")
+        # spec 147: 'bloqueada' ya no existe -- 'entregada'+'UNPAID' (default)
+        # también cuenta como activa (FR-016).
+        o3 = _seed_active_order(db, order_type="DELIVERY", status="entregada")
         db.commit()
 
         resp = router.close_shift(shift.id, ShiftClose(), db)
@@ -87,14 +89,17 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
         db.commit()
-        o1 = _seed_active_order(db, order_type="DINE_IN", status="abierta")
+        o1 = _seed_active_order(db, order_type="DINE_IN", status="entregada")
         o2 = _seed_active_order(db, order_type="TAKEAWAY", status="pendiente")
         db.commit()
 
         bloqueado = router.close_shift(shift.id, ShiftClose(), db)
         self.assertIsInstance(bloqueado, JSONResponse)
 
-        o1.status = "pagada"
+        # Spec 147: "cobrar" ya no mueve `status` a 'pagada' (no existe) --
+        # deja `payment_status='PAID'`, que saca a o1 (ya 'entregada') del
+        # conjunto activo (FR-016).
+        o1.payment_status = "PAID"
         o2.status = "cancelada"
         db.commit()
 
@@ -130,13 +135,14 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         register = fx.make_cash_register(db)
         shift = fx.make_cash_shift(db, register=register)
         db.commit()
-        orden = _seed_active_order(db, order_type="DINE_IN", status="abierta")
+        orden = _seed_active_order(db, order_type="DINE_IN", status="entregada")
         db.commit()
 
         primero = router.close_shift(shift.id, ShiftClose(), db)
         self.assertIsInstance(primero, JSONResponse)
 
-        orden.status = "pagada"
+        # Spec 147: "cobrar" ya no mueve `status`, deja `payment_status='PAID'`.
+        orden.payment_status = "PAID"
         db.commit()
 
         segundo = router.close_shift(shift.id, ShiftClose(close_note=_NOTA_CIERRE), db, fx.make_user_double())

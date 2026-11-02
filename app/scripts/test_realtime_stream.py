@@ -195,11 +195,11 @@ def main():
         c.close()
         time.sleep(0.3)
 
-        # Con la conexión caída, la terminal avanza la preparación del ítem.
-        item_id = pedido["items"][0]["id"]
+        # Con la conexión caída, la terminal confirma y entrega el pedido
+        # (spec 147: ya no hay PATCH por ítem -- una sola acción por pedido,
+        # que reemplaza el viejo avance de preparación).
         api("POST", f"/api/v1/orders/{pedido['id']}/confirm")
-        api("PATCH", f"/api/v1/orders/items/{item_id}/kitchen",
-            json={"estado_cocina": "en_preparacion"})
+        api("POST", f"/api/v1/orders/{pedido['id']}/deliver")
 
         c2 = SseClient(base, {"token": token, "last_event_id": antes}).open()
         abiertos.append(c2)
@@ -211,19 +211,10 @@ def main():
         check("el replay recupera lo perdido, en orden",
               tipos,
               ["order.confirmed", "session.bill_changed",
-               "order.item_kitchen_changed"])
+               "order.delivered"])
 
         vs = [e["parsed"]["v"] for e in c2.events if e.get("event") != "hello"]
         check("y con `v` estrictamente creciente", vs, sorted(set(vs)))
-
-        # ------------------------------------------------------ rt_v del PATCH
-        r = api("PATCH", f"/api/v1/orders/items/{item_id}/kitchen",
-                json={"estado_cocina": "listo"}).json()
-        if r.get("rt_v") is None:
-            raise Fail("el PATCH de preparación no devolvió `rt_v` "
-                       "(la escritura optimista lo necesita)")
-        note(f"el PATCH de preparación devuelve rt_v={r['rt_v']} para el guard "
-             f"de la escritura optimista")
 
         # ------------------------------------------------------ ticket de staff
         t1 = api("POST", "/api/v1/realtime/ticket").json()

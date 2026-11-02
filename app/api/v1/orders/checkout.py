@@ -43,8 +43,10 @@ from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.models.cash_shift import CashShift
 from app.models.sale import Sale
+from app.core import inventory_reasons
 from app.models.customer_order import CustomerOrder
-from app.models.order_item import EN_CURSO, OrderItem
+from app.models.inventory_movement import InventoryMovement
+from app.models.order_item import OrderItem
 from app.models.order_cancel_log import OrderCancelLog
 from app.models.order_payment_attempt import OrderPaymentAttempt
 from app.models.payment import PaymentMethod
@@ -61,16 +63,19 @@ from app.api.v1.orders.service import order_has_sale
 
 logger = logging.getLogger(__name__)
 
-TERMINAL = ("pagada", "cancelada")
+# Spec 147: 'pagada' ya no existe (el pago es `payment_status`, independiente
+# de `status`) — el único valor realmente terminal para el flujo de pedido es
+# 'cancelada'. Los sitios que antes distinguían "pagada" para no bloquear
+# liberación/cobro ahora leen `payment_status` explícitamente donde aplica.
+TERMINAL = ("cancelada",)
 
-# Estados en los que el insumo YA se combinó físicamente: cancelar no lo
-# devuelve al stock, es pérdida. El 'out' de la confirmación ya representa esa
-# pérdida, así que tampoco se escribe un movimiento extra (sería doble descuento).
-_CONSUMED_KITCHEN = ("en_preparacion", "listo")
-
-# Estados de orden en los que el inventario todavía NO se descontó: el descuento
-# ocurre al confirmar. Cancelar desde aquí no genera ningún movimiento.
-_NOT_DEDUCTED = ("pendiente",)
+# Estado de ítem en el que el insumo YA se combinó físicamente (entregado):
+# cancelar no lo devuelve al stock, es pérdida. El 'out' de la confirmación ya
+# representa esa pérdida, así que tampoco se escribe un movimiento extra
+# (sería doble descuento). Spec 147: colapsado de ('en_preparacion','listo') a
+# solo 'entregado' — ya no hay un paso intermedio "en preparación" que
+# distinguir del ítem recién confirmado (ambos son 'pendiente' ahora).
+_CONSUMED_KITCHEN = ("entregado",)
 
 
 # ------------------------------------------- Auditoría de orden (spec 074)
@@ -150,15 +155,20 @@ def _reload_order(db: Session, order_id: UUID) -> CustomerOrder:
 # --------------------------------------------------------------------- Bloqueo
 
 def block_order(db: Session, order_id: UUID, data: BlockIn) -> CustomerOrder:
+    """Spec 147 (FR-004/FR-010): ya no existe el status intermedio `'bloqueada'`
+    ni el gate de "ítems sin terminar en cocina" (el cobro ya no depende del
+    estado de entrega). Lo que queda es el lock optimista por `version` —
+    sigue sirviendo para que el frontend "reclame" la orden antes de cobrar y
+    detecte un doble clic/pestaña— sin tocar `status`."""
     try:
         order = db.execute(
             select(CustomerOrder).where(CustomerOrder.id == order_id).with_for_update()
         ).scalar_one_or_none()
         if order is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
-        if order.status != "abierta":
+        if order.status == "cancelada":
             raise HTTPException(
-                status.HTTP_409_CONFLICT, f"La orden no está abierta (status={order.status})"
+                status.HTTP_409_CONFLICT, f"Transición inválida (status={order.status})"
             )
         if order.version != data.version:
             raise HTTPException(
@@ -166,30 +176,6 @@ def block_order(db: Session, order_id: UUID, data: BlockIn) -> CustomerOrder:
                 detail={"error": "Conflicto de versión (la orden cambió)", "version_actual": order.version},
             )
 
-        pendientes = db.execute(
-            select(OrderItem).where(
-                OrderItem.order_id == order.id,
-                OrderItem.estado_cocina.in_(EN_CURSO),
-            )
-        ).scalars().all()
-        if pendientes:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail={
-                    "error": "Hay ítems sin terminar en cocina; anúlalos o espera a que estén listos.",
-                    "items": [
-                        {
-                            "order_item_id": str(it.id),
-                            "product_variant_id": str(it.product_variant_id),
-                            "estado_cocina": it.estado_cocina,
-                            "participant_id": str(it.participant_id) if it.participant_id else None,
-                        }
-                        for it in pendientes
-                    ],
-                },
-            )
-
-        order.status = "bloqueada"
         order.version += 1
         db.commit()
     except HTTPException:
@@ -231,7 +217,7 @@ def compute_bill(db: Session, table_id: UUID) -> BillResponse:
         subtotal = Decimal("0")
         items: list[BillItemLine] = []
         for it in order.items:
-            if it.estado_cocina == "anulado":
+            if it.estado_cocina == "cancelado":
                 continue
             # spec 089: `unit_price × quantity + addons_total` (addons_total = 0 en histórico).
             line_total = it.line_total
@@ -282,7 +268,7 @@ def order_sale_lines(
     stmt = (
         select(OrderItem)
         .options(selectinload(OrderItem.options))
-        .where(OrderItem.order_id == order_id, OrderItem.estado_cocina != "anulado")
+        .where(OrderItem.order_id == order_id, OrderItem.estado_cocina != "cancelado")
     )
     if participant_id is not ALL_PARTICIPANTS:
         stmt = stmt.where(OrderItem.participant_id == participant_id)
@@ -422,7 +408,7 @@ def refresh_order_item_discounts(
 ) -> None:
     """spec 118 (research.md D1-D3, contracts/order-item-discount-snapshot.md):
     recalcula y sobrescribe `discounted_unit_price`/`discounted_line_total` de
-    **todas** las líneas vigentes (`estado_cocina != "anulado"`) de `order`, no
+    **todas** las líneas vigentes (`estado_cocina != "cancelado"`) de `order`, no
     solo la que cambió -- el motor de promociones puede redistribuir el
     descuento entre filas existentes cuando se agrega o se quita una unidad
     (`_distribute_group_discount`). Escribe `(None, None)` cuando una línea ya
@@ -564,11 +550,18 @@ def compute_draft_preview(
 def pay_order(
     db: Session, order_id: UUID, data: PayIn, cashier: User, tenant: Tenant | None = None
 ) -> Sale:
-    order = get_or_404(db, CustomerOrder, order_id, "Order not found")
-    if order.status != "bloqueada":
+    # Spec 147 (FR-003/FR-004/FR-010): el cobro ya no depende de un status
+    # intermedio ('bloqueada' no existe) — se permite en cualquier status
+    # salvo 'cancelada'. El `SELECT ... FOR UPDATE` es ahora el único
+    # mecanismo de concurrencia del cobro (contracts/orders-api.md §2).
+    order = db.execute(
+        select(CustomerOrder).where(CustomerOrder.id == order_id).with_for_update()
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    if order.status == "cancelada":
         raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "La orden debe estar bloqueada para cobrar (bloquea primero).",
+            status.HTTP_409_CONFLICT, f"Transición inválida (status={order.status})"
         )
     shift = ensure_open_shift(db, data.cash_shift_id)
 
@@ -602,7 +595,7 @@ def pay_order(
             applied_promotions=applied,
             promotion_evaluated_at=instant,  # FR-011a
         )
-        order.status = "pagada"
+        order.payment_status = "PAID"
         # FR-021: el descuento agregado + la lista de promociones también en la orden.
         order.discount = Decimal(data.discount) + promo_discount
         order.applied_promotions = applied
@@ -640,16 +633,57 @@ def _deduct_and_open(db: Session, order: CustomerOrder, user: User) -> CustomerO
     entries = [
         (it, chosen_from_rows(db, it))
         for it in order.items
-        if it.estado_cocina != "anulado"
+        if it.estado_cocina != "cancelado"
     ]
     if not entries:
         raise HTTPException(status.HTTP_409_CONFLICT, "El pedido no tiene ítems")
 
     deduct_order_items(db, entries, user.id, reference_id=order.id)
 
-    order.status = "abierta"
+    # Spec 147: ya no hay transición `pendiente -> abierta` — el pedido queda
+    # `pendiente` hasta que se entregue (FR-001/FR-002a). `_confirm_order_impl`
+    # necesita saber si ESTA función ya corrió para esta orden (para rechazar
+    # una segunda llamada manual, Acceptance Scenario 4 de spec 026 US4), pero
+    # `InventoryMovement.reference_id` es a nivel de pedido, no de ítem, así
+    # que no sirve por sí solo: un ítem puede haberse descontado por otra vía
+    # (`consolidation.add_item_to_order`) sin que esta función haya corrido
+    # nunca. Este `AuditLog` marca específicamente "esta función ya corrió
+    # para esta orden", sin esa ambigüedad.
+    record_audit(
+        db, action="order.inventory_confirmed", entity="customer_orders",
+        entity_id=order.id, user=user,
+    )
     order.version += 1
     return order
+
+
+def ensure_inventory_deducted(db: Session, order: CustomerOrder, cashier: User) -> None:
+    """Descuenta el inventario de `order` solo si todavía no se descontó por
+    ningún camino -- ni por `_deduct_and_open` (QR/mostrador confirmados) ni
+    por `consolidation.add_item_to_order` (mesero, que descuenta de inmediato
+    por ítem, sin pasar nunca por `_deduct_and_open`). Mismo chequeo que ya
+    usa `cancel_order` para decidir si hay algo que revertir: un
+    `InventoryMovement` de salida por venta con `reference_id == order.id`
+    (a diferencia del `AuditLog "order.inventory_confirmed"` de
+    `_deduct_and_open`, que NO se escribe para el camino del mesero y daría
+    un falso "nunca se descontó" -- doble descuento).
+
+    A pedido del usuario (spec 147 ciclo 2): la revisión de pago QR
+    (aprobar comprobante/confirmar efectivo) deja de ser el único punto que
+    garantiza el descuento de un pedido QR -- `table_sessions.service` llama
+    esto al cobrar la sesión, para el caso de un pedido QR que se entregó y
+    se cobra en persona sin haber pasado nunca por esa revisión."""
+    deducted = db.execute(
+        select(InventoryMovement.id).where(
+            InventoryMovement.reference_type == inventory_reasons.REF_ORDER,
+            InventoryMovement.reference_id == order.id,
+            InventoryMovement.type == "out",
+            InventoryMovement.reason == inventory_reasons.VENTA,
+        ).limit(1)
+    ).scalar_one_or_none()
+    if deducted is not None:
+        return
+    _deduct_and_open(db, order, cashier)
 
 
 def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrder:
@@ -704,6 +738,29 @@ def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrde
     if has_confirmed_payment is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "La orden no tiene un pago confirmado"
+        )
+
+    # Spec 147: con `order.status` fijo en `'pendiente'` hasta la entrega (ya
+    # no existe `'abierta'` como marca de "ya confirmada"), el guard de
+    # idempotencia contra una segunda llamada (Acceptance Scenario 4, spec
+    # 026 US4) ya no puede leer `status`. No basta con mirar
+    # `InventoryMovement` (su `reference_id` es a nivel de pedido, no de
+    # ítem: no distingue "esta orden ya pasó por `_deduct_and_open`" de "uno
+    # de sus ítems se descontó por otra vía", p. ej.
+    # `consolidation.add_item_to_order`, que descuenta de inmediato al anexar
+    # una línea sin pasar por aquí — ver `test_segunda_unidad_agregada_por_el_
+    # mesero_...`, spec 118). El `AuditLog` que escribe `_deduct_and_open` sí
+    # es específico de esta función, sin esa ambigüedad.
+    ya_confirmada = db.execute(
+        select(AuditLog.id).where(
+            AuditLog.action == "order.inventory_confirmed",
+            AuditLog.entity == "customer_orders",
+            AuditLog.entity_id == order.id,
+        ).limit(1)
+    ).scalar_one_or_none()
+    if ya_confirmada is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "El inventario de esta orden ya se descontó"
         )
 
     return _deduct_and_open(db, order, user)
@@ -834,14 +891,26 @@ def checkout_and_send(
         # no queda ni cobrada ni a medio enviar.
         _deduct_and_open(db, order, cashier)
 
-        # spec 035, A-52 (registro-de-anomalias.md): a diferencia de
-        # `_deduct_and_open` en sus otros dos llamadores (QR, sin venta
-        # todavía en ese instante), aquí la `Sale` ya se construyó arriba en
-        # esta misma transacción — el pedido queda `'pagada'` de una vez, no
-        # `'abierta'`. `tables_advanced.py` ya no trata `'pagada'` como "sin
-        # nada pendiente": sigue bloqueando mientras queden ítems por
-        # preparar.
-        order.status = "pagada"
+        # spec 035, A-52 (registro-de-anomalias.md), reescrito spec 147: a
+        # diferencia de `_deduct_and_open` en sus otros dos llamadores (QR,
+        # sin venta todavía en ese instante), aquí la `Sale` ya se construyó
+        # arriba en esta misma transacción — el pago queda `PAID` de una vez.
+        # `status` no se toca para un pedido DE MESA (FR-003/FR-004): sigue
+        # `'pendiente'` hasta que se entregue, independientemente del pago —
+        # cobrar y preparar/entregar son decisiones separadas en una mesa.
+        #
+        # A pedido del usuario (spec 147 ciclo 2): un pedido SIN mesa
+        # (`dining_table_id is None` -- mostrador, domicilio o para llevar)
+        # no tiene ningún paso de entrega aparte que valga la pena mostrar:
+        # se despacha al cobrarlo. Mismo efecto que `deliver_order`
+        # (`kitchen.py`) -- status a `'entregada'` y los ítems `'pendiente'`
+        # a `'entregado'` -- pero dentro de esta misma transacción.
+        order.payment_status = "PAID"
+        if order.dining_table_id is None:
+            for it in order.items:
+                if it.estado_cocina == "pendiente":
+                    it.estado_cocina = "entregado"
+            order.status = "entregada"
 
         # spec 074: copiado antes del `commit` (ver `approve_payment_attempt`).
         order_id_for_audit = order.id
@@ -899,14 +968,19 @@ def cancel_order(
     request_id: str | None = None,
 ) -> CustomerOrder:
     """Cancela un pedido y ajusta el inventario **según lo que se alcanzó a
-    consumir**, no como una reversa simétrica:
+    consumir**, no como una reversa simétrica (spec 147: con solo 3 estados de
+    ítem, "descontado pero no entregado" y "nunca descontado" ya no se
+    distinguen por `estado_cocina` — se usa la existencia de un movimiento de
+    inventario, ver `deducted` abajo):
 
-    - orden aún sin confirmar (`pendiente`): nunca se descontó → cero movimientos;
-    - ítem `pendiente`: descontado pero no preparado → entrada real ('in');
-    - ítem `en_preparacion`/`listo`: el insumo ya se combinó → **no vuelve al
-      stock**. El 'out' de la confirmación ya es esa pérdida; escribir otro
-      movimiento la descontaría dos veces. Se traza en `audit_logs`;
-    - ítem `anulado`: ya lo resolvió `void_item`.
+    - orden sin inventario descontado todavía: cero movimientos;
+    - ítem `pendiente` de una orden ya descontada: descontado pero no
+      entregado → entrada real ('in');
+    - ítem `entregado`: el insumo ya se combinó → **no vuelve al stock**. El
+      'out' de la confirmación ya es esa pérdida; escribir otro movimiento la
+      descontaría dos veces. Se traza en `audit_logs` (FR-007: cancelar un
+      pedido ya entregado nunca revierte ese consumo);
+    - ítem `cancelado`: ya lo resolvió `void_item`.
 
     Devolver todo al stock (comportamiento anterior) sobrestimaba el inventario en
     silencio hasta el conteo físico.
@@ -931,26 +1005,49 @@ def cancel_order(
     ).scalar_one_or_none()
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
-    if order.status in TERMINAL:
+    # Spec 147 (FR-007/FR-009/FR-010, contracts/orders-api.md §3): ya no hay
+    # 'pagada' — "ya cobrado" se lee en `payment_status`, independiente de
+    # `status`. `cancelada` es transición inválida (no se cancela dos veces);
+    # `entregada`+`PAID` requiere reembolso, fuera de alcance de este cancel.
+    if order.status == "cancelada":
         raise HTTPException(
-            status.HTTP_409_CONFLICT, f"La orden ya es terminal (status={order.status})"
+            status.HTTP_409_CONFLICT, f"Transición inválida (status={order.status})"
         )
-    # Spec 029, hotfix #4: en los caminos QR/mostrador el pago NO mueve
-    # `status` a "pagada" (research.md D2) — sin este chequeo, este endpoint
+    if order.payment_status == "PAID":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "El pedido ya fue pagado; cancelarlo requiere un proceso de reembolso, "
+            "fuera de alcance",
+        )
+    # Spec 029, hotfix #4 (defensa adicional): en los caminos QR/mostrador
+    # legados, un `Sale` puede existir sin que `payment_status` se haya
+    # actualizado a tiempo (research.md D2) — sin este chequeo, este endpoint
     # podía cancelar un pedido ya cobrado y dejar su `Sale` huérfana.
     if order_has_sale(db, order_id):
         raise HTTPException(
             status.HTTP_409_CONFLICT, "El pedido ya fue pagado y no puede rechazarse"
         )
 
-    deducted = order.status not in _NOT_DEDUCTED
+    # Spec 147: con `status` fijo en `'pendiente'` hasta la entrega, un pedido
+    # `'pendiente'` ya puede tener su inventario descontado (confirmado, pero
+    # todavía no entregado) — `status` solo no basta para saber si se
+    # descontó (antes sí, vía la transición retirada `pendiente -> abierta`).
+    # Mismo signal que el guard de idempotencia de `_confirm_order_impl`.
+    deducted = db.execute(
+        select(InventoryMovement.id).where(
+            InventoryMovement.reference_type == inventory_reasons.REF_ORDER,
+            InventoryMovement.reference_id == order.id,
+            InventoryMovement.type == "out",
+            InventoryMovement.reason == inventory_reasons.VENTA,
+        ).limit(1)
+    ).scalar_one_or_none() is not None
 
     try:
         a_revertir: list[tuple[OrderItem, list[ChosenOption]]] = []
         perdidos: list[dict] = []
 
         for it in order.items:
-            if it.estado_cocina == "anulado":
+            if it.estado_cocina == "cancelado":
                 # Ya se resolvió al anular el ítem (void_item revirtió si procedía).
                 continue
             if not deducted:
@@ -972,6 +1069,12 @@ def cancel_order(
         revertidos = [str(it.id) for it, _ in a_revertir]
 
         order.status = "cancelada"
+        # Spec 147 (FR-007, contracts/orders-api.md §3): pedido e ítems pasan
+        # a 'cancelada'/'cancelado' juntos — un ítem no tiene transición
+        # propia, siempre sigue la de su pedido (FR-022).
+        for it in order.items:
+            if it.estado_cocina != "cancelado":
+                it.estado_cocina = "cancelado"
         db.add(OrderCancelLog(
             order_id=order.id, motivo=data.motivo,
             user_id=actor_id,
@@ -1161,7 +1264,18 @@ def release_table(
         .options(selectinload(CustomerOrder.items))
         .where(
             CustomerOrder.dining_table_id == table.id,
-            CustomerOrder.status.notin_(TERMINAL),
+            # Spec 147 (FR-016): "orden abierta" — ya no existe 'pagada', así
+            # que un pedido cerrado (entregada+PAID) ya no bloquea; antes
+            # `TERMINAL` ("pagada","cancelada") lo excluía, pero tras la
+            # migración todo pedido cerrado queda en 'entregada', que sin este
+            # ajuste bloquearía para siempre (comportamiento roto en
+            # silencio, Principio III). `'confirmado'` (a pedido del usuario)
+            # cuenta igual que `'pendiente'`.
+            CustomerOrder.status.in_(("pendiente", "confirmado"))
+            | (
+                (CustomerOrder.status == "entregada")
+                & (CustomerOrder.payment_status == "UNPAID")
+            ),
         )
     ).scalars().all()
     if blocking:
@@ -1173,7 +1287,7 @@ def release_table(
                     {
                         "order_id": str(o.id),
                         "status": o.status,
-                        "items": len([i for i in o.items if i.estado_cocina != "anulado"]),
+                        "items": len([i for i in o.items if i.estado_cocina != "cancelado"]),
                     }
                     for o in blocking
                 ],
@@ -1362,11 +1476,11 @@ def approve_payment_attempt(
             order.discount = promo_discount
             order.applied_promotions = applied
 
-            # spec 035, A-52 (registro-de-anomalias.md): la Sale ya se construyó
-            # arriba en esta misma transacción — igual que en checkout_and_send,
-            # el pedido queda 'pagada' de una vez, no 'abierta' (aunque cocina
-            # todavía no haya terminado de prepararlo).
-            order.status = "pagada"
+            # spec 035, A-52 (registro-de-anomalias.md), reescrito spec 147: la
+            # Sale ya se construyó arriba en esta misma transacción — igual que
+            # en checkout_and_send, el pago queda `PAID` de una vez; `status`
+            # no se toca (FR-003/FR-004).
+            order.payment_status = "PAID"
 
             db.commit()
     except HTTPException:
@@ -1714,7 +1828,8 @@ def _confirm_cash_portion_of_mixed_attempt(
             )
             order.discount = promo_discount
             order.applied_promotions = applied
-            order.status = "pagada"
+            # Spec 147: el pago queda `PAID`; `status` no se toca.
+            order.payment_status = "PAID"
 
             db.commit()
     except HTTPException:
@@ -1860,10 +1975,10 @@ def confirm_cash_payment_attempt(
         order.discount = promo_discount
         order.applied_promotions = applied
 
-        # spec 035, A-52 (registro-de-anomalias.md): igual que en
-        # approve_payment_attempt/checkout_and_send — la Sale ya existe en
-        # esta misma transacción.
-        order.status = "pagada"
+        # spec 035, A-52 (registro-de-anomalias.md), reescrito spec 147: igual
+        # que en approve_payment_attempt/checkout_and_send — la Sale ya existe
+        # en esta misma transacción; el pago queda `PAID`, `status` no se toca.
+        order.payment_status = "PAID"
 
         db.commit()
     except HTTPException:

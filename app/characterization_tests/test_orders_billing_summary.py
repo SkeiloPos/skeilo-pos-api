@@ -55,6 +55,9 @@ def _list_orders(db, **kw):
         date_from=None,
         date_to=None,
         q=None,
+        # Spec 147: default `Query(False, ...)` -- llamado directo necesita
+        # el valor explícito (mismo gotcha de los otros params Query).
+        entregadas_sin_cobrar=False,
         db=db,
         _=fx.make_user_double(),
     )
@@ -121,9 +124,10 @@ class TestEstadoDeFacturacion(unittest.TestCase):
         self.assertEqual(billing.total, Decimal("16000"))
 
     def test_g4b_un_pedido_cancelado_en_una_sesion_cobrada_es_sin_factura(self):
-        # El cierre de sesión solo cobra pedidos con
-        # `status NOT IN ('cancelada','pagada')` (`table_sessions/service.py:180`):
-        # un pedido cancelado antes del cierre se queda en la sesión con su
+        # El cierre de sesión solo cobra pedidos con `status != 'cancelada'
+        # and payment_status != 'PAID'` (`table_sessions/service.py::
+        # _billable_orders`, criterio reescrito spec 147): un pedido
+        # cancelado antes del cierre se queda en la sesión con su
         # `table_session_id` intacto y SIN haberse cobrado nunca. Decirle "se
         # cobró junto con otros" (FR-024a) afirmaría un cobro inexistente
         # (research.md D2, RN-005).
@@ -189,7 +193,7 @@ class TestImportesDelPedido(unittest.TestCase):
     def test_g1_subtotal_excluye_los_items_anulados(self):
         db, order, variant = _seed(items=2)  # 2 × 8.000 = 16.000
         fx.make_order_item(
-            db, order, variant, unit_price=PRECIO, quantity=1, estado_cocina="anulado",
+            db, order, variant, unit_price=PRECIO, quantity=1, estado_cocina="cancelado",
         )
         db.commit()
 
@@ -320,7 +324,7 @@ class TestSinDetalleDePrecios(unittest.TestCase):
         for _ in range(2):
             fx.make_order_item(
                 db, order, variant, unit_price=PRECIO, quantity=1,
-                estado_cocina="anulado",
+                estado_cocina="cancelado",
             )
         db.commit()
 

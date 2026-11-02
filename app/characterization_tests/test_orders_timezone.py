@@ -14,7 +14,7 @@ class TestOrderCreatedAtUtcSerialization(unittest.TestCase):
     def test_created_at_lleva_offset_utc_explicito(self):
         naive = datetime(2026, 8, 24, 12, 53, 7)
         resp = orders_schemas.OrderResponse.model_construct(
-            id=uuid.uuid4(), channel="POS", status="abierta", version=0,
+            id=uuid.uuid4(), channel="POS", status="pendiente", version=0,
             created_at=naive,
         )
         dumped = resp.model_dump(mode="json")["created_at"]

@@ -43,9 +43,10 @@ class TestSalesDuplicatePaymentMethod(unittest.TestCase):
         return db, order, shift, nequi, cashier
 
     def test_pay_order_rechaza_metodo_repetido(self):
+        # Spec 147: pay_order ya no exige ningún status intermedio
+        # ('bloqueada' no existe) -- cobra en cualquier status salvo
+        # 'cancelada'.
         db, order, shift, nequi, cashier = self._seed_hold_order()
-        order.status = "bloqueada"
-        db.commit()
         data = PayIn(
             cash_shift_id=shift.id,
             payments=[
@@ -61,7 +62,7 @@ class TestSalesDuplicatePaymentMethod(unittest.TestCase):
 
         self.assertEqual(db.query(Payment).count(), 0)
         db.refresh(order)
-        self.assertNotEqual(order.status, "pagada")
+        self.assertNotEqual(order.payment_status, "PAID")
 
     def test_checkout_and_send_rechaza_metodo_repetido(self):
         db, order, shift, nequi, cashier = self._seed_hold_order()
@@ -80,7 +81,7 @@ class TestSalesDuplicatePaymentMethod(unittest.TestCase):
 
         self.assertEqual(db.query(Payment).count(), 0)
         db.refresh(order)
-        self.assertNotEqual(order.status, "pagada")
+        self.assertNotEqual(order.payment_status, "PAID")
 
     def test_sale_create_rechaza_metodo_repetido(self):
         db = fx.new_session()

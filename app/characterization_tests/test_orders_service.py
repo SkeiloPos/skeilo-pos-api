@@ -202,13 +202,14 @@ class TestService(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 409)
 
     def test_create_order_permite_si_el_pedido_qr_ya_es_terminal(self):
-        """Contraste del test anterior: un pedido QR 'pagada' ya no es
-        'activo', así que no bloquea una comanda nueva de mostrador/mesero en
-        la misma mesa."""
+        """Contraste del test anterior: un pedido QR 'cancelada' (spec 147:
+        único valor terminal ahora, _NON_TERMINAL_ORDER_STATUSES =
+        ('pendiente','entregada')) ya no es 'activo', así que no bloquea una
+        comanda nueva de mostrador/mesero en la misma mesa."""
         db = fx.new_session()
         table = fx.make_dining_table(db, status="ocupada")
         ts = fx.make_table_session(db, table=table)
-        fx.make_customer_order(db, ts, channel="QR_MENU", status="pagada")
+        fx.make_customer_order(db, ts, channel="QR_MENU", status="cancelada")
         variant, insumo, option = self._seed_variant_con_receta_y_opciones(db)
         db.commit()
 
@@ -729,10 +730,10 @@ class TestCreateOrderDelivery(unittest.TestCase):
 
 class TestOrderHasSale(unittest.TestCase):
     """Spec 029 (D2/D3 de research.md): `order_has_sale`/`paid_order_ids` son
-    la señal real de "este pedido ya está pagado" — no `CustomerOrder.status`,
-    que nunca llega a `"pagada"` en los caminos QR/mostrador vigentes
-    (`checkout_and_send`/`_confirm_order_impl` dejan la orden en `"abierta"`
-    a propósito, con la `Sale` ya emitida)."""
+    una señal defensiva de "este pedido ya está pagado" para los caminos
+    QR/mostrador legados -- desde spec 146/147, `payment_status` ya es la
+    señal primaria y confiable, fijada en la misma transacción que la
+    `Sale`; `order_has_sale` queda como red de seguridad adicional."""
 
     def _seed_order_con_sale(self, *, order_status: str) -> tuple:
         db = fx.new_session()
@@ -755,17 +756,18 @@ class TestOrderHasSale(unittest.TestCase):
 
     def test_order_has_sale_true_sobre_orden_abierta_con_sale_camino_qr_mostrador(self):
         """El caso real que motivó la spec: `checkout_and_send`/
-        `_confirm_order_impl` dejan la orden en 'abierta' con la `Sale` ya
-        emitida — `order_has_sale` debe reconocerlo como pagado aunque
+        `_confirm_order_impl` dejan la orden `'pendiente'` (spec 147: ya no
+        existe `'abierta'`) con la `Sale` ya emitida — `order_has_sale` debe
+        reconocerlo como pagado aunque
         `status` nunca haya llegado a 'pagada'."""
-        db, order = self._seed_order_con_sale(order_status="abierta")
+        db, order = self._seed_order_con_sale(order_status="pendiente")
 
         self.assertTrue(service.order_has_sale(db, order.id))
 
     def test_order_has_sale_false_sobre_orden_abierta_sin_sale(self):
         db = fx.new_session()
         ts = fx.make_table_session(db)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         db.commit()
 
         self.assertFalse(service.order_has_sale(db, order.id))
@@ -781,8 +783,8 @@ class TestOrderHasSale(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS", order_type="DELIVERY")
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS", order_type="DELIVERY")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         db.commit()
 
         self.assertFalse(service.order_has_sale(db, order.id))
@@ -790,9 +792,9 @@ class TestOrderHasSale(unittest.TestCase):
     def test_paid_order_ids_resuelve_en_bloque_para_una_lista_de_pedidos(self):
         """Versión en bloque: una sola consulta para todo un listado, en vez
         de N — el pedido sin `Sale` no aparece en el resultado."""
-        db, pagado = self._seed_order_con_sale(order_status="abierta")
+        db, pagado = self._seed_order_con_sale(order_status="pendiente")
         ts = fx.make_table_session(db)
-        sin_pagar = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        sin_pagar = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         db.commit()
 
         resultado = service.paid_order_ids(db, [pagado.id, sin_pagar.id])
@@ -827,21 +829,21 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         return db, ts, order
 
     def test_excluye_pedido_pagado_de_sesion_ya_cerrada(self):
-        db, _, order = self._seed(session_status="closed", order_status="abierta", con_sale=True)
+        db, _, order = self._seed(session_status="closed", order_status="pendiente", con_sale=True)
 
         resultado = service.list_orders(db, active_sessions_only=True)
 
         self.assertNotIn(order.id, [o.id for o in resultado])
 
     def test_conserva_pedido_sin_pagar_de_sesion_ya_cerrada_caso_huerfano(self):
-        db, _, order = self._seed(session_status="closed", order_status="abierta", con_sale=False)
+        db, _, order = self._seed(session_status="closed", order_status="pendiente", con_sale=False)
 
         resultado = service.list_orders(db, active_sessions_only=True)
 
         self.assertIn(order.id, [o.id for o in resultado])
 
     def test_conserva_pedido_pagado_de_sesion_activa(self):
-        db, _, order = self._seed(session_status="active", order_status="abierta", con_sale=True)
+        db, _, order = self._seed(session_status="active", order_status="pendiente", con_sale=True)
 
         resultado = service.list_orders(db, active_sessions_only=True)
 
@@ -852,7 +854,7 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         ts = fx.make_table_session(db)  # solo para satisfacer la firma del fixture
         order = fx.make_customer_order(
             db, ts, table_session_id=None, dining_table_id=None,
-            status="abierta", channel="POS",
+            status="pendiente", channel="POS",
         )
         db.commit()
 
@@ -861,7 +863,7 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         self.assertIn(order.id, [o.id for o in resultado])
 
     def test_sin_el_parametro_el_resultado_no_cambia_respecto_a_hoy(self):
-        db, _, order = self._seed(session_status="closed", order_status="abierta", con_sale=True)
+        db, _, order = self._seed(session_status="closed", order_status="pendiente", con_sale=True)
 
         resultado = service.list_orders(db)
 
@@ -1080,7 +1082,7 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
     def test_add_item_to_order_nombra_el_producto_agotado(self):
         from app.api.v1.orders import consolidation
         ts = fx.make_table_session(self.db)
-        order = fx.make_customer_order(self.db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(self.db, ts, status="pendiente", channel="POS")
         self.db.commit()
         with self.assertRaises(HTTPException) as ctx:
             consolidation.add_item_to_order(
@@ -1095,7 +1097,7 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         from app.api.v1.orders import kitchen
         from app.api.v1.orders.schemas import VoidItemIn
         ts = fx.make_table_session(self.db)
-        order = fx.make_customer_order(self.db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(self.db, ts, status="pendiente", channel="POS")
         otro = fx.make_variant(self.db, product=self.product, price=PRECIO)
         fx.make_recipe_item(self.db, otro, self.queso, quantity=Decimal("0.1"))
         original = fx.make_order_item(
@@ -1114,7 +1116,7 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         self._assert_named(ctx.exception)
         self.db.expire_all()
         # Rollback total: la línea original sigue viva y sin reversa.
-        self.assertNotEqual(self.db.get(type(original), original.id).estado_cocina, "anulado")
+        self.assertNotEqual(self.db.get(type(original), original.id).estado_cocina, "cancelado")
 
 
 class TestCreateOrderPersistsDiscounts118(unittest.TestCase):

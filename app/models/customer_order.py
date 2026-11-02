@@ -19,15 +19,33 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
     """Pedido. Varios por mesa y por comensal a lo largo de una `table_session`.
 
     `status` es el ciclo del pedido, **no** el de cocina (ese vive por ítem, en
-    `order_items.estado_cocina`):
+    `order_items.estado_cocina`) **ni** el de pago (`payment_status`,
+    completamente independiente) -- spec 147 colapsó el modelo anterior de 5
+    estados (`pendiente, abierta, bloqueada, pagada, cancelada`) a 3, y luego
+    (a pedido del usuario) se reintrodujo `confirmado` como paso explícito de
+    recepción, separado de la entrega:
 
-        pendiente → abierta → bloqueada → pagada
-                 ↘  cancelada (terminal, desde cualquier estado no terminal)
+        pendiente → confirmado → entregada
+                 ↘          ↘  cancelada (terminal, desde cualquier estado no
+                              terminal; entregada solo si payment_status ==
+                              'UNPAID', FR-007)
 
-    - `pendiente`: toda orden nueva, de cualquier canal, nace así -- **aún no descuenta stock**;
-    - `abierta`: confirmada por staff — aquí y solo aquí se descontó el inventario;
-    - `bloqueada`: congelada para cobro (lock optimista por `version`);
-    - `pagada` / `cancelada`: terminales.
+    - `pendiente`: toda orden nueva, de cualquier canal, nace así;
+    - `confirmado`: el cajero "recibió" el pedido (`POST
+      /orders/{id}/receive`, idempotente -- ruta propia, distinta de la
+      preexistente `/orders/{id}/confirm`, que es otra cosa: descuenta
+      inventario y exige un pago ya confirmado) -- informativo, no toca
+      cocina ni pago. Paso previo que habilita "Entregar" en la terminal,
+      aunque el backend también acepta entregar directo desde `pendiente`;
+    - `entregada`: la acción única "Entregar" (`POST /orders/{id}/deliver`)
+      pasó el pedido completo y todos sus ítems `pendiente` a `entregado`
+      (FR-001/FR-002), sin tocar `payment_status`;
+    - `cancelada`: terminal. Ninguna transición sale de aquí (FR-010).
+
+    El inventario se descuenta al confirmar (`checkout.confirm_order`/
+    `_confirm_order_impl`), que ya no mueve `status` -- un pedido `pendiente`
+    puede o no tener ya el inventario comprometido; la señal de "ya
+    confirmado" es la existencia de un `InventoryMovement`, no `status`.
 
     `user_id` es null cuando el pedido lo envió el cliente por QR."""
 
@@ -76,7 +94,7 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
     delivery_phone: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     delivery_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
 
-    status: Mapped[str] = mapped_column(String(12), nullable=False, server_default="abierta")
+    status: Mapped[str] = mapped_column(String(12), nullable=False, server_default="pendiente")
 
     # spec 146 (FR-002): estado de pago, independiente de `status` — una orden
     # puede estar en `status='pendiente'` con `payment_status='PAID'` si el pago
@@ -116,7 +134,9 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
-    # Lock optimista para la transición abierta→bloqueada del cobro (Fase 7).
+    # Lock optimista del cobro (Fase 7). Spec 147: ya no hay transición de
+    # `status` que proteger ('bloqueada' no existe) -- lo usan `block_order`
+    # (claim contra doble clic) y `checkout_and_send` (idempotencia).
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     # Referencia blanda a shared.users.id (null si el cliente pidió por QR).
@@ -182,11 +202,11 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
             name="ck_customer_order_order_type",
         ),
         CheckConstraint(
-            "status IN ('pendiente', 'abierta', 'bloqueada', 'pagada', 'cancelada')",
+            "status IN ('pendiente', 'confirmado', 'entregada', 'cancelada')",
             name="ck_customer_order_status",
         ),
         CheckConstraint(
-            "payment_status IN ('UNPAID', 'PAID', 'PARTIAL')",
+            "payment_status IN ('UNPAID', 'PAID')",
             name="ck_customer_order_payment_status",
         ),
         CheckConstraint(
@@ -202,15 +222,25 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
         # mismo). La agrupación para cobrar la da `table_session_id`.
         #
         # A lo sumo una orden activa por comensal (spec 025, FR-013) — mismo
-        # predicado que `_NON_TERMINAL_ORDER_STATUSES`
-        # (`app/api/v1/cart/service.py`). Postgres no considera dos NULL
-        # iguales: las órdenes de mostrador/mesero (participant_id NULL) no
-        # se ven afectadas.
+        # criterio de "orden abierta" que FR-016 (spec 147, liberación de mesa):
+        # `status IN ('pendiente', 'confirmado')` OR (`status='entregada'` AND
+        # `payment_status='UNPAID'`). Un pedido ya `entregada`+`PAID` (cerrado,
+        # FR-006) no cuenta como activo, así el comensal puede abrir uno nuevo
+        # después de cobrar el anterior (data-model.md spec 147, "Corrección
+        # post-implementación" — el `status != 'cancelada'` originalmente
+        # propuesto chocaba con datos reales de pedidos ya cerrados). Postgres
+        # no considera dos NULL iguales: las órdenes de mostrador/mesero
+        # (participant_id NULL) no se ven afectadas. `confirmado` se agregó
+        # después (a pedido del usuario): sigue sin ser pago ni entrega, así
+        # que sigue contando como activo igual que `pendiente`.
         Index(
             "idx_active_order_per_participant",
             "participant_id",
             unique=True,
-            postgresql_where=text("status NOT IN ('pagada', 'cancelada')"),
+            postgresql_where=text(
+                "status IN ('pendiente', 'confirmado') "
+                "OR (status = 'entregada' AND payment_status = 'UNPAID')"
+            ),
         ),
         # spec 087 (FR-006): unicidad del número de pedido dentro del turno de
         # caja, solo para las filas que sí lo tienen (DINE_IN).

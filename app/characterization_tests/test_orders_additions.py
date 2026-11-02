@@ -170,7 +170,7 @@ class TestAddAdditionToOrderItem(unittest.TestCase):
         self._agregar(item)
         self.assertEqual(service.order_pending_balance(self.db, self.order.id), PRECIO_ADICION)
 
-        item.estado_cocina = "anulado"
+        item.estado_cocina = "cancelado"
         self.db.commit()
 
         self.assertEqual(service.order_pending_balance(self.db, self.order.id), Decimal("0"))
@@ -178,7 +178,7 @@ class TestAddAdditionToOrderItem(unittest.TestCase):
     # --------------------------------------------- Historia 4 (restricciones)
 
     def test_linea_en_estado_listo_rechaza_con_409_y_texto_de_ayuda(self):
-        item = self._item(estado_cocina="listo")
+        item = self._item(estado_cocina="entregado")
         body = OptionSelectionIn(option_id=self.option.id, quantity=1)
         with self.assertRaises(HTTPException) as ctx:
             additions.add_addition_to_order_item(self.db, item.id, body, self.user, self.tenant)
@@ -189,7 +189,7 @@ class TestAddAdditionToOrderItem(unittest.TestCase):
         self.assertEqual(item.addons_total, Decimal("0"))
 
     def test_linea_anulada_rechaza_con_409(self):
-        item = self._item(estado_cocina="anulado")
+        item = self._item(estado_cocina="cancelado")
         body = OptionSelectionIn(option_id=self.option.id, quantity=1)
         with self.assertRaises(HTTPException) as ctx:
             additions.add_addition_to_order_item(self.db, item.id, body, self.user, self.tenant)
@@ -356,7 +356,7 @@ class TestUpdateAdditionQuantity(TestAddAdditionToOrderItem):
     def test_linea_en_estado_listo_rechaza_con_409(self):
         item = self._item()
         self._agregar(item, quantity=2)
-        item.estado_cocina = "listo"
+        item.estado_cocina = "entregado"
         self.db.commit()
 
         with self.assertRaises(HTTPException) as ctx:
@@ -451,7 +451,7 @@ class TestRemoveAddition(TestAddAdditionToOrderItem):
     def test_linea_en_estado_listo_rechaza_con_409(self):
         item = self._item()
         self._agregar(item, quantity=2)
-        item.estado_cocina = "listo"
+        item.estado_cocina = "entregado"
         self.db.commit()
 
         with self.assertRaises(HTTPException) as ctx:

@@ -42,7 +42,7 @@ PRECIO = Decimal("10000")
 class TestTablesAdvanced(unittest.TestCase):
     # ------------------------------------------------------------- Helpers
 
-    def _seed_table_con_orden_activa(self, db=None, *, status="abierta"):
+    def _seed_table_con_orden_activa(self, db=None, *, status="pendiente"):
         if db is None:
             db = fx.new_session()
         table = fx.make_dining_table(db, status="ocupada")
@@ -58,13 +58,14 @@ class TestTablesAdvanced(unittest.TestCase):
         spec.md Historia 4, escenario 5): mesa con al menos una orden activa
         → `new_status='libre'`/`'reservada'` responde 409; sin órdenes
         activas, el cambio se acepta."""
-        db, table, ts, order = self._seed_table_con_orden_activa(status="abierta")
+        db, table, ts, order = self._seed_table_con_orden_activa(status="pendiente")
 
         with self.assertRaises(HTTPException) as ctx:
             tables_advanced.set_table_status(db, table.id, "libre")
         self.assertEqual(ctx.exception.status_code, 409)
 
-        order.status = "pagada"
+        order.status = "entregada"
+        order.payment_status = "PAID"
         db.commit()
 
         result = tables_advanced.set_table_status(db, table.id, "libre")
@@ -78,8 +79,8 @@ class TestTablesAdvanced(unittest.TestCase):
         1): mesa destino con una orden activa ya presente → `move_order`
         responde 409, más estricto que el modelo general de "varias órdenes
         por mesa"."""
-        db, origen, ts_origen, order = self._seed_table_con_orden_activa(status="abierta")
-        _, destino, _, _ = self._seed_table_con_orden_activa(db, status="abierta")
+        db, origen, ts_origen, order = self._seed_table_con_orden_activa(status="pendiente")
+        _, destino, _, _ = self._seed_table_con_orden_activa(db, status="pendiente")
 
         with self.assertRaises(HTTPException) as ctx:
             tables_advanced.move_order(db, order.id, destino.id)
@@ -95,7 +96,7 @@ class TestTablesAdvanced(unittest.TestCase):
         por sí sola. Se fuerza artificialmente (`db.flush` parcheado,
         Clarifications sesión 2026-08-17) y se confirma que el manejador
         `except IntegrityError` sigue presente y la traduce a 409."""
-        db, origen, ts, order = self._seed_table_con_orden_activa(status="abierta")
+        db, origen, ts, order = self._seed_table_con_orden_activa(status="pendiente")
         destino = fx.make_dining_table(db, status="libre")
         db.commit()
 
@@ -113,12 +114,12 @@ class TestTablesAdvanced(unittest.TestCase):
         preexistentes → el grupo resultante es uno de los dos (`SELECT` sin
         `ORDER BY`, no determinista) — se documenta la propiedad, sin fijar
         un valor específico (research.md §3)."""
-        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="abierta")
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="pendiente")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="pendiente")
 
         group_a = tables_advanced.merge_orders(db, [order_a.id])["merged_group_id"]
 
-        db, table_c, ts_c, order_c = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table_c, ts_c, order_c = self._seed_table_con_orden_activa(db, status="pendiente")
         group_b = tables_advanced.merge_orders(db, [order_b.id, order_c.id])["merged_group_id"]
 
         self.assertNotEqual(group_a, group_b)
@@ -134,8 +135,8 @@ class TestTablesAdvanced(unittest.TestCase):
         orden B `abierta` ($15.000, sin promoción vigente) → el total
         devuelto es $15.000, la orden A queda excluida del cálculo pero
         sigue presente en `orders[]`."""
-        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="abierta")
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="pendiente")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="pendiente")
 
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -145,7 +146,8 @@ class TestTablesAdvanced(unittest.TestCase):
         fx.make_order_item(db, order_b, variant_b)
 
         group_id = tables_advanced.merge_orders(db, [order_a.id, order_b.id])["merged_group_id"]
-        order_a.status = "pagada"
+        order_a.status = "entregada"
+        order_a.payment_status = "PAID"
         db.commit()
 
         bill = tables_advanced.group_bill(db, group_id)
@@ -159,8 +161,8 @@ class TestTablesAdvanced(unittest.TestCase):
         (FR-001): una orden `cancelada` se excluye del total igual que una
         `pagada`, sin importar el `estado_cocina` de sus ítems (Edge Case de
         `spec.md`: el filtro por `status` de la orden tiene prioridad)."""
-        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="abierta")
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="pendiente")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="pendiente")
 
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -180,8 +182,8 @@ class TestTablesAdvanced(unittest.TestCase):
         **todas** las órdenes del grupo están `pagada`/`cancelada`, el total
         es $0 (grupo sin nada pendiente de cobro), no un error — mismo
         comportamiento que ya tiene `table_sessions.compute_bill`."""
-        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="abierta")
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="pendiente")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="pendiente")
 
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -190,7 +192,8 @@ class TestTablesAdvanced(unittest.TestCase):
         fx.make_order_item(db, order_b, variant)
 
         group_id = tables_advanced.merge_orders(db, [order_a.id, order_b.id])["merged_group_id"]
-        order_a.status = "pagada"
+        order_a.status = "entregada"
+        order_a.payment_status = "PAID"
         order_b.status = "cancelada"
         db.commit()
 
@@ -203,7 +206,7 @@ class TestTablesAdvanced(unittest.TestCase):
         promoción `percent` del 10% vigente sobre su categoría, sin ninguna
         orden `pagada`/`cancelada` en el grupo → el total ya descuenta la
         promoción."""
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(status="abierta")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(status="pendiente")
 
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -230,13 +233,13 @@ class TestTablesAdvanced(unittest.TestCase):
         `checkout.order_sale_lines` — re-verificado a nivel de `group_bill`
         (gap de cobertura detectado en /speckit-analyze, G2: ninguna prueba
         de esta suite ejercitaba un ítem `anulado` en `group_bill`)."""
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(status="abierta")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(status="pendiente")
 
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
         fx.make_order_item(db, order_b, variant)
-        fx.make_order_item(db, order_b, variant, estado_cocina="anulado")
+        fx.make_order_item(db, order_b, variant, estado_cocina="cancelado")
 
         group_id = tables_advanced.merge_orders(db, [order_b.id])["merged_group_id"]
 
@@ -255,8 +258,8 @@ class TestTablesAdvanced(unittest.TestCase):
         sin descuento); ahora devuelve $13.500 — ambos defectos corregidos a
         la vez (ejemplo de
         `contradiccion-06-cuenta-a-cobrar-tres-implementaciones.md §3`)."""
-        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="abierta")
-        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table_a, ts_a, order_a = self._seed_table_con_orden_activa(status="pendiente")
+        db, table_b, ts_b, order_b = self._seed_table_con_orden_activa(db, status="pendiente")
 
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -275,7 +278,8 @@ class TestTablesAdvanced(unittest.TestCase):
         # mientras están 'abierta' y el status terminal de A se fija después,
         # directo en la fila.
         group_id = tables_advanced.merge_orders(db, [order_a.id, order_b.id])["merged_group_id"]
-        order_a.status = "pagada"
+        order_a.status = "entregada"
+        order_a.payment_status = "PAID"
         db.commit()
 
         bill = tables_advanced.group_bill(db, group_id)
@@ -300,9 +304,9 @@ class TestTablesAdvanced(unittest.TestCase):
         variant_a = fx.make_variant(db, product=product, price=Decimal("20000"))
         variant_b = fx.make_variant(db, product=product, price=Decimal("15000"))
 
-        order_a = fx.make_customer_order(db, ts, status="abierta")
+        order_a = fx.make_customer_order(db, ts, status="pendiente")
         fx.make_order_item(db, order_a, variant_a)
-        order_b = fx.make_customer_order(db, ts, status="abierta")
+        order_b = fx.make_customer_order(db, ts, status="pendiente")
         fx.make_order_item(db, order_b, variant_b)
 
         promo = fx.make_promotion(db, status="active")
@@ -315,7 +319,8 @@ class TestTablesAdvanced(unittest.TestCase):
         # Mismo patrón que el test anterior: se fusionan mientras están
         # 'abierta' y el status terminal de A se fija después.
         group_id = tables_advanced.merge_orders(db, [order_a.id, order_b.id])["merged_group_id"]
-        order_a.status = "pagada"
+        order_a.status = "entregada"
+        order_a.payment_status = "PAID"
         db.commit()
 
         session_total = table_sessions_service.compute_bill(db, ts.id).total
@@ -324,10 +329,11 @@ class TestTablesAdvanced(unittest.TestCase):
         self.assertEqual(session_total, group_total)
         self.assertEqual(group_total, Decimal("13500"))
 
-    # ------------------------- Nueva protección: orden 'pagada' con cocina pendiente (spec 035, A-52)
+    # ------------------------- Nueva protección: orden cerrada con cocina pendiente (spec 035, A-52)
 
     def _seed_orden_pagada_con_item(self, db=None, *, estado_cocina="pendiente"):
-        db, table, ts, order = self._seed_table_con_orden_activa(db, status="pagada")
+        db, table, ts, order = self._seed_table_con_orden_activa(db, status="entregada")
+        order.payment_status = "PAID"
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
@@ -335,12 +341,14 @@ class TestTablesAdvanced(unittest.TestCase):
         db.commit()
         return db, table, order
 
-    def test_orden_pagada_con_item_pendiente_sigue_bloqueando_spec_035(self):
-        """Spec 035 (A-52, `registro-de-anomalias.md`): una orden 'pagada'
-        (como la que deja `checkout_and_send` desde esta spec) con algún ítem
-        todavía sin terminar de preparar sigue bloqueando liberar, mover, y
-        fusionar su mesa — antes de esta spec, 'pagada' dejaba de bloquear
-        sin mirar el estado de cocina de sus ítems."""
+    def test_orden_cerrada_con_item_pendiente_sigue_bloqueando_spec_035(self):
+        """Spec 035 (A-52, `registro-de-anomalias.md`), criterio de "pedido
+        cerrado" reescrito spec 147 (`'entregada'`+`'PAID'`, ya no
+        `status == 'pagada'`): un pedido cerrado (como el que deja
+        `checkout_and_send` desde spec 035) con algún ítem todavía sin
+        terminar de preparar sigue bloqueando liberar, mover, y fusionar su
+        mesa — antes de spec 035, 'pagada' dejaba de bloquear sin mirar el
+        estado de cocina de sus ítems."""
         db, table, order = self._seed_orden_pagada_con_item(estado_cocina="pendiente")
 
         with self.assertRaises(HTTPException) as ctx:
@@ -353,27 +361,28 @@ class TestTablesAdvanced(unittest.TestCase):
             tables_advanced.move_order(db, order.id, destino.id)
         self.assertEqual(ctx.exception.status_code, 409)
 
-        _, _, _, otra = self._seed_table_con_orden_activa(db, status="abierta")
+        _, _, _, otra = self._seed_table_con_orden_activa(db, status="pendiente")
         with self.assertRaises(HTTPException) as ctx:
             tables_advanced.merge_orders(db, [order.id, otra.id])
         self.assertEqual(ctx.exception.status_code, 409)
 
-    def test_orden_pagada_con_items_terminados_ya_no_bloquea_spec_035(self):
-        """Spec 035 (A-52): la misma orden 'pagada', una vez sus ítems quedan
-        `listo`/`anulado`, deja de bloquear — mismo resultado final que antes
-        de esta spec para una orden verdaderamente sin nada pendiente."""
-        db, table, order = self._seed_orden_pagada_con_item(estado_cocina="listo")
+    def test_orden_cerrada_con_items_terminados_ya_no_bloquea_spec_035(self):
+        """Spec 035 (A-52): el mismo pedido cerrado, una vez sus ítems quedan
+        `entregado`/`cancelado` (spec 147: antes `listo`/`anulado`), deja de
+        bloquear — mismo resultado final que antes de esta spec para una
+        orden verdaderamente sin nada pendiente."""
+        db, table, order = self._seed_orden_pagada_con_item(estado_cocina="entregado")
         result = tables_advanced.set_table_status(db, table.id, "libre")
         self.assertEqual(result.status, "libre")
 
-        db, table2, order2 = self._seed_orden_pagada_con_item(db, estado_cocina="anulado")
+        db, table2, order2 = self._seed_orden_pagada_con_item(db, estado_cocina="cancelado")
         destino = fx.make_dining_table(db, status="libre")
         db.commit()
         moved = tables_advanced.move_order(db, order2.id, destino.id)
         self.assertEqual(moved.dining_table_id, destino.id)
 
-        db, table3, order3 = self._seed_orden_pagada_con_item(db, estado_cocina="listo")
-        _, _, _, otra = self._seed_table_con_orden_activa(db, status="abierta")
+        db, table3, order3 = self._seed_orden_pagada_con_item(db, estado_cocina="entregado")
+        _, _, _, otra = self._seed_table_con_orden_activa(db, status="pendiente")
         merged = tables_advanced.merge_orders(db, [order3.id, otra.id])
         self.assertIn(order3.id, merged["order_ids"])
 
@@ -415,15 +424,15 @@ class TestGroupBillVigenciaCongelada(unittest.TestCase):
         variant = self._seed_grupo(db)
 
         order_a = fx.make_customer_order(
-            db, ts_a, status="abierta",
+            db, ts_a, status="pendiente",
             promotion_evaluated_at=_utc_para_hora_local(2026, 9, 2, 19, 59),
         )
-        fx.make_order_item(db, order_a, variant, quantity=2, estado_cocina="listo")
+        fx.make_order_item(db, order_a, variant, quantity=2, estado_cocina="entregado")
         order_b = fx.make_customer_order(
-            db, ts_b, status="abierta",
+            db, ts_b, status="pendiente",
             promotion_evaluated_at=_utc_para_hora_local(2026, 9, 2, 20, 5),
         )
-        fx.make_order_item(db, order_b, variant, quantity=2, estado_cocina="listo")
+        fx.make_order_item(db, order_b, variant, quantity=2, estado_cocina="entregado")
         db.commit()
 
         group_id = tables_advanced.merge_orders(db, [order_a.id, order_b.id])["merged_group_id"]
@@ -457,12 +466,12 @@ class TestGroupBillVigenciaCongelada(unittest.TestCase):
             db, promo2, type="percent", value=Decimal("50"), min_qty=2, variants=[variant],
         )
 
-        order = fx.make_customer_order(db, ts_a, status="abierta")  # sin instante
-        fx.make_order_item(db, order, variant, quantity=2, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts_a, status="pendiente")  # sin instante
+        fx.make_order_item(db, order, variant, quantity=2, estado_cocina="entregado")
         t_b = fx.make_dining_table(db, status="ocupada")
         ts_b = fx.make_table_session(db, table=t_b)
-        order_b = fx.make_customer_order(db, ts_b, status="abierta")
-        fx.make_order_item(db, order_b, variant, quantity=1, estado_cocina="listo")
+        order_b = fx.make_customer_order(db, ts_b, status="pendiente")
+        fx.make_order_item(db, order_b, variant, quantity=1, estado_cocina="entregado")
         db.commit()
 
         group_id = tables_advanced.merge_orders(db, [order.id, order_b.id])["merged_group_id"]

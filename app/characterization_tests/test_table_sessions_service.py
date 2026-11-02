@@ -33,6 +33,7 @@ from app.api.v1.table_sessions.schemas import CloseSessionIn, ItemAssignmentIn
 from app.api.v1.sales.schemas import PaymentIn
 from app.models.cart import Cart
 from app.models.dining_table import DiningTable
+from app.models.inventory_movement import InventoryMovement
 from app.models.order_item import OrderItem, OrderItemOption
 from app.models.sale import Sale
 from app.models.session_participant import SessionParticipant
@@ -63,7 +64,7 @@ class TestTableSessionsService(unittest.TestCase):
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
 
-        order = fx.make_customer_order(db, ts, status="abierta")
+        order = fx.make_customer_order(db, ts, status="entregada")
         item = fx.make_order_item(db, order, variant, participant_id=ana.id)
 
         register = fx.make_cash_register(db)
@@ -101,28 +102,29 @@ class TestTableSessionsService(unittest.TestCase):
             service.get_session(db, uuid4())
         self.assertEqual(ctx.exception.status_code, 404)
 
-    # ------------------------------------------------- has_billable_orders (T018)
+    # ------------------------------------------------- has_open_orders (T018, reescrito spec 147)
 
-    def test_has_billable_orders_true_y_false(self):
-        """CONGELA comportamiento actual (`service.py:64-71`): una sesión con un
-        pedido `pendiente`/`abierta` (no terminal) devuelve `True`; con solo
-        pedidos `cancelada`/`pagada` devuelve `False`."""
+    def test_has_open_orders_true_y_false(self):
+        """Comportamiento reescrito spec 147 (FR-016, reemplaza
+        `has_billable_orders`): una sesión con un pedido `'pendiente'` o
+        `'entregada'`+`'UNPAID'` (abierta) devuelve `True`; con solo pedidos
+        `'cancelada'` o `'entregada'`+`'PAID'` (cerrada) devuelve `False`."""
         db, table, ts = self._seed_bare_session()
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
 
-        order_abierta = fx.make_customer_order(db, ts, status="abierta")
+        order_abierta = fx.make_customer_order(db, ts, status="entregada")
         fx.make_order_item(db, order_abierta, variant)
         db.commit()
-        self.assertTrue(service.has_billable_orders(db, ts.id))
+        self.assertTrue(service.has_open_orders(db, ts.id))
 
-        order_abierta.status = "pagada"
+        order_abierta.payment_status = "PAID"
         db.commit()
         order_cancelada = fx.make_customer_order(db, ts, status="cancelada")
         fx.make_order_item(db, order_cancelada, variant)
         db.commit()
-        self.assertFalse(service.has_billable_orders(db, ts.id))
+        self.assertFalse(service.has_open_orders(db, ts.id))
 
     # ------------------------------------------- has_pending_balance (spec 123)
 
@@ -130,8 +132,11 @@ class TestTableSessionsService(unittest.TestCase):
         """Pedido ya facturado (tiene `Sale`) con una línea que tiene una
         adición agregada después de facturar -- `added_after_sale=True`.
         `cubierta=True` simula que ya se cobró el pago complementario
-        (`complementary_sale_id` fijado), sin pasar por ese endpoint."""
-        order = fx.make_customer_order(db, ts, status="abierta")
+        (`complementary_sale_id` fijado), sin pasar por ese endpoint.
+        `payment_status='PAID'` (spec 147): el pedido ya está cerrado, así
+        que no cuenta como "orden abierta" (FR-016) -- lo único que debe
+        bloquear `release_paid_session` aquí es el saldo pendiente."""
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
         item = fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         group = fx.make_option_group(db)
         option = fx.make_option(db, group=group, extra_price=Decimal("2000"))
@@ -177,7 +182,7 @@ class TestTableSessionsService(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         order = self._seed_pending_balance(db, ts, variant)
         for it in order.items:
-            it.estado_cocina = "listo"
+            it.estado_cocina = "entregado"
         db.commit()
         cashier = fx.make_user_double()
 
@@ -195,7 +200,7 @@ class TestTableSessionsService(unittest.TestCase):
         variant = fx.make_variant(db, product=product, price=PRECIO)
         order = self._seed_pending_balance(db, ts, variant, cubierta=True)
         for it in order.items:
-            it.estado_cocina = "listo"
+            it.estado_cocina = "entregado"
         db.commit()
         cashier = fx.make_user_double()
 
@@ -225,7 +230,7 @@ class TestTableSessionsService(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts2, status="abierta")
+        order = fx.make_customer_order(db, ts2, status="entregada")
         fx.make_order_item(db, order, variant)
         db.commit()
 
@@ -261,10 +266,10 @@ class TestTableSessionsService(unittest.TestCase):
     def test_try_release_if_empty_libera_tras_cancelar_ultimo_pedido_activo(self):
         """US1 escenario 3 (spec 039, Acceptance Scenario 3): comensal con un
         Cart 'abierto' y un CustomerOrder vivo; al cancelarse ese último
-        pedido activo (has_billable_orders pasa a False, igual que hace
-        cart.service.cancel_my_order antes de llamar try_release_if_empty),
-        la mesa se libera y el Cart de ese comensal se elimina en la misma
-        operación."""
+        pedido activo (`has_open_orders` pasa a False, FR-016, reemplaza
+        `has_billable_orders` -- igual que hace cart.service.cancel_my_order
+        antes de llamar try_release_if_empty), la mesa se libera y el Cart de
+        ese comensal se elimina en la misma operación."""
         db, table, ts = self._seed_bare_session()
         participant = fx.make_participant(db, table_session=ts, status="closed")
         cart = fx.make_cart(db, participant=participant, status="abierto")
@@ -272,14 +277,14 @@ class TestTableSessionsService(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, participant=participant, status="abierta")
+        order = fx.make_customer_order(db, ts, participant=participant, status="entregada")
         fx.make_order_item(db, order, variant)
         db.commit()
-        self.assertTrue(service.has_billable_orders(db, ts.id))
+        self.assertTrue(service.has_open_orders(db, ts.id))
 
         order.status = "cancelada"
         db.commit()
-        self.assertFalse(service.has_billable_orders(db, ts.id))
+        self.assertFalse(service.has_open_orders(db, ts.id))
 
         released = service.try_release_if_empty(db, ts.id)
 
@@ -373,21 +378,21 @@ class TestTableSessionsService(unittest.TestCase):
             variants=[variant_1, variant_2],
         )
 
-        order_abierta = fx.make_customer_order(db, ts, status="abierta")
-        fx.make_order_item(db, order_abierta, variant_a, participant_id=ana.id, estado_cocina="listo")
+        order_abierta = fx.make_customer_order(db, ts, status="entregada")
+        fx.make_order_item(db, order_abierta, variant_a, participant_id=ana.id, estado_cocina="entregado")
         fx.make_order_item(
             db, order_abierta, variant_1, participant_id=beto.id,
-            estado_cocina="en_preparacion",
+            estado_cocina="pendiente",
         )
         fx.make_order_item(
             db, order_abierta, variant_2, participant_id=beto.id,
-            estado_cocina="listo",
+            estado_cocina="entregado",
         )
 
         order_cancelada = fx.make_customer_order(db, ts, status="cancelada")
         fx.make_order_item(db, order_cancelada, variant_a, participant_id=ana.id)
 
-        order_pagada = fx.make_customer_order(db, ts, status="pagada")
+        order_pagada = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
         fx.make_order_item(db, order_pagada, variant_a, participant_id=beto.id)
 
         db.commit()
@@ -417,8 +422,8 @@ class TestTableSessionsService(unittest.TestCase):
             db, promo, type="percent", value=Decimal("10"), min_qty=1, variants=[variant],
         )
 
-        order = fx.make_customer_order(db, ts, status="abierta")
-        fx.make_order_item(db, order, variant, participant_id=ana.id, estado_cocina="listo", quantity=2)
+        order = fx.make_customer_order(db, ts, status="entregada")
+        fx.make_order_item(db, order, variant, participant_id=ana.id, estado_cocina="entregado", quantity=2)
         db.commit()
 
         resp = service.compute_bill(db, ts.id)
@@ -450,6 +455,64 @@ class TestTableSessionsService(unittest.TestCase):
         s["db"].refresh(s["table"])
         self.assertEqual(s["ts"].status, "closed")
         self.assertEqual(s["table"].status, "libre")
+
+    def test_charge_session_descuenta_inventario_de_un_pedido_qr_que_nunca_paso_por_confirm(self):
+        """Spec 147 ciclo 2 (a pedido del usuario): "Entregar" es independiente
+        del pago -- un pedido QR puede llegar aquí `'entregada'` sin que el
+        comensal jamás haya completado su pago a distancia (ni comprobante
+        aprobado ni efectivo confirmado), así que nunca pasó por
+        `_deduct_and_open`. `charge_session`/`close_session` deben descontar
+        el inventario ahí mismo (`ensure_inventory_deducted`) en vez de dejar
+        la venta sin ningún movimiento -- antes de esta spec, nada lo hacía
+        para un pedido QR en ese estado."""
+        s = self._seed_billable_session()
+        s["order"].channel = "QR_MENU"
+        insumo = fx.make_inventory_item(s["db"], current_stock=Decimal("100"))
+        fx.make_recipe_item(s["db"], s["variant"], insumo, quantity=Decimal("2"))
+        s["db"].commit()
+
+        movimientos_antes = s["db"].execute(
+            select(func.count(InventoryMovement.id)).where(InventoryMovement.reference_id == s["order"].id)
+        ).scalar_one()
+        self.assertEqual(movimientos_antes, 0)
+
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+        resp = service.close_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        self.assertEqual(len(resp.sale_ids), 1)
+        movimientos_despues = s["db"].execute(
+            select(func.count(InventoryMovement.id)).where(InventoryMovement.reference_id == s["order"].id)
+        ).scalar_one()
+        self.assertEqual(movimientos_despues, 1)
+        s["db"].refresh(insumo)
+        self.assertEqual(Decimal(insumo.current_stock), Decimal("98"))
+
+    def test_charge_session_no_vuelve_a_descontar_un_pedido_de_mesero_ya_descontado(self):
+        """Un pedido `POS` (mesero) descuenta de inmediato al agregar cada
+        ítem (`consolidation.add_item_to_order`) -- `ensure_inventory_
+        deducted` ni siquiera se consulta para `channel != 'QR_MENU'`
+        (acotado a propósito, ver el comentario de `_charge_session`), así
+        que cobrar no debe generar un segundo movimiento ni exigirle receta
+        a una variante que nunca la tuvo."""
+        s = self._seed_billable_session()
+        self.assertEqual(s["order"].channel, "POS")
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        resp = service.close_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        self.assertEqual(len(resp.sale_ids), 1)
+        movimientos = s["db"].execute(
+            select(func.count(InventoryMovement.id)).where(InventoryMovement.reference_id == s["order"].id)
+        ).scalar_one()
+        self.assertEqual(movimientos, 0)
 
     def test_close_session_borra_carrito_huerfano_de_comensal_ya_cerrado(self):
         """US2 escenario 1 (spec 039, Acceptance Scenario 1): además de los
@@ -570,7 +633,7 @@ class TestTableSessionsService(unittest.TestCase):
             variants=[v2a, v2b],
         )
 
-        order = fx.make_customer_order(db, ts, status="abierta")
+        order = fx.make_customer_order(db, ts, status="entregada")
         for variant in (v1a, v1b, v2a, v2b):
             fx.make_order_item(db, order, variant, participant_id=ana.id)
 
@@ -618,7 +681,7 @@ class TestTableSessionsService(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta")
+        order = fx.make_customer_order(db, ts, status="entregada")
         fx.make_order_item(db, order, variant, participant_id=ana.id)
 
         register = fx.make_cash_register(db)
@@ -656,11 +719,13 @@ class TestTableSessionsService(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIsNotNone(db.get(SessionParticipant, ana.id))
 
-        # Mismo resultado con el único ítem asignado ya anulado y su pedido
-        # pagado (no cobrable): la consulta de `remove_participant` no filtra
-        # por `estado_cocina` ni por `CustomerOrder.status`.
-        item.estado_cocina = "anulado"
-        s["order"].status = "pagada"
+        # Mismo resultado con el único ítem asignado ya cancelado y su pedido
+        # pagado (no cobrable, spec 147: 'entregada'+'PAID'): la consulta de
+        # `remove_participant` no filtra por `estado_cocina` ni por
+        # `CustomerOrder.status`/`payment_status`.
+        item.estado_cocina = "cancelado"
+        s["order"].status = "entregada"
+        s["order"].payment_status = "PAID"
         db.commit()
 
         with self.assertRaises(HTTPException) as ctx2:
@@ -747,19 +812,19 @@ class TestTableSessionsService(unittest.TestCase):
         self.assertEqual(ts.status, "active")
 
     def test_release_paid_session_409_con_cocina_en_curso_sobre_pedido_pagado(self):
-        """Aun sin nada billable, la comida puede seguir en curso en cocina
-        sobre un pedido ya 'pagada' (se cobró antes de que terminara de
-        prepararse, p.ej. vía `checkout.checkout_and_send`):
-        `release_paid_session` sigue rechazando, porque reusa
+        """Aun sin ninguna orden abierta (FR-016), la comida puede seguir en
+        curso en cocina sobre un pedido ya cerrado (`'entregada'`+`'PAID'`,
+        FR-002a: un ítem nuevo agregado después de la primera entrega nace
+        `'pendiente'`): `release_paid_session` sigue rechazando, porque reusa
         `_assert_closable` sobre **todos** los pedidos de la sesión —no solo
-        los billables, que ya no incluirían este— para que el chequeo de
+        los abiertos, que ya no incluirían este— para que el chequeo de
         cocina en curso siga aplicando."""
         db, table, ts = self._seed_bare_session()
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="pagada")
-        fx.make_order_item(db, order, variant, estado_cocina="en_preparacion")
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
+        fx.make_order_item(db, order, variant, estado_cocina="pendiente")
         cashier = fx.make_user_double()
         db.commit()
 
@@ -777,8 +842,8 @@ class TestTableSessionsService(unittest.TestCase):
         bloqueaba `release_paid_session` para siempre, sin ninguna acción
         posible desde la UI (el pedido ya es terminal). Contraste directo con
         `test_release_paid_session_409_con_cocina_en_curso_sobre_pedido_pagado`
-        (mismo escenario de ítem `'en_preparacion'`, pero con `status='pagada'`,
-        que sí debe seguir bloqueando)."""
+        (mismo escenario de ítem `'pendiente'`, pero con el pedido
+        `'entregada'`+`'PAID'`, que sí debe seguir bloqueando)."""
         db, table, ts = self._seed_bare_session()
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
@@ -797,15 +862,16 @@ class TestTableSessionsService(unittest.TestCase):
         self.assertEqual(table.status, "libre")
 
     def test_release_paid_session_libera_la_mesa_cuando_todo_esta_pagado_y_listo(self):
-        """Camino feliz: nada billable y la comida del único pedido 'pagada'
-        ya está 'listo' → cierra la sesión en cascada y libera la mesa, igual
-        que `close_session` pero sin ninguna venta que emitir."""
+        """Camino feliz: ninguna orden abierta y la comida del único pedido
+        cerrado (`'entregada'`+`'PAID'`) ya está `'entregado'` → cierra la
+        sesión en cascada y libera la mesa, igual que `close_session` pero
+        sin ninguna venta que emitir."""
         db, table, ts = self._seed_bare_session()
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="pagada")
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         cashier = fx.make_user_double()
         db.commit()
 
@@ -826,8 +892,8 @@ class TestTableSessionsService(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="pagada")
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         huerfano = fx.make_participant(db, table_session=ts, status="closed")
         cart = fx.make_cart(db, participant=huerfano, status="abandonado")
         cart_id = cart.id
@@ -842,25 +908,21 @@ class TestTableSessionsService(unittest.TestCase):
         self.assertIsNone(db.get(Cart, cart_id))
 
     def test_release_paid_session_libera_una_mesa_pagada_por_qr_aunque_la_orden_siga_abierta(self):
-        """Regresión (spec 028): `approve_payment_attempt`/
-        `confirm_cash_payment_attempt` (`orders/checkout.py`) ya generan la
-        `Sale`/`Invoice` al confirmar un pago QR, pero DEJAN la orden en
-        `status="abierta"` a propósito —no `"pagada"`— para que siga siendo
-        consumo activo visible mientras cocina la termina (`activeOrders`/
-        `tableOrders` del frontend excluyen `"pagada"`; marcarla así de
-        inmediato haría ver la mesa como libre con el pedido aún en
-        preparación). Antes de este fix, `has_billable_orders`/
-        `_billable_orders` solo miraban `status`, así que ese pedido nunca
-        dejaba de contar como "por cobrar" y la mesa jamás se liberaba —ni
-        por el barrido ni por "Liberar Mesa"— aunque ya estuviera pagada y
-        facturada: el bug reportado en producción. Se reproduce sembrando una
-        `Sale` real asociada al pedido, sin pasar por `status="pagada"`."""
+        """Regresión (spec 028), reescrita spec 147: `approve_payment_attempt`/
+        `confirm_cash_payment_attempt` (`orders/checkout.py`) generan la
+        `Sale`/`Invoice` al confirmar un pago QR Y fijan `payment_status =
+        'PAID'` en la MISMA transacción (a diferencia del viejo `status`, que
+        rara vez llegaba a `'pagada'` por sí solo) -- `payment_status` es
+        ahora la señal confiable de "ya se cobró" que antes requería mirar si
+        existía una `Sale`. Se reproduce sembrando una `Sale` real asociada al
+        pedido junto con `payment_status='PAID'`, igual que hacen esas dos
+        funciones."""
         db, table, ts = self._seed_bare_session()
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta")
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         cashier = fx.make_user_double()
         shift = fx.make_cash_shift(db)
         db.add(Sale(
@@ -891,8 +953,8 @@ class TestTableSessionsService(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="pagada")
-        fx.make_order_item(db, order, variant, estado_cocina="listo")
+        order = fx.make_customer_order(db, ts, status="entregada", payment_status="PAID")
+        fx.make_order_item(db, order, variant, estado_cocina="entregado")
         cashier = fx.make_user_double()
         db.commit()
 
@@ -935,15 +997,15 @@ class TestVigenciaCongeladaSesionMesa(unittest.TestCase):
         )
 
         ronda1 = fx.make_customer_order(
-            db, ts, status="abierta",
+            db, ts, status="entregada",
             promotion_evaluated_at=_utc_para_hora_local(2026, 9, 2, 19, 59),
         )
-        fx.make_order_item(db, ronda1, variant, estado_cocina="listo")
+        fx.make_order_item(db, ronda1, variant, estado_cocina="entregado")
         ronda2 = fx.make_customer_order(
-            db, ts, status="abierta",
+            db, ts, status="entregada",
             promotion_evaluated_at=_utc_para_hora_local(2026, 9, 2, 20, 5),
         )
-        fx.make_order_item(db, ronda2, variant, estado_cocina="listo")
+        fx.make_order_item(db, ronda2, variant, estado_cocina="entregado")
         db.commit()
 
         resp = service.compute_bill(db, ts.id)
@@ -966,12 +1028,12 @@ class TestVigenciaCongeladaSesionMesa(unittest.TestCase):
         )
 
         congelado = fx.make_customer_order(
-            db, ts, status="abierta",
+            db, ts, status="entregada",
             promotion_evaluated_at=_utc_para_hora_local(2026, 9, 2, 19, 59),
         )
-        fx.make_order_item(db, congelado, variant, estado_cocina="listo")
-        anterior = fx.make_customer_order(db, ts, status="abierta")  # sin instante
-        fx.make_order_item(db, anterior, variant, estado_cocina="listo")
+        fx.make_order_item(db, congelado, variant, estado_cocina="entregado")
+        anterior = fx.make_customer_order(db, ts, status="entregada")  # sin instante
+        fx.make_order_item(db, anterior, variant, estado_cocina="entregado")
         db.commit()
 
         resp = service.compute_bill(db, ts.id)
@@ -993,7 +1055,7 @@ class TestTryReleaseAndNotify(unittest.TestCase):
         if comensal_abierto:
             fx.make_participant(db, table_session=ts, display_name="Beto")
         if con_pedido_por_cobrar:
-            fx.make_customer_order(db, ts, status="abierta")
+            fx.make_customer_order(db, ts, status="entregada")
         db.commit()
         return db, table, ts
 

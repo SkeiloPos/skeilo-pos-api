@@ -124,7 +124,9 @@ class TestCartPaymentAttempts(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_create_payment_attempt_409_si_la_orden_no_esta_recibida(self):
-        db, participant, order = self._seed_order(order_status="abierta")
+        # Spec 147: 'abierta' ya no existe; 'entregada' es el valor no-'pendiente'
+        # que sigue disparando el rechazo.
+        db, participant, order = self._seed_order(order_status="entregada")
         nequi = fx.make_payment_method(db, name="Nequi", is_cash=False, type="transfer")
         db.commit()
 

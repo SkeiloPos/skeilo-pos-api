@@ -81,7 +81,7 @@ class TestSweepSchema(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, participant=participant, status="abierta")
+        order = fx.make_customer_order(db, ts, participant=participant, status="pendiente")
         fx.make_order_item(db, order, variant)
         db.commit()
 
@@ -118,7 +118,7 @@ class TestSweepSchema(unittest.TestCase):
 
         pedido_huerfano = CustomerOrder(
             id=uuid.uuid4(), dining_table_id=table.id, table_session_id=None,
-            participant_id=None, channel="POS", status="abierta",
+            participant_id=None, channel="POS", status="pendiente",
             created_at=datetime.now(),
         )
         db.add(pedido_huerfano)

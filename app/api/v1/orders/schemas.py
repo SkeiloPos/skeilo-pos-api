@@ -32,29 +32,29 @@ class OrderType(str, Enum):
 
 
 class OrderStatus(str, Enum):
-    """Ciclo del pedido. El estado de cocina es por ítem (`estado_cocina`)."""
-    #: Estado inicial para toda orden nueva, de cualquier canal; todavía no descuenta inventario.
+    """Ciclo del pedido (spec 147: colapsado a 3 estados). El estado de cocina
+    es por ítem (`estado_cocina`); el de pago es independiente (`payment_status`)."""
+    #: Estado inicial para toda orden nueva, de cualquier canal.
     PENDIENTE = "pendiente"
-    #: Confirmada por staff: aquí se descontó el stock.
-    ABIERTA = "abierta"
-    BLOQUEADA = "bloqueada"
-    PAGADA = "pagada"
+    #: Entregada con la acción única "Entregar" (POST /orders/{id}/deliver,
+    #: spec 147); no implica nada sobre el pago.
+    ENTREGADA = "entregada"
     CANCELADA = "cancelada"
 
 
 class PaymentStatus(str, Enum):
-    """Estado de pago de la orden, independiente de `OrderStatus` (spec 146)."""
+    """Estado de pago de la orden, independiente de `OrderStatus` (spec 146;
+    colapsado a 2 valores en spec 147)."""
     UNPAID = "UNPAID"
     PAID = "PAID"
-    PARTIAL = "PARTIAL"
 
 
 class KitchenStatus(str, Enum):
-    """Estado de preparación por ítem, independiente del status de pago."""
+    """Estado de preparación por ítem (spec 147: colapsado a 3 estados), sin
+    acción propia — sigue siempre el de su pedido (FR-022)."""
     PENDIENTE = "pendiente"
-    EN_PREPARACION = "en_preparacion"
-    LISTO = "listo"
-    ANULADO = "anulado"
+    ENTREGADO = "entregado"
+    CANCELADO = "cancelado"
 
 
 # ---------- Mesas ----------

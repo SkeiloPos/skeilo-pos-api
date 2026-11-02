@@ -21,7 +21,7 @@ from decimal import Decimal
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.api.v1.orders import checkout
+from app.api.v1.orders import checkout, kitchen
 from app.api.v1.orders.schemas import CheckoutAndSendIn, PayIn
 from app.api.v1.sales.schemas import PaymentIn, SaleCreate
 from app.characterization_tests import orders_fixtures as fx
@@ -34,17 +34,21 @@ def _pago(method_id, amount, reference=None) -> PaymentIn:
 
 
 def _seed_order(*, order_type="DINE_IN", delivery_fee=None):
-    """Mesa ocupada + sesión + orden 'bloqueada', con un ítem cobrable de
+    """Mesa ocupada + sesión + orden 'pendiente', con un ítem cobrable de
     inmediato -- mismo patrón que `test_orders_checkout.py::_seed_order_con_receta`,
-    sin receta (este script no ejercita inventario)."""
+    sin receta (este script no ejercita inventario). Spec 147: `pay_order` ya
+    no exige ningún status intermedio ('bloqueada' no existe) -- cobra en
+    cualquier status salvo 'cancelada'."""
     db = fx.new_session()
     table = fx.make_dining_table(db, status="ocupada")
     ts = fx.make_table_session(db, table=table)
     category = fx.make_category(db)
     product = fx.make_product(db, category=category)
     variant = fx.make_variant(db, product=product, price=PRECIO)
-    order = fx.make_customer_order(db, ts, status="bloqueada", channel="POS", order_type=order_type)
-    fx.make_order_item(db, order, variant, quantity=1)
+    order = fx.make_customer_order(db, ts, status="pendiente", channel="POS", order_type=order_type)
+    # spec 147: estado_cocina='listo' ya no es válido; 'pendiente' es
+    # correcto aquí (pagar no exige haber entregado, FR-004).
+    fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
     if delivery_fee is not None:
         order.delivery_fee = delivery_fee
     register = fx.make_cash_register(db)
@@ -61,8 +65,9 @@ def _seed_order(*, order_type="DINE_IN", delivery_fee=None):
 
 def _test_pago_mixto_crea_dos_filas_payment(order_type: str, total: Decimal) -> None:
     """Historia 1 (Esquema de escenario): efectivo + transferencia sumando el
-    total -> el pedido queda 'pagada' con 2 filas `Payment` que suman el total,
-    para Mesa (DINE_IN), Para llevar (TAKEAWAY) y Domicilio (DELIVERY)."""
+    total -> el pedido queda `payment_status='PAID'` (status no se toca,
+    spec 147/FR-003) con 2 filas `Payment` que suman el total, para Mesa
+    (DINE_IN), Para llevar (TAKEAWAY) y Domicilio (DELIVERY)."""
     delivery_fee = Decimal("3000") if order_type == "DELIVERY" else None
     s = _seed_order(order_type=order_type, delivery_fee=delivery_fee)
     efectivo_monto = total - Decimal("6000")
@@ -79,7 +84,8 @@ def _test_pago_mixto_crea_dos_filas_payment(order_type: str, total: Decimal) -> 
     assert len(sale.payments) == 2, f"se esperaban 2 pagos, hubo {len(sale.payments)}"
     assert sum(p.amount for p in sale.payments) == total
     s["db"].refresh(s["order"])
-    assert s["order"].status == "pagada"
+    assert s["order"].payment_status == "PAID"
+    assert s["order"].status == "pendiente", "spec 147: pagar no toca status"
     print(f"OK: pago_mixto_crea_dos_filas_payment [{order_type}]")
 
 
@@ -155,7 +161,9 @@ def test_dos_lineas_mismo_metodo_rechazadas_422() -> None:
     else:
         raise AssertionError("debía rechazar 2 líneas con el mismo método")
     s["db"].refresh(s["order"])
-    assert s["order"].status == "bloqueada", f"el pedido no debía quedar pagado, quedó {s['order'].status}"
+    assert s["order"].payment_status == "UNPAID", (
+        f"el pedido no debía quedar pagado, quedó payment_status={s['order'].payment_status}"
+    )
     print("OK: dos_lineas_mismo_metodo_rechazadas_422")
 
 
@@ -185,7 +193,10 @@ def test_tres_lineas_dos_repiten_metodo_rechazadas_422() -> None:
 def test_release_table_tras_pago_mixto() -> None:
     """US5/RN12/FR-018: `release_table` sigue liberando la mesa tras un
     cobro con 2 líneas de pago, igual que con una sola (no depende de
-    ningún campo de método único)."""
+    ningún campo de método único). Spec 147 (FR-015/FR-016): pagar ya no
+    basta -- `release_table` también exige que el pedido esté `'entregada'`
+    (un pedido `'pendiente'` siempre bloquea, pagado o no), así que aquí se
+    entrega explícitamente antes de liberar."""
     s = _seed_order()
     data = PayIn(
         cash_shift_id=s["shift"].id,
@@ -195,6 +206,7 @@ def test_release_table_tras_pago_mixto() -> None:
         ],
     )
     checkout.pay_order(s["db"], s["order"].id, data, s["cashier"])
+    kitchen.deliver_order(s["db"], s["order"].id)
 
     result = checkout.release_table(s["db"], s["table"].id, closed_by=s["cashier"])
     assert result.status == "libre", f"la mesa debía quedar libre, quedó {result.status}"

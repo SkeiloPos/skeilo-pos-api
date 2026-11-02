@@ -64,6 +64,9 @@ def _call_list_orders(db, *, status=None, order_type=None, active_sessions_only=
         date_from=None,
         date_to=None,
         q=None,
+        # Spec 147: default `Query(False, ...)` -- llamado directo necesita
+        # el valor explícito (mismo gotcha de los otros params Query).
+        entregadas_sin_cobrar=False,
         db=db,
         _=fx.make_user_double(),
     )
@@ -73,7 +76,7 @@ def _call_list_tables(db, *, page=None, size=None):
     return orders_router.list_tables(page=page, size=size, db=db, _=fx.make_user_double())
 
 
-def _seed_order(db, ts, *, created_at, status="abierta", order_type="DINE_IN", con_sale=False):
+def _seed_order(db, ts, *, created_at, status="pendiente", order_type="DINE_IN", con_sale=False):
     # Sin `user_id`: `shared.users` no está en el esquema SQLite de los tests de
     # `orders` (`orders_fixtures._TABLE_NAMES`), igual que en el resto de la red.
     order = fx.make_customer_order(
@@ -129,16 +132,19 @@ class TestOrdersListModoCompatible(unittest.TestCase):
         self.assertEqual(ids, [str(vivo.id)])
 
     def test_status_crudo_se_conserva_en_modo_compatible(self):
+        # Spec 147: 'abierta'/'bloqueada' ya no son valores válidos --
+        # 'pendiente'/'entregada' son los dos valores no terminales que
+        # distinguen esta prueba ahora.
         db = fx.new_session()
         ts = fx.make_table_session(db)
-        abierta = _seed_order(db, ts, created_at=datetime(2026, 9, 1, 12, 0), status="abierta")
-        _seed_order(db, ts, created_at=datetime(2026, 9, 1, 13, 0), status="bloqueada")
+        pendiente = _seed_order(db, ts, created_at=datetime(2026, 9, 1, 12, 0), status="pendiente")
+        _seed_order(db, ts, created_at=datetime(2026, 9, 1, 13, 0), status="entregada")
         db.commit()
 
-        resp = _call_list_orders(db, status="abierta")
+        resp = _call_list_orders(db, status="pendiente")
 
         ids = [o["id"] for o in json.loads(resp.body)]
-        self.assertEqual(ids, [str(abierta.id)])
+        self.assertEqual(ids, [str(pendiente.id)])
 
     def test_page_presente_con_active_sessions_only_no_da_400_y_la_bandera_se_ignora(self):
         db = fx.new_session()

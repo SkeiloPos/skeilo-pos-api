@@ -35,7 +35,7 @@ class TestDraftPreviewParity(unittest.TestCase):
         variant = fx.make_variant(
             db, product=fx.make_product(db, category=category), price=PRECIO
         )
-        order = fx.make_customer_order(db, ts, status="abierta", channel="POS")
+        order = fx.make_customer_order(db, ts, status="pendiente", channel="POS")
         promo = fx.make_promotion(db, status="active")
         fx.add_rule_to_promotion(
             db, promo, type="percent", value=Decimal("50"), min_qty=2, variants=[variant],

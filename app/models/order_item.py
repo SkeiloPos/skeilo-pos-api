@@ -12,7 +12,8 @@ if TYPE_CHECKING:
 #: Ítems que aún no están terminados. Es la misma regla en tres sitios —bloquear
 #: el cobro, cerrar la sesión de mesa y marcar listo un pedido entero—, así que
 #: vive junto al modelo dueño del campo en vez de copiarse en cada uno.
-EN_CURSO = ("pendiente", "en_preparacion")
+#: Spec 147: único valor no terminal tras el colapso de 4 estados a 3.
+EN_CURSO = ("pendiente",)
 
 
 class OrderItem(UUIDPrimaryKeyMixin, Base):
@@ -66,9 +67,10 @@ class OrderItem(UUIDPrimaryKeyMixin, Base):
         ForeignKey("promotions.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
-    # Ciclo de preparación del ítem, independiente del status de pago de la orden.
-    # Las transiciones pendiente→en_preparacion→listo las mueve la terminal de
-    # mesas. 'anulado' se excluye de la validación de bloqueo de cobro.
+    # Ciclo de preparación del ítem, independiente del status de pago de la
+    # orden. Sin transición propia (spec 147, FR-022): sigue siempre la de su
+    # pedido, vía la acción única "Entregar" (pendiente -> entregado).
+    # 'cancelado' se excluye de la validación de bloqueo de cobro.
     estado_cocina: Mapped[str] = mapped_column(
         String(15), nullable=False, server_default="pendiente"
     )
@@ -100,7 +102,7 @@ class OrderItem(UUIDPrimaryKeyMixin, Base):
         CheckConstraint("quantity > 0", name="ck_order_item_quantity_positive"),
         CheckConstraint("addons_total >= 0", name="ck_order_item_addons_total_nonneg"),
         CheckConstraint(
-            "estado_cocina IN ('pendiente', 'en_preparacion', 'listo', 'anulado')",
+            "estado_cocina IN ('pendiente', 'entregado', 'cancelado')",
             name="ck_order_item_estado_cocina",
         ),
         {"schema": "tenant"},

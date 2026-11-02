@@ -1,12 +1,16 @@
 """Semántica de los filtros `status` y `order_type` de la rama paginada de
 `GET /orders` (spec 079, US2 — FR-011 / FR-016 / FR-018, data-model.md §3-§4).
 
-`status` es el "estado que ve la persona" (port de `displayOrderStatus()` al
-servidor), **no** el `status` crudo: una orden `abierta` con `Sale` emitida cae
-bajo `pagada`; una `pagada` cruda sin `Sale` también; una cancelada con venta
-previa nunca. `order_type` filtra por la columna homónima y las órdenes
-históricas con `order_type IS NULL` quedan fuera de cualquier tipo concreto y
-dentro de "Todos" (lógica ternaria de SQL, sin `COALESCE`).
+Reescrito spec 147: con el colapso a 3 estados (`pendiente`, `entregada`,
+`cancelada`), `status` deja de ser un "estado que ve la persona" derivado de
+si ya existe una `Sale` -- ahora filtra directamente por el `status` crudo
+(FR-012/FR-013: ningún campo de respuesta infiere una etiqueta que no sea uno
+de los 3 valores válidos). El pago (`payment_status`) es un eje
+completamente separado, filtrado aparte por `entregadas_sin_cobrar`
+(FR-014/SC-003), no por `status`. `order_type` no cambia: filtra por la
+columna homónima y las órdenes históricas con `order_type IS NULL` quedan
+fuera de cualquier tipo concreto y dentro de "Todos" (lógica ternaria de SQL,
+sin `COALESCE`).
 
 Invoca `router.list_orders` directamente (ver `test_orders_pagination.py`).
 
@@ -45,6 +49,10 @@ def _ids(db, *, status=None, order_type=None):
         date_from=None,
         date_to=None,
         q=None,
+        # Spec 147: default `Query(False, ...)` -- llamado directo sin pasar
+        # por FastAPI necesita el valor explícito (mismo gotcha ya conocido
+        # para los otros params Query de este router).
+        entregadas_sin_cobrar=False,
         db=db,
         _=fx.make_user_double(),
     )
@@ -57,7 +65,7 @@ class _Base(unittest.TestCase):
         self.ts = fx.make_table_session(self.db)
         self._clock = datetime(2026, 9, 1, 8, 0, 0)
 
-    def _order(self, *, status="abierta", order_type="DINE_IN", con_sale=False):
+    def _order(self, *, status="pendiente", order_type="DINE_IN", con_sale=False):
         self._clock += timedelta(minutes=1)
         order = fx.make_customer_order(
             self.db, self.ts, status=status, order_type=order_type, created_at=self._clock,
@@ -73,70 +81,55 @@ class _Base(unittest.TestCase):
 
 
 class TestFiltroDeEstado(_Base):
+    """Reescrita spec 147: `status` ya filtra directo por el valor crudo, sin
+    derivar nada de la existencia de una `Sale` -- esa derivación (la vieja
+    "pagada") ya no existe como estado de pedido; el pago es
+    `payment_status`, un eje aparte (filtrado por `entregadas_sin_cobrar`,
+    no por `status`, ver `test_orders_pagination.py`)."""
 
-    def test_recibida_solo_recibidas_sin_venta(self):
-        recibida = self._order(status="pendiente")
-        self._order(status="pendiente", con_sale=True)  # ya tiene venta → "pagada"
-        self._order(status="abierta")
+    def test_pendiente_solo_pendientes_sin_importar_el_pago(self):
+        pendiente = self._order(status="pendiente")
+        # `con_sale` ya no saca a la orden de 'pendiente' -- el pago es un eje
+        # aparte, independiente de status (FR-003).
+        pendiente_pagada = self._order(status="pendiente", con_sale=True)
+        self._order(status="entregada")
         self.db.commit()
 
-        self.assertEqual(_ids(self.db, status="pendiente"), {recibida.id})
+        self.assertEqual(_ids(self.db, status="pendiente"), {pendiente.id, pendiente_pagada.id})
 
-    def test_abierta_excluye_las_que_ya_tienen_venta(self):
-        abierta = self._order(status="abierta")
-        con_venta = self._order(status="abierta", con_sale=True)
+    def test_entregada_incluye_pagadas_y_sin_pagar(self):
+        entregada_sin_pagar = self._order(status="entregada")
+        entregada_pagada = self._order(status="entregada", con_sale=True)
         self.db.commit()
 
-        self.assertEqual(_ids(self.db, status="abierta"), {abierta.id})
-        self.assertNotIn(con_venta.id, _ids(self.db, status="abierta"))
-
-    def test_bloqueada_excluye_las_que_ya_tienen_venta(self):
-        bloqueada = self._order(status="bloqueada")
-        self._order(status="bloqueada", con_sale=True)
-        self.db.commit()
-
-        self.assertEqual(_ids(self.db, status="bloqueada"), {bloqueada.id})
-
-    def test_pagada_incluye_abierta_con_venta_y_no_aparece_bajo_abierta(self):
-        abierta_con_venta = self._order(status="abierta", con_sale=True)
-        self.db.commit()
-
-        self.assertIn(abierta_con_venta.id, _ids(self.db, status="pagada"))
-        self.assertNotIn(abierta_con_venta.id, _ids(self.db, status="abierta"))
-
-    def test_pagada_incluye_status_pagada_cruda_sin_sale(self):
-        pagada_cruda = self._order(status="pagada")
-        self.db.commit()
-
-        self.assertIn(pagada_cruda.id, _ids(self.db, status="pagada"))
-
-    def test_pagada_excluye_cancelada_con_venta_previa(self):
-        cancelada_con_venta = self._order(status="cancelada", con_sale=True)
-        self.db.commit()
-
-        self.assertNotIn(cancelada_con_venta.id, _ids(self.db, status="pagada"))
-        self.assertIn(cancelada_con_venta.id, _ids(self.db, status="cancelada"))
+        self.assertEqual(
+            _ids(self.db, status="entregada"), {entregada_sin_pagar.id, entregada_pagada.id},
+        )
 
     def test_cancelada_solo_canceladas(self):
         cancelada = self._order(status="cancelada")
-        self._order(status="abierta")
+        self._order(status="entregada")
         self.db.commit()
 
         self.assertEqual(_ids(self.db, status="cancelada"), {cancelada.id})
 
-    def test_sin_filtro_incluye_las_bloqueadas(self):
-        bloqueada = self._order(status="bloqueada")
-        abierta = self._order(status="abierta")
+    def test_sin_filtro_incluye_todos_los_estados(self):
+        pendiente = self._order(status="pendiente")
+        entregada = self._order(status="entregada")
+        cancelada = self._order(status="cancelada")
         self.db.commit()
 
-        self.assertEqual(_ids(self.db), {bloqueada.id, abierta.id})
+        self.assertEqual(_ids(self.db), {pendiente.id, entregada.id, cancelada.id})
 
     def test_status_invalido_da_422(self):
-        self._order(status="abierta")
+        self._order(status="entregada")
         self.db.commit()
 
+        # Spec 147: los valores retirados ('abierta', 'bloqueada', 'pagada')
+        # ya no son aceptados por el filtro -- el enum cerrado tiene 3
+        # valores, no 5.
         with self.assertRaises(HTTPException) as ctx:
-            _ids(self.db, status="entregada")
+            _ids(self.db, status="abierta")
         self.assertEqual(ctx.exception.status_code, 422)
 
 
@@ -164,13 +157,13 @@ class TestFiltroDeTipo(_Base):
 class TestCombinacion(_Base):
 
     def test_status_y_order_type_se_intersecan_con_and(self):
-        objetivo = self._order(status="abierta", order_type="TAKEAWAY")
-        self._order(status="abierta", order_type="DINE_IN")
+        objetivo = self._order(status="pendiente", order_type="TAKEAWAY")
+        self._order(status="pendiente", order_type="DINE_IN")
         self._order(status="cancelada", order_type="TAKEAWAY")
         self.db.commit()
 
         self.assertEqual(
-            _ids(self.db, status="abierta", order_type=OrderType.TAKEAWAY),
+            _ids(self.db, status="pendiente", order_type=OrderType.TAKEAWAY),
             {objetivo.id},
         )
 

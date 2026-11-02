@@ -18,14 +18,16 @@ from sqlalchemy.orm import Session
 from app.models.customer_order import CustomerOrder
 from app.models.dining_table import DiningTable
 
-# Misma tupla que `cart/service.py:82` y `orders/service.py:69` — repetida
-# aquí por el mismo motivo que ya documentan esos dos módulos (evitar un
-# import cruzado entre paquetes de API hermanos).
-_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "abierta", "bloqueada")
-
-# Un único predicado de "activo" para el conteo y para la lista (US6, FR-023):
-# así no pueden divergir.
-_IS_ACTIVE = CustomerOrder.status.in_(_NON_TERMINAL_ORDER_STATUSES)
+# Antes (`"pendiente", "abierta", "bloqueada"`) excluía implícitamente
+# `"pagada"`: un pedido ya cobrado no bloqueaba el cierre de turno. Spec 147
+# retira `"pagada"` -- un pedido `"entregada"` ya cobrado (`payment_status ==
+# "PAID"`, FR-006) tampoco debe bloquear; solo uno sin resolver sí (mismo
+# criterio de "orden abierta" que FR-016, `table_sessions.service.open_orders`).
+# `"confirmado"` (a pedido del usuario) cuenta igual que `"pendiente"`: tampoco
+# es entrega ni pago.
+_IS_ACTIVE = CustomerOrder.status.in_(("pendiente", "confirmado")) | (
+    (CustomerOrder.status == "entregada") & (CustomerOrder.payment_status == "UNPAID")
+)
 
 
 @dataclass
