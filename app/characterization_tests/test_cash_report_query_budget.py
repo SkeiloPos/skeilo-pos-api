@@ -249,7 +249,10 @@ class TestAgregacionEnLaBaseDeDatos(unittest.TestCase):
     def test_productos_agrupa_y_limita_y_categorias_agrupa(self):
         db = fx.new_session()
         variants = _seed_variants(db, 12)  # > TOP_PRODUCTS_LIMIT
-        shift = fx.make_cash_shift(db)
+        # `opened_at` fijo dentro de octubre de 2026 (BASE): sin esto, el turno
+        # nace con `datetime.now()` y cae fuera del período consultado por
+        # `_periodo` (ref_date=2026-10-15) en cuanto la fecha real avanza.
+        shift = fx.make_cash_shift(db, opened_at=BASE)
         db.commit()
         db.add_all([row for v in variants for row in _sale_pair(shift, v)])
         db.commit()
