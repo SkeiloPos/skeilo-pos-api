@@ -23,7 +23,9 @@ from app.models.dining_table import DiningTable
 # retira `"pagada"` -- un pedido `"entregada"` ya cobrado (`payment_status ==
 # "PAID"`, FR-006) tampoco debe bloquear; solo uno sin resolver sí (mismo
 # criterio de "orden abierta" que FR-016, `table_sessions.service.open_orders`).
-_IS_ACTIVE = (CustomerOrder.status == "pendiente") | (
+# `"confirmado"` (a pedido del usuario) cuenta igual que `"pendiente"`: tampoco
+# es entrega ni pago.
+_IS_ACTIVE = CustomerOrder.status.in_(("pendiente", "confirmado")) | (
     (CustomerOrder.status == "entregada") & (CustomerOrder.payment_status == "UNPAID")
 )
 

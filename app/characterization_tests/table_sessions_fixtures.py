@@ -123,6 +123,10 @@ _TABLE_SESSIONS_TABLE_NAMES = [
     "sale_items",
     "invoices",
     "invoice_counters",
+    # Spec 147 ciclo 2: `ensure_inventory_deducted` (vía `_deduct_and_open`)
+    # escribe el marcador `AuditLog "order.inventory_confirmed"` al cobrar un
+    # pedido QR que nunca pasó por la revisión de pago.
+    "audit_logs",
 ]
 
 _TABLE_NAMES = _CATALOG_TABLE_NAMES + _TABLE_SESSIONS_TABLE_NAMES

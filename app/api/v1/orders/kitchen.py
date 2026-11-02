@@ -31,6 +31,48 @@ from app.api.v1.orders.schemas import VoidItemIn
 logger = logging.getLogger(__name__)
 
 
+def receive_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
+    """"Recibir" un pedido recién llegado (`pendiente` → `confirmado`), sin
+    tocar cocina ni pago (A pedido del usuario: decide el cajero, paso previo
+    a "Entregar" -- antes de esto el panel de cobro de la terminal ya se ve,
+    pero `_assert_closable` (`table_sessions/service.py`) sigue rechazando
+    cobrar mientras el pedido siga sin entregar).
+
+    Deliberadamente DISTINTO de `orders.checkout.confirm_order` (`POST
+    /orders/{id}/confirm`, preexistente): ese otro descuenta inventario y
+    exige un intento de pago ya confirmado -- este no toca ninguno de los
+    dos, es puramente informativo para el cajero.
+
+    Idempotente: recibir un pedido ya `'confirmado'` o `'entregada'` es
+    no-op exitoso. `'cancelada'` es la única transición inválida."""
+    order = db.execute(
+        select(CustomerOrder)
+        .where(CustomerOrder.id == order_id)
+        .with_for_update(of=CustomerOrder)
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    if order.status == "cancelada":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"Transición inválida (status={order.status})"
+        )
+    if order.status != "pendiente":
+        return order
+
+    order.status = "confirmado"
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Error recibiendo el pedido")
+        raise
+    db.refresh(order)
+
+    events.order_received(tenant_id, order_id=order.id, table_session_id=order.table_session_id)
+
+    return order
+
+
 def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
     """Entregar un pedido completo con una sola acción, idempotente (spec 147,
     FR-001/FR-002a/FR-011, research.md R3).
@@ -43,9 +85,11 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     - `status == 'entregada'` → no es error: promueve cualquier ítem
       `'pendiente'` (nacido después de la primera entrega, FR-002a) a
       `'entregado'`; si no había ninguno, no-op exitoso sin emitir evento.
-    - `status == 'pendiente'` → pasa a `'entregada'` y todos sus ítems
-      `'pendiente'` a `'entregado'`; `payment_status` no se toca
-      (FR-001/FR-003)."""
+    - `status in ('pendiente', 'confirmado')` → pasa a `'entregada'` y todos
+      sus ítems `'pendiente'` a `'entregado'`; `payment_status` no se toca
+      (FR-001/FR-003). A pedido del usuario: entregar ya no exige pasar antes
+      por `confirm_order` -- "Recibir" es un paso informativo del cajero, no
+      una validación que el backend imponga."""
     order = db.execute(
         select(CustomerOrder)
         .options(selectinload(CustomerOrder.items))
@@ -60,7 +104,7 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
         )
 
     cambiados = [it for it in order.items if it.estado_cocina == "pendiente"]
-    was_pendiente = order.status == "pendiente"
+    was_pendiente = order.status in ("pendiente", "confirmado")
 
     if not cambiados and not was_pendiente:
         # Ya entregada, sin ítems nuevos que promover: no-op exitoso, sin

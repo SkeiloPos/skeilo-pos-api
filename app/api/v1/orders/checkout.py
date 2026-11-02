@@ -657,6 +657,35 @@ def _deduct_and_open(db: Session, order: CustomerOrder, user: User) -> CustomerO
     return order
 
 
+def ensure_inventory_deducted(db: Session, order: CustomerOrder, cashier: User) -> None:
+    """Descuenta el inventario de `order` solo si todavía no se descontó por
+    ningún camino -- ni por `_deduct_and_open` (QR/mostrador confirmados) ni
+    por `consolidation.add_item_to_order` (mesero, que descuenta de inmediato
+    por ítem, sin pasar nunca por `_deduct_and_open`). Mismo chequeo que ya
+    usa `cancel_order` para decidir si hay algo que revertir: un
+    `InventoryMovement` de salida por venta con `reference_id == order.id`
+    (a diferencia del `AuditLog "order.inventory_confirmed"` de
+    `_deduct_and_open`, que NO se escribe para el camino del mesero y daría
+    un falso "nunca se descontó" -- doble descuento).
+
+    A pedido del usuario (spec 147 ciclo 2): la revisión de pago QR
+    (aprobar comprobante/confirmar efectivo) deja de ser el único punto que
+    garantiza el descuento de un pedido QR -- `table_sessions.service` llama
+    esto al cobrar la sesión, para el caso de un pedido QR que se entregó y
+    se cobra en persona sin haber pasado nunca por esa revisión."""
+    deducted = db.execute(
+        select(InventoryMovement.id).where(
+            InventoryMovement.reference_type == inventory_reasons.REF_ORDER,
+            InventoryMovement.reference_id == order.id,
+            InventoryMovement.type == "out",
+            InventoryMovement.reason == inventory_reasons.VENTA,
+        ).limit(1)
+    ).scalar_one_or_none()
+    if deducted is not None:
+        return
+    _deduct_and_open(db, order, cashier)
+
+
 def _confirm_order_impl(db: Session, order_id: UUID, user: User) -> CustomerOrder:
     """Lógica de `pendiente` → `abierta` (descuento de inventario incluido), sin
     `commit`/`rollback` propios — quien la invoque decide la frontera de la
@@ -866,9 +895,22 @@ def checkout_and_send(
         # diferencia de `_deduct_and_open` en sus otros dos llamadores (QR,
         # sin venta todavía en ese instante), aquí la `Sale` ya se construyó
         # arriba en esta misma transacción — el pago queda `PAID` de una vez.
-        # `status` no se toca (FR-003/FR-004): el pedido sigue `'pendiente'`
-        # hasta que se entregue, independientemente del pago.
+        # `status` no se toca para un pedido DE MESA (FR-003/FR-004): sigue
+        # `'pendiente'` hasta que se entregue, independientemente del pago —
+        # cobrar y preparar/entregar son decisiones separadas en una mesa.
+        #
+        # A pedido del usuario (spec 147 ciclo 2): un pedido SIN mesa
+        # (`dining_table_id is None` -- mostrador, domicilio o para llevar)
+        # no tiene ningún paso de entrega aparte que valga la pena mostrar:
+        # se despacha al cobrarlo. Mismo efecto que `deliver_order`
+        # (`kitchen.py`) -- status a `'entregada'` y los ítems `'pendiente'`
+        # a `'entregado'` -- pero dentro de esta misma transacción.
         order.payment_status = "PAID"
+        if order.dining_table_id is None:
+            for it in order.items:
+                if it.estado_cocina == "pendiente":
+                    it.estado_cocina = "entregado"
+            order.status = "entregada"
 
         # spec 074: copiado antes del `commit` (ver `approve_payment_attempt`).
         order_id_for_audit = order.id
@@ -1227,8 +1269,9 @@ def release_table(
             # `TERMINAL` ("pagada","cancelada") lo excluía, pero tras la
             # migración todo pedido cerrado queda en 'entregada', que sin este
             # ajuste bloquearía para siempre (comportamiento roto en
-            # silencio, Principio III).
-            (CustomerOrder.status == "pendiente")
+            # silencio, Principio III). `'confirmado'` (a pedido del usuario)
+            # cuenta igual que `'pendiente'`.
+            CustomerOrder.status.in_(("pendiente", "confirmado"))
             | (
                 (CustomerOrder.status == "entregada")
                 & (CustomerOrder.payment_status == "UNPAID")

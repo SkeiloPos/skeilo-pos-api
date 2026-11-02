@@ -68,8 +68,9 @@ logger = logging.getLogger(__name__)
 #: `cart.service._NON_TERMINAL_ORDER_STATUSES` — se repite aquí (en vez de
 #: importarlo) porque cada módulo de este paquete define el suyo (ver
 #: `checkout.TERMINAL`), y `cart.service` ya importa de `table_sessions.service`,
-#: que a su vez depende de `orders.checkout`.
-_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "entregada")
+#: que a su vez depende de `orders.checkout`. Incluye `'confirmado'` (a
+#: pedido del usuario): mismo criterio, ninguno de los tres es entrega ni pago.
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "confirmado", "entregada")
 
 #: Combinaciones canal × tipo de orden con sentido de negocio (spec 055,
 #: FR-006; research.md D4) — validado solo aquí: es el único punto donde
@@ -499,12 +500,13 @@ def list_orders(
     return db.execute(q).scalars().all()
 
 
-#: Los 3 valores exactos del filtro de estado de la pantalla "Órdenes" (spec
-#: 147: colapsado de 5 a 3) — el conjunto cerrado que acepta la rama paginada
-#: de `GET /orders` (spec 079, FR-008, data-model.md §3). `None` / ausente =
-#: "Todos" (sin predicado). El router valida contra este conjunto y responde
-#: 422 fuera de rango.
-ESTADOS_MOSTRADOS_ORDENES = ("pendiente", "entregada", "cancelada")
+#: Los valores exactos del filtro de estado de la pantalla "Órdenes" (spec
+#: 147: colapsado de 5 a 3; `'confirmado'` agregado después, a pedido del
+#: usuario) — el conjunto cerrado que acepta la rama paginada de `GET /orders`
+#: (spec 079, FR-008, data-model.md §3). `None` / ausente = "Todos" (sin
+#: predicado). El router valida contra este conjunto y responde 422 fuera de
+#: rango.
+ESTADOS_MOSTRADOS_ORDENES = ("pendiente", "confirmado", "entregada", "cancelada")
 
 
 def list_orders_query(

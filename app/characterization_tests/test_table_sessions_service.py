@@ -33,6 +33,7 @@ from app.api.v1.table_sessions.schemas import CloseSessionIn, ItemAssignmentIn
 from app.api.v1.sales.schemas import PaymentIn
 from app.models.cart import Cart
 from app.models.dining_table import DiningTable
+from app.models.inventory_movement import InventoryMovement
 from app.models.order_item import OrderItem, OrderItemOption
 from app.models.sale import Sale
 from app.models.session_participant import SessionParticipant
@@ -454,6 +455,64 @@ class TestTableSessionsService(unittest.TestCase):
         s["db"].refresh(s["table"])
         self.assertEqual(s["ts"].status, "closed")
         self.assertEqual(s["table"].status, "libre")
+
+    def test_charge_session_descuenta_inventario_de_un_pedido_qr_que_nunca_paso_por_confirm(self):
+        """Spec 147 ciclo 2 (a pedido del usuario): "Entregar" es independiente
+        del pago -- un pedido QR puede llegar aquí `'entregada'` sin que el
+        comensal jamás haya completado su pago a distancia (ni comprobante
+        aprobado ni efectivo confirmado), así que nunca pasó por
+        `_deduct_and_open`. `charge_session`/`close_session` deben descontar
+        el inventario ahí mismo (`ensure_inventory_deducted`) en vez de dejar
+        la venta sin ningún movimiento -- antes de esta spec, nada lo hacía
+        para un pedido QR en ese estado."""
+        s = self._seed_billable_session()
+        s["order"].channel = "QR_MENU"
+        insumo = fx.make_inventory_item(s["db"], current_stock=Decimal("100"))
+        fx.make_recipe_item(s["db"], s["variant"], insumo, quantity=Decimal("2"))
+        s["db"].commit()
+
+        movimientos_antes = s["db"].execute(
+            select(func.count(InventoryMovement.id)).where(InventoryMovement.reference_id == s["order"].id)
+        ).scalar_one()
+        self.assertEqual(movimientos_antes, 0)
+
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+        resp = service.close_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        self.assertEqual(len(resp.sale_ids), 1)
+        movimientos_despues = s["db"].execute(
+            select(func.count(InventoryMovement.id)).where(InventoryMovement.reference_id == s["order"].id)
+        ).scalar_one()
+        self.assertEqual(movimientos_despues, 1)
+        s["db"].refresh(insumo)
+        self.assertEqual(Decimal(insumo.current_stock), Decimal("98"))
+
+    def test_charge_session_no_vuelve_a_descontar_un_pedido_de_mesero_ya_descontado(self):
+        """Un pedido `POS` (mesero) descuenta de inmediato al agregar cada
+        ítem (`consolidation.add_item_to_order`) -- `ensure_inventory_
+        deducted` ni siquiera se consulta para `channel != 'QR_MENU'`
+        (acotado a propósito, ver el comentario de `_charge_session`), así
+        que cobrar no debe generar un segundo movimiento ni exigirle receta
+        a una variante que nunca la tuvo."""
+        s = self._seed_billable_session()
+        self.assertEqual(s["order"].channel, "POS")
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        resp = service.close_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        self.assertEqual(len(resp.sale_ids), 1)
+        movimientos = s["db"].execute(
+            select(func.count(InventoryMovement.id)).where(InventoryMovement.reference_id == s["order"].id)
+        ).scalar_one()
+        self.assertEqual(movimientos, 0)
 
     def test_close_session_borra_carrito_huerfano_de_comensal_ya_cerrado(self):
         """US2 escenario 1 (spec 039, Acceptance Scenario 1): además de los

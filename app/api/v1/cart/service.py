@@ -9,7 +9,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -85,8 +85,25 @@ from app.core.timezone import utc_now_naive
 #: Estados no terminales de `CustomerOrder` — mientras el comensal tenga una
 #: orden en alguno de estos, no puede crear otra (spec 024, FR-005/FR-006;
 #: research.md spec 024, Decisión 8, mismo criterio de "terminal" que ya usa
-#: `checkout.TERMINAL`/`mark_order_ready`). Spec 147: colapsado a 2 estados.
-_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "entregada")
+#: `checkout.TERMINAL`/`mark_order_ready`). Spec 147: colapsado a 2 estados;
+#: `'confirmado'` se agregó después (a pedido del usuario, paso de recepción
+#: explícito entre `'pendiente'` y `'entregada'`) y cuenta igual que
+#: `'pendiente'` -- ninguno de los dos es entrega ni pago.
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "confirmado", "entregada")
+
+#: "¿Esta orden cuenta como activa para el comensal?" — mismo criterio que
+#: `idx_active_order_per_participant` (`models/customer_order.py`, spec 147
+#: "Corrección post-implementación"): `'pendiente'`/`'confirmado'` siempre
+#: cuentan, pero `'entregada'` solo cuenta mientras siga `'UNPAID'`; una
+#: `'entregada'` ya `'PAID'` está cerrada y no debe bloquear un pedido nuevo
+#: del mismo comensal. Antes de esta corrección, `submit_cart` solo miraba
+#: `status` (sin `payment_status`) y por eso rechazaba con 409 pedidos nuevos
+#: de comensales con una cuenta ya entregada y pagada (bug reportado en
+#: producción).
+_ACTIVE_ORDER_CLAUSE = or_(
+    CustomerOrder.status.in_(("pendiente", "confirmado")),
+    and_(CustomerOrder.status == "entregada", CustomerOrder.payment_status == "UNPAID"),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -844,7 +861,7 @@ def submit_cart(
     active_order = db.execute(
         select(CustomerOrder.id).where(
             CustomerOrder.participant_id == participant.id,
-            CustomerOrder.status.in_(_NON_TERMINAL_ORDER_STATUSES),
+            _ACTIVE_ORDER_CLAUSE,
         )
     ).scalar_one_or_none()
 

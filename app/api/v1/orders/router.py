@@ -379,6 +379,27 @@ def consolidate(
     return _load_order(db, order.id)
 
 
+# ============================ Recepción (a pedido del usuario) ==============
+@router.post(
+    "/{order_id}/receive",
+    response_model=OrderResponse,
+    summary="Recibir un pedido recién llegado (idempotente, sin cobrar ni descontar inventario)",
+)
+def receive_order(
+    order_id: UUID,
+    db: Session = Depends(get_db), _: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    """A pedido del usuario: el cajero "recibe" el pedido QR apenas llega
+    (`pendiente` → `confirmado`), sin cocina ni pago -- paso previo a
+    "Entregar", que a su vez sigue siendo distinto de cobrar. Deliberadamente
+    en una ruta propia, `/receive`, no `/confirm`: esa ya existe arriba
+    (`confirm_order`) con un significado totalmente distinto (descuenta
+    inventario, exige un intento de pago ya confirmado)."""
+    kitchen.receive_order(db, order_id, tenant_id=tenant.id)
+    return _load_order(db, order_id)
+
+
 # ============================ Entrega (spec 147) ============================
 @router.post(
     "/{order_id}/deliver",
@@ -754,6 +775,14 @@ def checkout_and_send(
             tenant.id, order_id=order.id, table_session_id=order.table_session_id
         )
         events.bill_changed(tenant.id, table_session_id=order.table_session_id)
+        # Spec 147 ciclo 2: sin mesa, `checkout.checkout_and_send` ya dejó el
+        # pedido `'entregada'` en la misma transacción (ver su comentario) --
+        # avisa en tiempo real igual que `deliver_order` (kitchen.py) para
+        # que la grilla de mesas/terminal no necesite un sondeo para verlo.
+        if order.dining_table_id is None:
+            events.order_delivered(
+                tenant.id, order_id=order.id, table_session_id=order.table_session_id
+            )
     return sale
 
 

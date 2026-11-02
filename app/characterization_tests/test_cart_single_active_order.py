@@ -90,6 +90,27 @@ class TestCartSingleActiveOrder(unittest.TestCase):
             service.submit_cart(db, participant, efectivo.id)
         self.assertEqual(ctx.exception.status_code, 409)
 
+    def test_segunda_orden_con_la_primera_entregada_y_pagada_se_permite(self):
+        """Corrección post-implementación de spec 147 (data-model.md, mismo
+        criterio que `idx_active_order_per_participant`): una orden
+        `'entregada'` + `payment_status='PAID'` está cerrada -- a diferencia
+        del test anterior (misma `entregada` pero sin pagar), esta SÍ debe
+        liberar el cupo. Bug reportado en producción: el comensal de una
+        mesa ya entregada y pagada no podía enviar una ronda nueva porque
+        `submit_cart` solo miraba `status`, nunca `payment_status`."""
+        db, participant, variant, efectivo = self._seed_session_con_carrito()
+        first = service.submit_cart(db, participant, efectivo.id)
+        first.status = "entregada"
+        first.payment_status = "PAID"
+        db.commit()
+
+        cart2 = fx.make_cart(db, participant=participant)
+        fx.make_cart_item(db, cart2, variant)
+        db.commit()
+
+        second = service.submit_cart(db, participant, efectivo.id)
+        self.assertEqual(second.status, "pendiente")
+
     def test_segunda_orden_tras_cancelar_la_primera_se_permite(self):
         db, participant, variant, efectivo = self._seed_session_con_carrito()
         first = service.submit_cart(db, participant, efectivo.id)

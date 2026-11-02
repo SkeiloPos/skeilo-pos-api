@@ -112,6 +112,62 @@ class TestKitchen(unittest.TestCase):
         nuevo_actualizado = next(it for it in actualizado.items if it.id == nuevo.id)
         self.assertEqual(nuevo_actualizado.estado_cocina, "entregado")
 
+    # ------------------------------------------------- receive_order (a pedido del usuario)
+
+    def test_receive_order_pasa_pendiente_a_confirmado_sin_tocar_cocina_ni_pago(self):
+        """A pedido del usuario: "Recibir" solo mueve `status`, nunca
+        `estado_cocina` ni `payment_status`."""
+        s = self._seed_item(order_status="pendiente", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        with mock.patch("app.core.events.order_received") as publicar:
+            actualizado = kitchen.receive_order(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.status, "confirmado")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+        self.assertTrue(all(it.estado_cocina == "pendiente" for it in actualizado.items))
+
+    def test_receive_order_409_si_cancelada(self):
+        s = self._seed_item(order_status="cancelada", estado_cocina="cancelado")
+        db, order = s["db"], s["order"]
+
+        with self.assertRaises(HTTPException) as ctx:
+            kitchen.receive_order(db, order.id, tenant_id=1)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_receive_order_es_idempotente_sin_segundo_evento(self):
+        s = self._seed_item(order_status="confirmado", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        with mock.patch("app.core.events.order_received") as publicar:
+            actualizado = kitchen.receive_order(db, order.id, tenant_id=1)
+            publicar.assert_not_called()
+
+        self.assertEqual(actualizado.status, "confirmado")
+
+    def test_receive_order_no_op_si_ya_entregada(self):
+        """Recibir un pedido que ya avanzó a `'entregada'` (p. ej. "Entregar"
+        directo desde `'pendiente'`, sin pasar por "Recibir") no lo retrocede."""
+        s = self._seed_item(order_status="entregada", estado_cocina="entregado")
+        db, order = s["db"], s["order"]
+
+        actualizado = kitchen.receive_order(db, order.id, tenant_id=1)
+        self.assertEqual(actualizado.status, "entregada")
+
+    def test_deliver_order_acepta_confirmado_como_origen(self):
+        """A pedido del usuario: `deliver_order` entrega igual desde
+        `'confirmado'`, no solo desde `'pendiente'`."""
+        s = self._seed_item(order_status="confirmado", estado_cocina="pendiente")
+        db, order = s["db"], s["order"]
+
+        with mock.patch("app.core.events.order_delivered") as publicar:
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.status, "entregada")
+        self.assertTrue(all(it.estado_cocina == "entregado" for it in actualizado.items))
+
     # ------------------------ void_item ya no anula un pedido pagado (spec 029/147)
 
     def test_void_item_409_si_payment_status_paid_spec_029_147(self):

@@ -276,6 +276,23 @@ def order_cancelled(tenant_id: int, *, order_id, table_session_id, motivo) -> st
     )
 
 
+def order_received(tenant_id: int, *, order_id, table_session_id) -> str | None:
+    """A pedido del usuario: el pedido recién llegado (`'pendiente'`) pasó a
+    `'confirmado'` -- el cajero lo "recibió", sin cocina ni pago todavía.
+    Distinto de `order_confirmed` (preexistente, descuento de inventario tras
+    aprobar un pago QR). Mismo patrón que `order_delivered` (post-commit,
+    canales staff + sesión)."""
+    channels = [CH_STAFF]
+    if table_session_id is not None:
+        channels.append(session_channel(table_session_id))
+    return publish(
+        tenant_id,
+        type="order.received",
+        channels=channels,
+        payload={"order_id": order_id, "table_session_id": table_session_id, "status": "confirmado"},
+    )
+
+
 def order_delivered(tenant_id: int, *, order_id, table_session_id) -> str | None:
     """Spec 147 (R8, FR-020): el pedido completo (y todos sus ítems
     `'pendiente'`) pasó a `'entregada'` con la acción única "Entregar". Se

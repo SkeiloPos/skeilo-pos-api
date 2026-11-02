@@ -153,7 +153,7 @@ def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) ->
             pendientes = db.execute(
                 select(CustomerOrder.id).where(
                     CustomerOrder.dining_table_id == table_id,
-                    (CustomerOrder.status == "pendiente")
+                    CustomerOrder.status.in_(("pendiente", "confirmado"))
                     | (
                         (CustomerOrder.status == "entregada")
                         & (CustomerOrder.payment_status == "UNPAID")
