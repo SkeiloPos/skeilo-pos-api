@@ -72,5 +72,91 @@ class MenuSoldOutTests(unittest.TestCase):
         self.assertTrue(menu_product.available)  # pedible por stock: sin grupos obligatorios sin stock
 
 
+class MenuSoldOutByInventoryHookTests(unittest.TestCase):
+    """T102 (spec 148, US6): el agotado por receta en `GET /menu` y su
+    interacción con el gancho de inventario (`core/availability_hooks.py`) y
+    la marca manual (FR-011: nunca se tocan entre sí)."""
+
+    def setUp(self):
+        self.db = fx.new_session()
+
+    def _producto_en_menu(self, nombre: str):
+        categories = _build_menu(self.db)
+        for cat in categories:
+            for p in cat.products:
+                if p.name == nombre:
+                    return p
+        return None
+
+    def test_variante_sin_insumo_de_receta_sale_available_false(self):
+        category = fx.make_category(self.db)
+        product = fx.make_product(self.db, category=category, name="Única presentación", available=True)
+        variant = fx.make_variant(self.db, product=product, price=Decimal("8000"))
+        item = fx.make_inventory_item(self.db, current_stock=Decimal("0"))
+        fx.make_recipe_item(self.db, variant, item, quantity=Decimal("1"))
+        self.db.commit()
+
+        menu_product = self._producto_en_menu("Única presentación")
+
+        self.assertFalse(menu_product.variants[0].available)
+        # era su única presentación: el producto también queda no pedible.
+        self.assertFalse(menu_product.available)
+        self.assertFalse(menu_product.sold_out)  # la marca manual no cambió
+
+    def test_marca_manual_con_insumo_suficiente_sigue_sold_out_tras_movimiento(self):
+        from app.inventory_engine.stock import record_movement
+        from app.core.availability_hooks import install_availability_hooks
+        from unittest import mock
+
+        install_availability_hooks()
+        self.db.info["tenant_id"] = 7
+
+        category = fx.make_category(self.db)
+        product = fx.make_product(self.db, category=category, name="Agotado a mano", available=False)
+        variant = fx.make_variant(self.db, product=product, price=Decimal("8000"))
+        item = fx.make_inventory_item(self.db, current_stock=Decimal("10"))
+        fx.make_recipe_item(self.db, variant, item, quantity=Decimal("1"))
+        self.db.commit()
+
+        with mock.patch("app.core.availability_hooks.events.availability_changed"):
+            record_movement(self.db, item.id, type="out", quantity=Decimal("1"))
+            self.db.commit()
+
+        menu_product = self._producto_en_menu("Agotado a mano")
+        self.assertTrue(menu_product.sold_out)  # la marca manual no se tocó
+        self.assertTrue(menu_product.available)  # insumo sigue alcanzando (9 >= 1)
+
+    def test_producto_sin_marca_y_sin_insumo_conserva_available_true_en_bd(self):
+        """FR-011: `Product.available` (la marca manual) nunca cambia por
+        inventario, ni en la respuesta del menú ni en la fila de la base de
+        datos, antes o después de los movimientos y de los commits del gancho."""
+        from app.inventory_engine.stock import record_movement
+        from app.core.availability_hooks import install_availability_hooks
+        from unittest import mock
+
+        install_availability_hooks()
+        self.db.info["tenant_id"] = 7
+
+        category = fx.make_category(self.db)
+        product = fx.make_product(self.db, category=category, name="Sin marca", available=True)
+        variant = fx.make_variant(self.db, product=product, price=Decimal("8000"))
+        item = fx.make_inventory_item(self.db, current_stock=Decimal("1"))
+        fx.make_recipe_item(self.db, variant, item, quantity=Decimal("1"))
+        self.db.commit()
+
+        self.assertTrue(product.available)
+
+        with mock.patch("app.core.availability_hooks.events.availability_changed"):
+            record_movement(self.db, item.id, type="out", quantity=Decimal("1"))
+            self.db.commit()
+
+        self.db.refresh(product)
+        self.assertTrue(product.available)  # sigue "disponible" a mano aunque no haya insumo
+
+        menu_product = self._producto_en_menu("Sin marca")
+        self.assertFalse(menu_product.sold_out)
+        self.assertFalse(menu_product.available)  # no pedible por stock
+
+
 if __name__ == "__main__":
     unittest.main()

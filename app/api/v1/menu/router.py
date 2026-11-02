@@ -8,16 +8,16 @@ from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.catalog_engine.availability import CatalogAvailability, compute_availability
+from app.core import events
 from app.core.db import get_db, get_tenant
 from app.core.models import Tenant
 from app.core.qr_context import open_qr_context
 from app.core.rate_limit import enforce as rate_limit
 from app.models.category import Category
-from app.models.inventory_item import InventoryItem
-from app.models.option import Option
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.models.option_group import OptionGroup
@@ -33,64 +33,22 @@ from app.api.v1.menu.schemas import (
     MenuOptionGroupResponse, MenuOptionResponse, MenuTableResponse,
     MenuBusinessResponse, MenuPromotionAnnouncement, MenuPromotionRule,
     MenuToppingResponse,
+    AvailabilitySnapshot, AvailabilityProductState, AvailabilityVariantState,
+    AvailabilityOptionState,
 )
 
 router = APIRouter(prefix="/menu", tags=["menu"])
 
 
-def _option_availability(db: Session) -> dict[UUID, bool]:
-    """`{option_id: hay stock}` para todas las opciones que ligan insumo, en dos
-    queries constantes (nada de N+1 por producto).
-
-    El flag es **por opción, no por (variante × opción)**: se compara el stock contra
-    el peor caso del catálogo, la mayor cantidad que le pide cualquier presentación. O
-    sea que "Fresa" puede salir agotada para la ensalada pequeña (60 g) porque la grande
-    necesita 180 y solo quedan 100. Es el error seguro; la alternativa exacta obligaría
-    a exponer la configuración de cada tamaño en el menú público. `check_availability`
-    sigue siendo la red fina, con su 409 al añadir al carrito.
-    """
-    # Por grupo: la mayor cantidad que define un tamaño, y si alguno se queda en 0 (en
-    # cuyo caso manda la cantidad propia de la opción).
-    por_grupo: dict[UUID, tuple[Decimal, bool]] = {
-        gid: (Decimal(mayor or 0), bool(sin_definir))
-        for gid, mayor, sin_definir in db.execute(
-            select(
-                VariantOptionGroup.option_group_id,
-                func.max(VariantOptionGroup.quantity_per_option),
-                func.bool_or(VariantOptionGroup.quantity_per_option <= 0),
-            ).group_by(VariantOptionGroup.option_group_id)
-        ).all()
-    }
-
-    rows = db.execute(
-        select(
-            Option.id, Option.option_group_id, Option.item_quantity,
-            InventoryItem.current_stock, InventoryItem.active,
-        ).join(InventoryItem, InventoryItem.id == Option.inventory_item_id)
-    ).all()
-
-    out: dict[UUID, bool] = {}
-    for option_id, group_id, item_qty, stock, item_active in rows:
-        mayor, alguno_sin_definir = por_grupo.get(group_id, (Decimal(0), True))
-        # La cantidad de la opción solo cuenta si algún tamaño la deja mandar: si todos
-        # definen la suya, ese valor no aplica en ningún sitio e inflaría el umbral.
-        need = max(mayor, Decimal(item_qty)) if alguno_sin_definir else mayor
-        # Una opción ligada a un insumo que no pide cantidad en ningún sitio no
-        # descuenta nada, así que no puede agotarse; pero sí desaparece si el insumo
-        # se desactiva.
-        out[option_id] = bool(item_active) and (need <= 0 or Decimal(stock) >= need)
-    return out
-
-
 def _toppings_by_product(
-    db: Session, product_ids: list[UUID]
+    db: Session, product_ids: list[UUID], avail: CatalogAvailability,
 ) -> dict[UUID, list[MenuToppingResponse]]:
     """spec 129 (FR-009, research.md D5): `{product_id: [adiciones disponibles]}`,
     en dos queries (sin N+1 por producto). El precio es siempre el de catálogo de
-    la variante principal de la adición (FR-017); la disponibilidad reusa el mismo
-    criterio manual que `MenuProductResponse.sold_out` (`Product.active`/
-    `Product.available`), no un chequeo de stock en vivo -- consistente con que
-    `ProductTopping` tampoco guarda ningún dato de inventario propio."""
+    la variante principal de la adición (FR-017); la disponibilidad es
+    `active ∧ marca manual ∧ pedible(variante principal)` (spec 148, FR-017,
+    research.md D3) — antes de esta spec era solo `active ∧ marca manual`, sin
+    considerar la receta de la adición."""
     if not product_ids:
         return {}
 
@@ -119,9 +77,11 @@ def _toppings_by_product(
         if variant is None:
             continue  # adición sin ninguna presentación activa: no se puede ofrecer.
         topping_product = link.topping_product
+        variant_state = avail.variants.get(variant.id)
+        pedible = variant_state.available if variant_state is not None else True
         out.setdefault(link.product_id, []).append(MenuToppingResponse(
             id=topping_product.id, name=topping_product.name, unit_price=variant.price,
-            available=topping_product.active and topping_product.available,
+            available=topping_product.active and topping_product.available and pedible,
         ))
     return out
 
@@ -129,7 +89,7 @@ def _toppings_by_product(
 def _build_menu(
     db: Session, tenant: Tenant | None = None, *, only_visible_en_qr: bool = False,
 ) -> list[MenuCategoryResponse]:
-    avail = _option_availability(db)
+    avail = compute_availability(db)
     now = datetime.now(timezone.utc)
     # spec 063 (revisión 2026-09-01): reglas de promoción por conjunto de
     # variantes vigentes en este instante (la vigencia es de la promoción,
@@ -190,7 +150,7 @@ def _build_menu(
     # (dos queries, nada de N+1 por producto), nunca filtradas por `visible_en_qr`
     # (una adición se ofrece como adjunta sin importar su propia visibilidad como
     # ítem suelto, FR-009/FR-010).
-    toppings_by_product = _toppings_by_product(db, [p.id for p in products])
+    toppings_by_product = _toppings_by_product(db, [p.id for p in products], avail)
 
     result: list[MenuCategoryResponse] = []
     for cat in categories:
@@ -204,7 +164,6 @@ def _build_menu(
                 if not v.active:
                     continue
                 groups = []
-                v_pedible = True
                 for link in v.option_groups:
                     g = link.option_group
                     if not g.active:
@@ -212,21 +171,10 @@ def _build_menu(
                     options = [
                         MenuOptionResponse(
                             id=o.id, name=o.name, extra_price=o.extra_price,
-                            available=avail.get(o.id, True),
+                            available=avail.options.get(o.id, True),
                         )
                         for o in g.options if o.active
                     ]
-                    # Un grupo obligatorio sin ninguna opción con stock deja esta
-                    # presentación imposible de pedir: mejor decirlo aquí que dejar al
-                    # comensal chocar con el 409 al añadir al carrito. spec 065: un
-                    # grupo "cantidad" nunca es obligatorio (FR-003), sin importar
-                    # `min_select` heredado del `VariantOptionGroup`.
-                    if (
-                        g.selection_mode != "cantidad"
-                        and link.min_select > 0
-                        and not any(o.available for o in options)
-                    ):
-                        v_pedible = False
                     grupo = MenuOptionGroupResponse(
                         id=g.id, name=g.name,
                         min_select=link.min_select, max_select=link.max_select,
@@ -260,6 +208,13 @@ def _build_menu(
                     # spec 066 (FR-007): la condición y el equivalente por unidad,
                     # ya calculados y ya renderizados por el backend.
                     promotion = menu_variant_promotion(rules, v.id, v.price, promo_names)
+
+                # spec 148 (research.md D3): "pedible" de la presentación la
+                # decide el motor único (`compute_availability`) -- receta +
+                # grupos obligatorios, antes calculado a mano aquí mismo solo
+                # con grupos (anomalía A-154: la receta es nueva).
+                variant_state = avail.variants.get(v.id)
+                v_pedible = variant_state.available if variant_state is not None else True
 
                 variants.append(MenuVariantResponse(
                     id=v.id, presentation_id=v.presentation_id,
@@ -375,6 +330,58 @@ def public_menu_promotions(db: Session = Depends(get_db), tenant: Tenant = Depen
     return _build_menu_promotions(db, datetime.now(timezone.utc), tenant)
 
 
+def _availability_snapshot(
+    db: Session, tenant: Tenant, *, only_visible_en_qr: bool,
+) -> AvailabilitySnapshot:
+    """spec 148 (contracts/availability-snapshot-api.md, research.md D8):
+    consulta ligera de reconciliación -- solo el estado de disponibilidad,
+    nada de precios/imágenes/promociones. `as_of` se lee **antes** de
+    calcular, para que el cliente pueda descartar un evento que este
+    snapshot ya refleja (D9)."""
+    as_of = events.latest_version(tenant.id)
+
+    scope_product_ids = None
+    if only_visible_en_qr:
+        # Mismos filtros que `_build_menu(only_visible_en_qr=True)`: no debe
+        # devolver ids de productos ni categorías ocultos (FR-030/FR-031).
+        visible_category_ids = db.execute(
+            select(Category.id).where(
+                Category.active.is_(True), Category.visible_en_qr.is_(True),
+            )
+        ).scalars().all()
+        scope_product_ids = db.execute(
+            select(Product.id).where(
+                Product.active.is_(True), Product.visible_en_qr.is_(True),
+                Product.category_id.in_(visible_category_ids),
+            )
+        ).scalars().all()
+
+    avail = compute_availability(db, scope_product_ids=scope_product_ids)
+    return AvailabilitySnapshot(
+        as_of=as_of,
+        products=[
+            AvailabilityProductState(id=pid, sold_out=s.sold_out, available=s.available)
+            for pid, s in avail.products.items()
+        ],
+        variants=[
+            AvailabilityVariantState(id=vid, product_id=s.product_id, available=s.available)
+            for vid, s in avail.variants.items()
+        ],
+        options=[
+            AvailabilityOptionState(id=oid, available=a)
+            for oid, a in avail.options.items()
+        ],
+    )
+
+
+@router.get(
+    "/availability", response_model=AvailabilitySnapshot,
+    summary="Consulta ligera de reconciliación de disponibilidad (personal)",
+)
+def public_menu_availability(db: Session = Depends(get_db), tenant: Tenant = Depends(get_tenant)):
+    return _availability_snapshot(db, tenant, only_visible_en_qr=False)
+
+
 # NOTA: se eliminó `GET /menu/qr/{qr_token}` (UUID plano + header x-tenant-host).
 # Resolvía el tenant desde una cabecera falsificable y exponía un identificador de
 # mesa editable por el cliente; lo reemplaza `/menu/qr-token/{token}`, donde tenant
@@ -404,3 +411,17 @@ async def menu_by_signed_qr(token: str, request: Request):
             # spec 040 (FR-021): clave aditiva; el resto del dict no cambia.
             "promotions": _build_menu_promotions(ctx.db, datetime.now(timezone.utc), ctx.tenant),
         }
+
+
+@router.get(
+    "/qr-token/{token}/availability", response_model=AvailabilitySnapshot,
+    summary="Consulta ligera de reconciliación de disponibilidad (comensal)",
+)
+async def menu_availability_by_signed_qr(token: str, request: Request):
+    """Mismo tenant/mesa del token firmado que `menu_by_signed_qr`, mismo
+    rate limit `menu_qr`, mismo filtro `only_visible_en_qr=True` (spec 148,
+    contracts/availability-snapshot-api.md)."""
+    await rate_limit(request, "menu_qr")
+    with open_qr_context(token) as ctx:
+        await rate_limit(request, "menu_qr", table_id=ctx.table_id)
+        return _availability_snapshot(ctx.db, ctx.tenant, only_visible_en_qr=True)

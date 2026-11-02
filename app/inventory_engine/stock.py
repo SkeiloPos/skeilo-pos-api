@@ -14,6 +14,21 @@ from app.models.inventory_item import InventoryItem
 from app.models.inventory_movement import InventoryMovement
 
 
+def _track_stock(db: Session, item_id: UUID, initial: Decimal, final: Decimal) -> None:
+    """Registra en `db.info` el stock inicial/final de un insumo dentro de esta
+    transacción (research.md D4, spec 148). El oyente de sesión en
+    `app/core/availability_hooks.py` usa esto para publicar `availability.changed`
+    después del commit, calculando la diferencia de pedibilidad una sola vez por
+    transacción. El inicial se fija solo la primera vez que se toca el insumo
+    (para que una venta que baja y repone el mismo insumo en la misma transacción
+    no dispare ningún aviso); el final se actualiza en cada movimiento."""
+    stocks: dict[UUID, tuple[Decimal, Decimal]] = db.info.setdefault("availability_stock", {})
+    if item_id not in stocks:
+        stocks[item_id] = (initial, final)
+    else:
+        stocks[item_id] = (stocks[item_id][0], final)
+
+
 def lock_items(db: Session, item_ids: Iterable[UUID]) -> dict[UUID, InventoryItem]:
     """Bloquea en **una sola query y en orden de id** todos los insumos indicados.
 
@@ -75,6 +90,7 @@ def record_movement(
             f"requerido {quantity}.",
             item_name=item.name,
         )
+    _track_stock(db, inventory_item_id, item.current_stock, new_stock)
     item.current_stock = new_stock
 
     movement = InventoryMovement(
@@ -110,6 +126,7 @@ def apply_adjustment(
         raise InsufficientStockError(
             f"El ajuste dejaría el stock de '{item.name}' en negativo."
         )
+    _track_stock(db, inventory_item_id, item.current_stock, new_stock)
     item.current_stock = new_stock
     movement = InventoryMovement(
         inventory_item_id=inventory_item_id,

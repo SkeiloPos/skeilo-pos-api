@@ -89,6 +89,24 @@ def _compile_jsonb_as_json_on_sqlite(element, compiler, **kw):  # pragma: no cov
     return "JSON"
 
 
+# spec 148: `compute_availability` (ex `_option_availability`) usa `func.bool_or(...)`
+# (agregado de Postgres) para saber si alguna variante de un grupo de opciones no
+# exige cantidad. Mismo shim que `cart_fixtures._BoolOr` -- SQLite no trae `bool_or`,
+# y sin registrarlo como función agregada sobre la conexión cualquier SELECT que lo
+# mencione falla con `OperationalError: no such function: bool_or`, incluso con la
+# tabla vacía.
+class _BoolOr:
+    def __init__(self) -> None:
+        self._result = False
+
+    def step(self, value) -> None:
+        if value:
+            self._result = True
+
+    def finalize(self) -> bool:
+        return self._result
+
+
 def _attach_shared(conn) -> None:
     """Mismo truco que `fixtures.attach_shared_tenants`, extendido a `roles` y
     `users` (que esa función no necesita): adjunta una segunda base SQLite en
@@ -106,6 +124,7 @@ def new_session() -> Session:
     tables = [t for t in Base.metadata.tables.values() if t.name in _TENANT_TABLE_NAMES]
     engine = create_engine("sqlite:///:memory:")
     conn = engine.connect().execution_options(schema_translate_map={"tenant": None})
+    conn.connection.dbapi_connection.create_aggregate("bool_or", 1, _BoolOr)
     Base.metadata.create_all(bind=conn, tables=tables)
     _attach_shared(conn)
     conn.commit()

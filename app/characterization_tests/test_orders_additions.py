@@ -210,6 +210,10 @@ class TestAddAdditionToOrderItem(unittest.TestCase):
         self.assertEqual(item.addons_total, Decimal("0"))
 
     def test_stock_insuficiente_rechaza_sin_cambiar_la_linea_ni_el_total(self):
+        # A-153 (spec 148, research.md D6): el `error` deja de ser el texto fijo
+        # "Stock insuficiente" y pasa al formato unificado de FR-024
+        # ("Se agotó: ... Quítalo para continuar"), con `agotados[]` aditivo;
+        # `insumo` se conserva (claves heredadas, FR-023). El status ya era 409.
         self.insumo.current_stock = Decimal("0")
         self.db.commit()
         item = self._item()
@@ -218,8 +222,10 @@ class TestAddAdditionToOrderItem(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 additions.add_addition_to_order_item(self.db, item.id, body, self.user, self.tenant)
         self.assertEqual(ctx.exception.status_code, 409)
-        self.assertEqual(ctx.exception.detail["error"], "Stock insuficiente")
+        self.assertIn("Quítalo para continuar", ctx.exception.detail["error"])
         self.assertEqual(ctx.exception.detail["insumo"], self.insumo.name)
+        self.assertIn("agotados", ctx.exception.detail)
+        self.assertEqual(ctx.exception.detail["agotados"][0]["motivo"], "inventario")
 
         self.db.refresh(item)
         self.assertEqual(item.addons_total, Decimal("0"))

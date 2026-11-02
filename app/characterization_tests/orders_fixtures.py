@@ -182,6 +182,24 @@ def _compile_jsonb_as_json_on_sqlite(element, compiler, **kw):  # pragma: no cov
     return "JSON"
 
 
+# spec 148: `compute_availability`/`ensure_orderable` (ex `_option_availability`)
+# usan `func.bool_or(...)` (agregado de Postgres) para saber si alguna variante de
+# un grupo de opciones no exige cantidad. Mismo shim que `cart_fixtures._BoolOr` --
+# SQLite no trae `bool_or`, y sin registrarlo como función agregada sobre la
+# conexión cualquier SELECT que lo mencione falla con `OperationalError: no such
+# function: bool_or`, incluso con la tabla vacía.
+class _BoolOr:
+    def __init__(self) -> None:
+        self._result = False
+
+    def step(self, value) -> None:
+        if value:
+            self._result = True
+
+    def finalize(self) -> bool:
+        return self._result
+
+
 def _patch_sqlite_incompatible_server_defaults() -> None:
     """`sale_items.options` y (spec 063) `sales`/`invoices`/`customer_orders.
     applied_promotions` tienen `server_default=text("'[]'::jsonb")` — válido en
@@ -233,6 +251,7 @@ def new_session(*, autoflush: bool = True) -> Session:
     tables = [t for t in Base.metadata.tables.values() if t.name in _TABLE_NAMES]
     engine = create_engine("sqlite:///:memory:")
     conn = engine.connect().execution_options(schema_translate_map={"tenant": None})
+    conn.connection.dbapi_connection.create_aggregate("bool_or", 1, _BoolOr)
     Base.metadata.create_all(bind=conn, tables=tables)
     conn.commit()
     return Session(bind=conn, autoflush=autoflush)
