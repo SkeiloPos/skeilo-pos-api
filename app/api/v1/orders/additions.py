@@ -26,7 +26,8 @@ from app.api.v1.catalog.line_pricing import load_valid_options, validate_option_
 from app.api.v1.catalog.schemas import OptionSelectionIn, UpdateAdditionQuantityIn
 from app.api.v1.orders import service
 from app.api.v1.orders.consumption import (
-    check_addition_availability, deduct_addition, reverse_addition,
+    check_addition_availability_unified as check_addition_availability,
+    deduct_addition, reverse_addition,
 )
 
 

@@ -324,11 +324,19 @@ def ensure_product_available(variant: ProductVariant) -> None:
     producto marcado "Agotado" (`Product.available=False`, independiente de
     `active`). Mismo shape que ya usa `sold_out_detail()` para el agotado por
     inventario (`app/catalog_engine/consumption.py`) -- un único producto nombrado,
-    no una lista (ver `ensure_products_available` para el caso de varios a la vez)."""
+    no una lista (ver `ensure_products_available` para el caso de varios a la vez).
+
+    Spec 148 (A-153, research.md D6): delega en el 409 unificado
+    (`sold_out_conflict`) -- mismo texto y status de siempre, ahora con
+    `agotados[]` aditivo."""
     if not variant.product.available:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
+        from app.catalog_engine.availability import SoldOutItem, sold_out_conflict
+        raise sold_out_conflict(
+            [SoldOutItem(
+                id=variant.product.id, tipo="producto", nombre=variant.product.name,
+                producto_id=variant.product.id, motivo="manual",
+            )],
+            legacy={
                 "error": f"«{variant.product.name}» está agotado y no se puede agregar al pedido",
                 "producto": variant.product.name,
             },
@@ -340,13 +348,21 @@ def ensure_products_available(variants: Sequence[ProductVariant]) -> None:
     (uno por variante) antes de confirmar un carrito/pedido con varios ítems a la
     vez -- a diferencia de `ensure_product_available`, nombra todos los agotados
     encontrados en un solo 409 en vez de rechazar por el primero y obligar a
-    reintentar uno por uno."""
-    agotados = sorted({v.product.name for v in variants if not v.product.available})
-    if agotados:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "error": f"Los siguientes productos están agotados: {', '.join(agotados)}",
-                "productos_agotados": agotados,
+    reintentar uno por uno.
+
+    Spec 148 (A-153, research.md D6): delega en el 409 unificado."""
+    agotados_products = sorted(
+        {(v.product.id, v.product.name) for v in variants if not v.product.available},
+        key=lambda pair: pair[1],
+    )
+    if agotados_products:
+        from app.catalog_engine.availability import SoldOutItem, sold_out_conflict
+        nombres = [name for _, name in agotados_products]
+        raise sold_out_conflict(
+            [SoldOutItem(id=pid, tipo="producto", nombre=name, producto_id=pid, motivo="manual")
+             for pid, name in agotados_products],
+            legacy={
+                "error": f"Los siguientes productos están agotados: {', '.join(nombres)}",
+                "productos_agotados": nombres,
             },
         )

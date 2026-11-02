@@ -15,6 +15,7 @@ from app.core.error_middleware import (
 )
 from app.core.redis import token_blocklist
 from app.core.event_bus import event_bus
+from app.core.availability_hooks import install_availability_hooks
 from app.core.scheduler import start_scheduler
 from app.core.db import initialize_database
 from app.api.v1.auth.routes import auth_router
@@ -67,6 +68,10 @@ async def lifespan(app: FastAPI):
         # monopoliza la suya, y el pool del blocklist se usa en cada request).
         await event_bus.start()
         print("✅ Bus de eventos listo")
+        # spec 148: gancho de sesión que publica `availability.changed` tras un
+        # commit que cambia la pedibilidad por inventario. Instalación explícita
+        # (nunca al importar) para que ninguna suite de tests lo active sola.
+        install_availability_hooks()
         # Cierra las sesiones de mesa abandonadas; sin esto una mesa que nadie
         # cobra queda 'ocupada' para siempre (el TTL del comensal es perezoso).
         scheduler = start_scheduler()

@@ -34,7 +34,7 @@ from app.models.product_variant import ProductVariant
 from app.models.product_topping import ProductTopping
 from app.api.v1.catalog.schemas import ToppingSelectionIn, UpdateToppingQuantityIn
 from app.api.v1.catalog.service import resolve_principal_variant
-from app.api.v1.catalog.line_pricing import check_availability
+from app.catalog_engine.availability import SoldOutItem, stock_conflict_for_required
 from app.api.v1.catalog.consumption_plan import plan_line_consumption
 from app.api.v1.inventory.stock import record_movement
 from app.core import inventory_reasons as reasons
@@ -60,6 +60,23 @@ def _consumption_required(db: Session, variant_id: UUID, quantity: int) -> dict[
     for line in plan_line_consumption(db, variant_id, quantity, []):
         required[line.inventory_item_id] += line.quantity
     return dict(required)
+
+
+def _raise_if_insufficient(
+    db: Session, topping_variant: ProductVariant, required: dict[UUID, Decimal], *, extra_context: str,
+) -> None:
+    """Spec 148 (A-153, research.md D6): mismo chequeo preventivo que antes
+    (`check_availability`, pricing.py), pero devuelve el 409 unificado con
+    `agotados[]` nombrando la adición -- sin tocar `check_availability` en sí
+    (D6: compartida con pagos complementarios, fuera del contrato)."""
+    product = topping_variant.product
+    item = SoldOutItem(
+        id=product.id, tipo="producto", nombre=product.name,
+        producto_id=product.id, motivo="inventario",
+    )
+    conflict = stock_conflict_for_required(db, required, item, extra_context=extra_context)
+    if conflict is not None:
+        raise conflict
 
 
 def _deduct(db: Session, variant_id: UUID, quantity: int, user_id, reference_id: UUID) -> None:
@@ -113,8 +130,8 @@ def add_topping_to_order_item(
         )
 
     if has_module_access(db, tenant, "inventario"):
-        check_availability(
-            db, _consumption_required(db, topping_variant.id, data.quantity),
+        _raise_if_insufficient(
+            db, topping_variant, _consumption_required(db, topping_variant.id, data.quantity),
             extra_context="agregar adición",
         )
 
@@ -171,8 +188,8 @@ def update_topping_quantity(
 
     delta = data.quantity - existing.quantity
     if delta > 0 and has_module_access(db, tenant, "inventario"):
-        check_availability(
-            db, _consumption_required(db, topping_variant.id, delta),
+        _raise_if_insufficient(
+            db, topping_variant, _consumption_required(db, topping_variant.id, delta),
             extra_context="editar adición",
         )
 

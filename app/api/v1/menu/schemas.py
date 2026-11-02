@@ -184,3 +184,35 @@ class MenuBusinessResponse(BaseModel):
     timezone: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------- spec 148: snapshot de disponibilidad
+
+class AvailabilityProductState(BaseModel):
+    """Mismo significado que `changes[]` de `availability.changed`
+    (contracts/availability-event.md): `sold_out` = marca manual
+    (`not Product.available`); `available` = pedible por stock."""
+    id: UUID
+    sold_out: bool
+    available: bool
+
+
+class AvailabilityVariantState(BaseModel):
+    id: UUID
+    product_id: UUID
+    available: bool
+
+
+class AvailabilityOptionState(BaseModel):
+    id: UUID
+    available: bool
+
+
+class AvailabilitySnapshot(BaseModel):
+    """`GET /menu/availability` y `GET /menu/qr-token/{token}/availability`
+    (contracts/availability-snapshot-api.md): estado de disponibilidad del
+    catálogo activo, sin precios, imágenes ni promociones."""
+    as_of: int | None = None
+    products: list[AvailabilityProductState] = Field(default_factory=list)
+    variants: list[AvailabilityVariantState] = Field(default_factory=list)
+    options: list[AvailabilityOptionState] = Field(default_factory=list)

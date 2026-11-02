@@ -403,3 +403,52 @@ def menu_updated(tenant_id: int) -> str | None:
         type="menu.updated",
         channels=[menu_channel(tenant_id)],
     )
+
+
+# spec 148 (research.md D1): tope de elementos por evento de disponibilidad. Por
+# encima de esto se publica `changes: [], refresh: True` en vez del lote completo
+# -- un insumo muy compartido no debe producir un evento gigante.
+AVAILABILITY_EVENT_MAX_CHANGES = 200
+
+
+def availability_changed(
+    tenant_id: int, changes: list[dict], *, refresh: bool = False,
+) -> str | None:
+    """spec 148 (contracts/availability-event.md, research.md D1/D2): un
+    producto/presentación/opción cambió de "pedible" (marca manual o
+    inventario). Evento delgado por lote -- un solo evento por commit,
+    aunque afecte a muchos elementos (FR-010); solo ids y booleanos, nunca
+    existencias, costos, insumos ni nombres de empleados (FR-007).
+
+    Llega tanto al personal (`staff`) como a los comensales con el menú
+    abierto (`menu:{tenant}`) -- no se toca la autenticación del stream, así
+    que el aislamiento entre negocios y comensal/personal salen de la
+    infraestructura ya existente (FR-030 a FR-032)."""
+    if len(changes) > AVAILABILITY_EVENT_MAX_CHANGES:
+        changes, refresh = [], True
+    return publish(
+        tenant_id,
+        type="availability.changed",
+        channels=[CH_STAFF, menu_channel(tenant_id)],
+        payload={"changes": changes, "refresh": refresh},
+    )
+
+
+def latest_version(tenant_id: int) -> int | None:
+    """spec 148 (research.md D8): versión (`version_of`) de la última
+    entrada del stream del tenant, leída **antes** de calcular un snapshot de
+    reconciliación -- así el cliente puede descartar un evento que el
+    snapshot ya refleja (D9). `None` si el stream está vacío o Redis no
+    responde; nunca lanza (mismo criterio *fail-open* que `publish`)."""
+    try:
+        entries = _client().xrevrange(stream_key(tenant_id), count=1)
+    except Exception:
+        logger.warning(
+            "No se pudo leer la versión del stream del tenant %s",
+            tenant_id, exc_info=True,
+        )
+        return None
+    if not entries:
+        return None
+    entry_id, _fields = entries[0]
+    return version_of(entry_id)

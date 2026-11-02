@@ -458,7 +458,10 @@ class TestOrdersPaymentGate(unittest.TestCase):
         inventario falla por falta de stock, el intento de pago NO queda
         confirmado y la orden NO avanza — ninguna de las dos cosas ocurre a
         medias (research.md Decisión 1: un solo `commit`/`rollback` cubre
-        ambos cambios)."""
+        ambos cambios).
+
+        A-153 (spec 148, research.md D6): el status pasa de 400 a 409
+        unificado (`stock_error_to_conflict`) -- la atomicidad no cambia."""
         db, order = self._seed_order_recibida(stock=Decimal("0"))
         efectivo = fx.make_payment_method(db, name="Efectivo", is_cash=True)
         attempt = fx.make_payment_attempt(db, order, efectivo, status="pendiente")
@@ -468,7 +471,8 @@ class TestOrdersPaymentGate(unittest.TestCase):
             checkout.confirm_cash_payment_attempt(
             db, attempt.id, Decimal("20000"), self._shift(db).id, self._user()
         )
-        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("agotados", ctx.exception.detail)
 
         db.refresh(attempt)
         db.refresh(order)

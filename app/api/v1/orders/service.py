@@ -47,9 +47,10 @@ from app.models.sale import Sale
 from app.models.table_session import TableSession
 from app.core.models import Tenant, User
 from app.api.v1.catalog.line_pricing import (
-    ensure_products_available,
     load_valid_options,
 )
+from app.catalog_engine.availability import OrderableLine, ensure_orderable
+from app.core.plan_limits import has_module_access
 from app.api.v1.cash.service import resolve_dine_in_table_order
 from app.api.v1.orders import topping_lines
 from app.api.v1.orders.consolidation import get_or_create_table_session_id
@@ -795,10 +796,30 @@ def create_order(
         for variant in variants_by_line:
             if not variant.active:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Variante inactiva: {variant.id}")
-        # spec 093 (FR-021/FR-022): barrido de TODOS los ítems antes de crear nada --
-        # si uno o más productos están agotados, se nombran todos de una vez en vez
-        # de obligar a reintentar uno por uno.
-        ensure_products_available(variants_by_line)
+        # Spec 148 (A-153, research.md D6/H7): chequeo preventivo UNIFICADO --
+        # antes solo miraba la marca manual (`ensure_products_available`); ahora
+        # también el inventario (receta/opciones/adiciones y cantidad agregada),
+        # que antes solo se descubría al cobrar. Nada se crea si hay algo no
+        # pedible: el 409 unificado nombra todo de una vez.
+        orderable_lines = [
+            OrderableLine(
+                variant_id=variant.id,
+                quantity=line.quantity,
+                options=load_valid_options(db, line.options, variant=variant, quantity=line.quantity),
+                topping_product_ids=[t.topping_product_id for t in line.toppings],
+            )
+            for line, variant in zip(data.items, variants_by_line)
+        ]
+        ensure_orderable(
+            db, orderable_lines,
+            # `getattr(tenant, "plan_id", None)` evita romper con los dobles de
+            # test que no modelan `plan_id` (p. ej. `make_tenant_double`):
+            # ningún `Tenant` real de producción carece de él.
+            toppings_inventory=(
+                tenant is not None and getattr(tenant, "plan_id", None) is not None
+                and has_module_access(db, tenant, "inventario")
+            ),
+        )
 
         # (item, [(topping_variant, quantity), ...]) -- se guardan y, si aplica,
         # se descuentan en el punto de confirmación (`checkout.py`), no aquí.

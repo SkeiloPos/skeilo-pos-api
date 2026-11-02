@@ -1031,8 +1031,12 @@ class TestOrderLinesWithAddonsPerLine(unittest.TestCase):
 
 class TestSoldOutNamesTheProduct(unittest.TestCase):
     """spec 089 (A-96, FR-029, research D18): al agregar una línea cuyo insumo se agota, la
-    respuesta nombra el PRODUCTO, no solo el insumo, y no queda nada a medias. El status sigue
-    siendo el de `InsufficientStockError` (400)."""
+    respuesta nombra el PRODUCTO, no solo el insumo, y no queda nada a medias.
+
+    A-153 (spec 148, research.md D6): el status pasa de 400 (`InsufficientStockError`
+    directo / `sold_out_detail`) a 409 unificado, con el texto de FR-024 en vez del
+    antiguo «Producto» está agotado: falta Insumo» -- `producto`/`insumo` se conservan
+    (FR-023) y se agrega `agotados[]`."""
 
     def setUp(self):
         self.db = fx.new_session()
@@ -1046,14 +1050,13 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         self.db.commit()
 
     def _assert_named(self, exc: HTTPException):
-        self.assertEqual(exc.status_code, 400)
+        self.assertEqual(exc.status_code, 409)
         self.assertIsInstance(exc.detail, dict)
-        self.assertIn("«", exc.detail["error"])
         self.assertIn("Hamburguesa", exc.detail["error"])
-        self.assertIn("está agotado", exc.detail["error"])
-        self.assertIn("falta Queso", exc.detail["error"])
         self.assertIn("Hamburguesa", exc.detail["producto"])
         self.assertEqual(exc.detail["insumo"], "Queso")
+        self.assertIn("agotados", exc.detail)
+        self.assertEqual(exc.detail["agotados"][0]["motivo"], "inventario")
 
     def _assert_nothing_left(self):
         from app.models.order_item import OrderItem
@@ -1062,22 +1065,27 @@ class TestSoldOutNamesTheProduct(unittest.TestCase):
         self.assertEqual(Decimal(self.queso.current_stock), Decimal("1"))
         self.assertEqual(self.db.execute(select(InventoryMovement)).scalars().all(), [])
 
-    def test_create_order_ya_no_valida_el_agotado_en_la_creacion(self):
-        """A-150 (spec 146): `create_order` ya no descuenta inventario, así
-        que esta guarda (que vivía en `deduct_order_items_naming_product`) ya
-        no se ejecuta en la creación -- la orden se crea en 'pendiente' con
-        el insumo intacto. El 400 nombrando el producto agotado se desplaza
-        al punto de confirmación (`checkout.py`). Reemplaza la
-        caracterización anterior (que exigía el 400 en la creación)."""
+    def test_create_order_valida_el_agotado_preventivamente_en_la_creacion(self):
+        """A-153 (spec 148, research.md D6/H7, reemplaza la caracterización de
+        A-150/spec 146 que exigía que `create_order` NO validara el inventario):
+        `create_order` ahora rechaza con el 409 unificado (`ensure_orderable`)
+        ANTES de crear nada, en vez de descubrirlo solo al cobrar. No se crea
+        ninguna orden ni se toca el insumo."""
         data = OrderCreate(
             channel=OrderChannel.POS, customer_name="Cliente de prueba",
             items=[OrderItemIn(product_variant_id=self.variant.id, quantity=1)],
         )
-        order = service.create_order(self.db, data, uuid4())
-        self.assertEqual(order.status, "pendiente")
+        with self.assertRaises(HTTPException) as ctx:
+            service.create_order(self.db, data, uuid4())
+        exc = ctx.exception
+        self.assertEqual(exc.status_code, 409)
+        self.assertIn("agotados", exc.detail)
+        self.assertEqual(exc.detail["agotados"][0]["motivo"], "inventario")
         self.db.expire_all()
         self.assertEqual(Decimal(self.queso.current_stock), Decimal("1"))
         self.assertEqual(self.db.execute(select(InventoryMovement)).scalars().all(), [])
+        from app.models.customer_order import CustomerOrder
+        self.assertEqual(self.db.execute(select(CustomerOrder)).scalars().all(), [])
 
     def test_add_item_to_order_nombra_el_producto_agotado(self):
         from app.api.v1.orders import consolidation

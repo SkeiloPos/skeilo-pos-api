@@ -31,10 +31,10 @@ from app.models.order_item import OrderItem, OrderItemOption
 from app.api.v1.orders import topping_lines
 from app.api.v1.orders.consumption import deduct_order_items, deduct_order_items_naming_product
 from app.api.v1.catalog.line_pricing import (
-    check_availability,
-    ensure_product_available,
     load_valid_options,
 )
+from app.catalog_engine.availability import OrderableLine, SoldOutItem, ensure_orderable, sold_out_conflict
+from app.core.exceptions import InsufficientStockError
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,6 @@ def add_item_to_order(
     variant = get_or_404(db, ProductVariant, data.product_variant_id, "Variant not found")
     if not variant.active:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Variante inactiva: {variant.id}")
-    ensure_product_available(variant)
     options = load_valid_options(db, data.options, variant=variant, quantity=data.quantity)
     # spec 117 (A-126): nunca es el carrito QR -- `qr_addons_per_line=False`.
     options = mark_per_line(db, options, qr_addons_per_line=False)
@@ -252,10 +251,23 @@ def add_item_to_order(
 
     inventario_activo = tenant is not None and has_module_access(db, tenant, "inventario")
 
+    # Spec 148 (A-153, research.md D6/D19): chequeo preventivo UNIFICADO --
+    # antes solo `ensure_product_available` (marca manual); ahora también
+    # inventario de la presentación/opciones y, si el módulo está activo, de
+    # las adiciones (mismo criterio `inventario_activo` que ya decidía si se
+    # validaba/descontaba su stock).
+    ensure_orderable(
+        db,
+        [OrderableLine(
+            variant_id=variant.id, quantity=data.quantity, options=options,
+            topping_product_ids=[t.topping_product_id for t in data.toppings],
+        )],
+        toppings_inventory=inventario_activo,
+    )
+
     try:
         entries: list[tuple[OrderItem, list[ChosenOption]]] = []
         topping_rows: list[tuple[OrderItem, list[topping_lines.ResolvedTopping]]] = []
-        topping_consumption: dict[UUID, Decimal] = defaultdict(Decimal)
         for product_variant_id, quantity, options, combo_id in lines:
             resolved_toppings, toppings_total = topping_lines.resolve_toppings(
                 db, variant.product_id, data.toppings,
@@ -283,8 +295,6 @@ def add_item_to_order(
             entries.append((item, options))
             if resolved_toppings:
                 topping_rows.append((item, resolved_toppings))
-                if inventario_activo:
-                    topping_lines.accumulate_consumption(db, resolved_toppings, topping_consumption)
 
         for item, resolved_toppings in topping_rows:
             topping_lines.persist_toppings(db, item, resolved_toppings)
@@ -292,10 +302,25 @@ def add_item_to_order(
         # spec 089 (A-96): un insumo agotado nombra el PRODUCTO, no solo el insumo.
         deduct_order_items_naming_product(db, entries, user.id, reference_id=order.id)
 
-        if inventario_activo and topping_consumption:
-            check_availability(db, topping_consumption, extra_context="agregar producto")
+        if inventario_activo:
             for item, resolved_toppings in topping_rows:
-                topping_lines.deduct_toppings(db, resolved_toppings, user.id, order.id)
+                try:
+                    topping_lines.deduct_toppings(db, resolved_toppings, user.id, order.id)
+                except InsufficientStockError as exc:
+                    # Spec 148 (A-153, research.md D6): guardia final -- rara
+                    # carrera entre `ensure_orderable` y este descuento real;
+                    # mismo 409 unificado que el resto del contrato.
+                    topping_variant = resolved_toppings[0][0] if resolved_toppings else None
+                    p_id = topping_variant.product_id if topping_variant else None
+                    p_name = topping_variant.product.name if topping_variant else "adición"
+                    conflict_item = SoldOutItem(
+                        id=p_id, tipo="producto", nombre=p_name, producto_id=p_id, motivo="inventario",
+                    )
+                    legacy = {"producto": p_name}
+                    insumo = getattr(exc, "item_name", None)
+                    if insumo:
+                        legacy["insumo"] = insumo
+                    raise sold_out_conflict([conflict_item], legacy=legacy) from exc
 
         # spec 118 (research.md D3): caso central de la Historia 2 -- una
         # segunda unidad agregada en otro momento recalcula el descuento de

@@ -1,10 +1,19 @@
-"""Motor de catálogo: precio de línea + plan de consumo de inventario.
+"""Motor de catálogo: precio de línea + plan de consumo de inventario +
+motor de disponibilidad ("pedibilidad").
 
 Extracción de `app/api/v1/catalog/line_pricing.py` y `consumption_plan.py`
-(specs/014-extraccion-motor-catalogo). Reexporta los catorce símbolos públicos
-del contrato — ver contracts/module-api.md Contrato A (spec 089 añade `compute_unit_price`,
-`compute_addons_total` y `line_total`).
+(specs/014-extraccion-motor-catalogo). Reexporta los símbolos públicos del
+contrato — ver contracts/module-api.md Contrato A (spec 089 añade `compute_unit_price`,
+`compute_addons_total` y `line_total`). Spec 148 añade `compute_availability`,
+`diff_availability` y los tipos de `app.catalog_engine.availability`.
 """
+from app.catalog_engine.availability import (
+    CatalogAvailability as CatalogAvailability,
+    ProductAvailability as ProductAvailability,
+    VariantAvailability as VariantAvailability,
+    compute_availability as compute_availability,
+    diff_availability as diff_availability,
+)
 from app.catalog_engine.core import (
     ChosenOption as ChosenOption,
     ConsumptionLine as ConsumptionLine,

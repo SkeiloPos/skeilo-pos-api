@@ -82,6 +82,10 @@ def with_db(tenant_schema: Optional[str]):
 
     try:
         db = Session(autocommit=False, autoflush=False, bind=connectable)
+        # spec 148 (research.md D4): la sesión no conoce su tenant_id, solo el
+        # schema -- el gancho de disponibilidad (`core/availability_hooks.py`)
+        # lo resuelve a partir de esto para publicar tras el commit.
+        db.info["tenant_schema"] = tenant_schema
         yield db
     finally:
         db.close()
@@ -309,6 +313,9 @@ def resolve_tenant_by_id(tenant_id: int) -> Tenant:
 def get_db(tenant: Tenant = Depends(get_tenant)):
     logger.info(f"Obteniendo DB para tenant: {tenant.name} (schema: {tenant.schema})")
     with with_db(tenant.schema) as db:
+        # spec 148: ya tenemos el tenant resuelto aquí -- evita que el gancho
+        # de disponibilidad tenga que resolver tenant_id por schema.
+        db.info["tenant_id"] = tenant.id
         yield db
 
 

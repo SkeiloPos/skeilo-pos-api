@@ -6,6 +6,8 @@ from openpyxl import load_workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.catalog_engine.availability import compute_availability
+from app.core import events
 from app.core.db import get_db, get_tenant
 from app.core.dependencies import (
     get_current_user,
@@ -253,9 +255,27 @@ def set_product_availability(
     id: UUID,
     body: ProductAvailabilityUpdate,
     db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
     user: User = Depends(require_tenant_admin_or_cashier),
 ):
-    return service.set_availability(db, id, body.available, user)
+    # spec 148 (D5): el 403 (rol), el 404 y el 409 (producto inactivo) ocurren
+    # dentro de `set_availability`, ANTES de cualquier commit -- `previous` se
+    # lee aquí porque el servicio no devuelve el valor anterior.
+    previous = service.get_or_404(db, id).available
+    product = service.set_availability(db, id, body.available, user)
+    if previous != product.available:
+        # Publicar solo después del commit del servicio, y solo si cambió
+        # (FR-004). `events.availability_changed` nunca lanza (FR-005): el
+        # cambio ya quedó guardado sin importar lo que pase aquí.
+        snapshot = compute_availability(db, scope_product_ids=[product.id])
+        state = snapshot.products.get(product.id)
+        events.availability_changed(tenant.id, [{
+            "kind": "product",
+            "id": product.id,
+            "sold_out": not product.available,
+            "available": state.available if state is not None else False,
+        }])
+    return product
 
 
 @router.post(
