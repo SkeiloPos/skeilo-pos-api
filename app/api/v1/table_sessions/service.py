@@ -63,25 +63,37 @@ def get_session(db: Session, table_session_id: UUID) -> TableSession:
 
 # ------------------------------------------------------ Liberar mesa abandonada
 
-def has_billable_orders(db: Session, table_session_id: UUID) -> bool:
-    """¿Queda algún pedido que cobrar en la sesión? `pagada`/`cancelada` no
-    cuentan, ni los que ya tienen una `Sale` asociada.
+def open_orders(db: Session, table_session_id: UUID) -> list[CustomerOrder]:
+    """Órdenes "abiertas" de la sesión (spec 147, FR-016): `status ==
+    'pendiente'` OR (`status == 'entregada'` AND `payment_status ==
+    'UNPAID'`). Las `'cancelada'` nunca cuentan como abiertas — ni siquiera un
+    pedido `'entregada'`+`'PAID'` (cerrado, FR-006) cuenta. Reemplaza el
+    criterio de `has_billable_orders` (antes: "¿hay algo por cobrar?", que
+    dependía además de si ya existía una `Sale`, un rodeo necesario porque
+    `status` rara vez llegaba a `'pagada'` por sí solo) — con `payment_status`
+    la señal de "ya se cobró" ya no necesita ese rodeo."""
+    return db.execute(
+        select(CustomerOrder).where(
+            CustomerOrder.table_session_id == table_session_id,
+            (CustomerOrder.status == "pendiente")
+            | (
+                (CustomerOrder.status == "entregada")
+                & (CustomerOrder.payment_status == "UNPAID")
+            ),
+        )
+    ).scalars().all()
 
-    Esa última condición hace falta desde spec 028: la aprobación/confirmación
-    de un pago QR ahora factura en el mismo paso (para que exista algo que
-    reimprimir), pero deja el pedido en `status="abierta"` a propósito —no
-    `"pagada"`— para que siga siendo visible como consumo activo mientras
-    cocina lo termina (`activeOrders`/`tableOrders` del frontend excluyen
-    `"pagada"`; marcarlo así de inmediato haría ver la mesa como libre con el
-    pedido todavía en preparación). Sin este chequeo, un pedido así nunca deja
-    de contar como "por cobrar" y la mesa jamás se libera ni por el barrido ni
-    por "Liberar Mesa", aunque ya esté completamente pagado y facturado."""
-    ya_facturados = select(Sale.customer_order_id).where(Sale.customer_order_id.isnot(None))
+
+def has_open_orders(db: Session, table_session_id: UUID) -> bool:
+    """¿Existe alguna orden abierta (FR-016) en la sesión? Ver `open_orders`."""
     return db.execute(
         select(CustomerOrder.id).where(
             CustomerOrder.table_session_id == table_session_id,
-            CustomerOrder.status.notin_(checkout.TERMINAL),
-            CustomerOrder.id.notin_(ya_facturados),
+            (CustomerOrder.status == "pendiente")
+            | (
+                (CustomerOrder.status == "entregada")
+                & (CustomerOrder.payment_status == "UNPAID")
+            ),
         ).limit(1)
     ).scalar() is not None
 
@@ -141,7 +153,7 @@ def try_release_if_empty(db: Session, table_session_id: UUID) -> list[TableSessi
     if quedan is not None:
         return []
 
-    if has_billable_orders(db, ts.id):
+    if has_open_orders(db, ts.id):
         return []
 
     sessions = checkout.close_table_sessions(db, ts.dining_table_id, closed_by=None)
@@ -186,14 +198,16 @@ def _billable_orders(db: Session, table_session_id: UUID) -> list[CustomerOrder]
     pagados, ni con una `Sale` ya emitida (spec 028 — mismo motivo que
     `has_billable_orders`: evita facturar dos veces un pedido QR que ya se
     cobró al aprobar/confirmar su pago, aunque su `status` siga en
-    `"abierta"` mientras cocina lo termina)."""
+    `"entregada"`/`"pendiente"` mientras cocina lo termina). Spec 147: ya no
+    existe `status == "pagada"` — "ya pagado" se lee en `payment_status`."""
     ya_facturados = select(Sale.customer_order_id).where(Sale.customer_order_id.isnot(None))
     return db.execute(
         select(CustomerOrder)
         .options(selectinload(CustomerOrder.items))
         .where(
             CustomerOrder.table_session_id == table_session_id,
-            CustomerOrder.status.notin_(("cancelada", "pagada")),
+            CustomerOrder.status != "cancelada",
+            CustomerOrder.payment_status != "PAID",
             CustomerOrder.id.notin_(ya_facturados),
         )
         .order_by(CustomerOrder.created_at)
@@ -215,7 +229,7 @@ def compute_bill(
     seen: set[UUID | None] = set()
     for order in orders:
         for it in order.items:
-            if it.estado_cocina == "anulado" or it.participant_id in seen:
+            if it.estado_cocina == "cancelado" or it.participant_id in seen:
                 continue
             seen.add(it.participant_id)
             participant_ids.append(it.participant_id)
@@ -345,8 +359,11 @@ def close_session(
         else:
             sales = _close_split(db, ts, orders, data, shift, cashier, invoice_prefix, tenant)
 
+        # Spec 147: `_assert_closable` ya exige que ningún pedido esté
+        # `'pendiente'` (status) ni tenga ítems `'pendiente'` (estado_cocina,
+        # `EN_CURSO`) — todos están ya `'entregada'` aquí. Solo falta el pago.
         for order in orders:
-            order.status = "pagada"
+            order.payment_status = "PAID"
 
         ts.billing_mode = data.billing_mode.value
         sessions = checkout.close_table_sessions(db, ts.dining_table_id, closed_by=cashier)
@@ -416,26 +433,29 @@ def release_paid_session(
     db: Session, table_session_id: UUID, cashier: User,
     *, tenant_id: int | None = None,
 ) -> ReleaseSessionResponse:
-    """Libera una mesa cuya sesión ya está completamente pagada (spec 028,
-    T027) — la inversa de `close_session`: en vez de exigir algo por cobrar,
-    aquí se rechaza si **queda** algo por cobrar. Pensada para el modo híbrido
-    en el que cada comanda se cobra por separado al vuelo
-    (`checkout.checkout_and_send`), así que al final no queda ninguna venta
-    pendiente que `close_session` pudiera facturar — solo hace falta cerrar la
-    sesión y devolver la mesa a `libre`.
+    """Libera una mesa manualmente (spec 028, T027; criterio reescrito spec
+    147, FR-015/FR-016/FR-017) — único camino que pone la mesa en `'libre'`
+    por una sesión con actividad real; ningún temporizador lo hace (FR-015,
+    SC-005; el barrido de sesiones huérfanas es un mecanismo distinto para
+    sesiones ya sin comensales, research.md R6).
 
-    Aun sin nada por cobrar, la comida puede seguir en curso en cocina sobre
-    pedidos ya `pagada` (se cobró antes de que terminara de prepararse): se
-    cargan **todos los pedidos de la sesión salvo los cancelados**, no solo
-    los billables, y se reusa `_assert_closable` sin modificar para que ese
-    chequeo de cocina siga aplicando sobre `'pagada'`.
+    Se rechaza si existe alguna orden **abierta** (`open_orders`, FR-016):
+    `'pendiente'`, o `'entregada'` con `payment_status == 'UNPAID'`. El 409
+    incluye esa lista (id, status, payment_status) para que el cajero las
+    cobre o cancele sin buscarlas por separado (FR-017/SC-004).
+
+    Aun con todas las órdenes cerradas, la comida puede seguir en curso en
+    cocina sobre un pedido `'entregada'` con un ítem `'pendiente'` nacido
+    después de la entrega (FR-002a): se cargan **todos los pedidos de la
+    sesión salvo los cancelados** y se reusa `_assert_closable` sin modificar
+    para que ese chequeo de cocina siga aplicando.
 
     Bugfix (spec 050): un pedido `'cancelada'` no anula el `estado_cocina` de
     sus ítems (`cancel_order`, `orders/checkout.py` — deliberado, para no
     interferir con el ajuste de inventario), así que antes de excluirlo aquí,
-    un ítem que se quedó `'pendiente'`/`'en_preparacion'` al cancelar su
-    pedido bloqueaba esta función para siempre, sin ninguna acción posible
-    desde la UI (el pedido ya es terminal).
+    un ítem que se quedó `'pendiente'` al cancelar su pedido bloqueaba esta
+    función para siempre, sin ninguna acción posible desde la UI (el pedido ya
+    es terminal).
     """
     ts = _load(db, table_session_id, lock=True)
     if ts.status != "active":
@@ -443,10 +463,17 @@ def release_paid_session(
             status.HTTP_409_CONFLICT, f"La sesión ya está {ts.status}"
         )
 
-    if has_billable_orders(db, ts.id):
+    abiertas = open_orders(db, ts.id)
+    if abiertas:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "Todavía hay algo por cobrar en esta mesa; cóbralo antes de liberarla.",
+            detail={
+                "error": "Hay órdenes abiertas en esta mesa; cóbralas o cancélalas antes de liberarla.",
+                "orders": [
+                    {"id": str(o.id), "status": o.status, "payment_status": o.payment_status}
+                    for o in abiertas
+                ],
+            },
         )
 
     if has_pending_balance(db, ts.id):
@@ -499,7 +526,7 @@ def _participantes_con_consumo(orders: list[CustomerOrder]) -> set:
     return {
         it.participant_id
         for o in orders for it in o.items
-        if it.estado_cocina != "anulado"
+        if it.estado_cocina != "cancelado"
     }
 
 
@@ -611,7 +638,8 @@ def set_assignments(
             .join(CustomerOrder, CustomerOrder.id == OrderItem.order_id)
             .where(
                 CustomerOrder.table_session_id == ts.id,
-                CustomerOrder.status.notin_(("cancelada", "pagada")),
+                CustomerOrder.status != "cancelada",
+                CustomerOrder.payment_status != "PAID",
             )
         ).scalars()
     }
@@ -626,7 +654,7 @@ def set_assignments(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"El producto {a.order_item_id} no pertenece a la cuenta de esta mesa.",
             )
-        if item.estado_cocina == "anulado":
+        if item.estado_cocina == "cancelado":
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Un producto anulado no se cobra, así que no se puede asignar.",

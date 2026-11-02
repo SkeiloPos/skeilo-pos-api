@@ -69,7 +69,7 @@ class TestTableSessionsRouter(unittest.TestCase):
         category = fx.make_category(db)
         product = fx.make_product(db, category=category)
         variant = fx.make_variant(db, product=product, price=PRECIO)
-        order = fx.make_customer_order(db, ts, status="abierta")
+        order = fx.make_customer_order(db, ts, status="entregada")
         item = fx.make_order_item(db, order, variant, participant_id=ana.id)
 
         register = fx.make_cash_register(db)
@@ -300,7 +300,7 @@ class TestSessionClosedNotifications(unittest.TestCase):
     def test_release_table_con_ordenes_sin_cerrar_responde_409_y_no_emite(self):
         from app.characterization_tests import cart_fixtures as cf
         db, table, ts, ana = self._seed()
-        cf.make_customer_order(db, ana, status="abierta")
+        cf.make_customer_order(db, ana, status="pendiente")
         db.commit()
 
         with mock.patch("app.core.events.session_closed") as ev, \
@@ -340,7 +340,7 @@ class TestSessionClosedNotifications(unittest.TestCase):
         from app.api.v1.cart import service as cart_service
         from app.characterization_tests import cart_fixtures as cf
         db, table, ts, ana = self._seed(comensal_cerrado=False)
-        cf.make_customer_order(db, ana, status="abierta")
+        cf.make_customer_order(db, ana, status="pendiente")
         db.commit()
 
         with mock.patch("app.core.events.session_closed") as ev:

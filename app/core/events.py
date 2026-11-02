@@ -193,12 +193,15 @@ def order_created(
 
 
 def order_confirmed(tenant_id: int, *, order_id, table_session_id) -> str | None:
-    """El staff aceptó el pedido: 'pendiente' → 'abierta' (descuenta inventario)."""
+    """El staff aceptó el pedido y se descontó el inventario. Spec 147: ya no
+    existe 'abierta' -- `status` sigue en `'pendiente'` hasta que se entregue
+    (`order_delivered`), así que el payload ya no afirma un valor que nunca
+    se llegó a fijar."""
     return publish(
         tenant_id,
         type="order.confirmed",
         channels=[CH_STAFF, session_channel(table_session_id)],
-        payload={"order_id": order_id, "table_session_id": table_session_id, "status": "abierta"},
+        payload={"order_id": order_id, "table_session_id": table_session_id, "status": "pendiente"},
     )
 
 
@@ -270,6 +273,22 @@ def order_cancelled(tenant_id: int, *, order_id, table_session_id, motivo) -> st
         payload={
             "order_id": order_id, "table_session_id": table_session_id, "motivo": motivo,
         },
+    )
+
+
+def order_delivered(tenant_id: int, *, order_id, table_session_id) -> str | None:
+    """Spec 147 (R8, FR-020): el pedido completo (y todos sus ítems
+    `'pendiente'`) pasó a `'entregada'` con la acción única "Entregar". Se
+    emite después del commit, nunca antes (mismo cuidado que
+    `notify_sessions_closed`)."""
+    channels = [CH_STAFF]
+    if table_session_id is not None:
+        channels.append(session_channel(table_session_id))
+    return publish(
+        tenant_id,
+        type="order.delivered",
+        channels=channels,
+        payload={"order_id": order_id, "table_session_id": table_session_id, "status": "entregada"},
     )
 
 

@@ -62,7 +62,7 @@ def _abandonadas_sin_pedir(db, now: datetime) -> list:
     """
     from app.models.session_participant import SessionParticipant
     from app.models.table_session import TableSession
-    from app.api.v1.table_sessions.service import has_billable_orders
+    from app.api.v1.table_sessions.service import has_open_orders
 
     limite = now - timedelta(minutes=settings.EMPTY_SESSION_TTL_MINUTES)
     # `expires_at - SESSION_TTL_MINUTES` = última actividad del comensal.
@@ -85,7 +85,7 @@ def _abandonadas_sin_pedir(db, now: datetime) -> list:
         )
     ).scalars().all()
 
-    return [ts for ts in candidatas if not has_billable_orders(db, ts.id)]
+    return [ts for ts in candidatas if not has_open_orders(db, ts.id)]
 
 
 def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) -> int:
@@ -94,9 +94,9 @@ def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) ->
     from app.models.dining_table import DiningTable
     from app.models.table_session import TableSession
     from app.api.v1.orders.checkout import (
-        TERMINAL, close_participants, close_table_sessions, delete_orphan_carts,
+        close_participants, close_table_sessions, delete_orphan_carts,
     )
-    from app.api.v1.table_sessions.service import has_billable_orders
+    from app.api.v1.table_sessions.service import has_open_orders
 
     tocadas = 0
     #: (table_session_id, dining_table_id, número de mesa, ¿quedó libre?) de las
@@ -129,7 +129,7 @@ def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) ->
             # activas— y por tanto imposible de cobrar desde la terminal. Se echa a
             # los comensales, que es lo que interesa del vencimiento, y la mesa
             # queda esperando al cajero.
-            if has_billable_orders(db, ts.id):
+            if has_open_orders(db, ts.id):
                 echados = close_participants(db, ts)
                 logger.info(
                     "Sesión %s (schema %s) vencida con pedidos sin cobrar: se "
@@ -145,10 +145,19 @@ def _sweep_schema(schema: str, corte: datetime, tenant_id: int | None = None) ->
             # Segunda red: la mesa solo vuelve a 'libre' si tampoco le quedan
             # pedidos vivos **fuera** de esta sesión (los que quedaron sin
             # `table_session_id` en su día). Liberarla los volvería incobrables.
+            # Spec 147 (FR-016): "orden abierta" — un pedido ya cerrado
+            # (entregada+PAID) no bloquea; antes `TERMINAL` ("pagada",
+            # "cancelada") lo excluía, pero 'pagada' ya no existe (research.md
+            # R6: el barrido no cambia de criterio de negocio, pero sus
+            # literales de status sí deben seguir el modelo nuevo).
             pendientes = db.execute(
                 select(CustomerOrder.id).where(
                     CustomerOrder.dining_table_id == table_id,
-                    CustomerOrder.status.notin_(TERMINAL),
+                    (CustomerOrder.status == "pendiente")
+                    | (
+                        (CustomerOrder.status == "entregada")
+                        & (CustomerOrder.payment_status == "UNPAID")
+                    ),
                 ).limit(1)
             ).scalar()
             table = db.get(DiningTable, table_id)

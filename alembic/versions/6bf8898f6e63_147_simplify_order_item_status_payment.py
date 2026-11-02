@@ -149,6 +149,12 @@ def upgrade(schema: str) -> None:
         ),
         schema=schema,
     )
+    # El default de columna seguía en 'abierta' (del modelo previo a esta
+    # spec); con el CHECK nuevo, cualquier INSERT que confiara en el default
+    # violaría la restricción en silencio hasta fallar con un IntegrityError.
+    op.alter_column(
+        "customer_orders", "status", server_default="pendiente", schema=schema,
+    )
 
 
 @for_each_tenant_schema
@@ -202,4 +208,7 @@ def downgrade(schema: str) -> None:
         unique=True,
         postgresql_where=text("status NOT IN ('pagada', 'cancelada')"),
         schema=schema,
+    )
+    op.alter_column(
+        "customer_orders", "status", server_default="abierta", schema=schema,
     )

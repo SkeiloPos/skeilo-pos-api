@@ -122,13 +122,16 @@ def _fixture(db, suf: str):
                               display_name="Beto", display_label="Beto", status="open")
     db.add_all([ana, beto]); db.flush()
 
-    order = CustomerOrder(channel="POS", order_type="DINE_IN", status="abierta",
+    # Spec 147: status='entregada'/estado_cocina='entregado' (ya no existen
+    # 'abierta'/'listo') -- `close_session`/`_assert_closable` exige que nada
+    # quede 'pendiente' antes de cobrar y cerrar.
+    order = CustomerOrder(channel="POS", order_type="DINE_IN", status="entregada",
                           dining_table_id=table.id, table_session_id=ts.id)
     db.add(order); db.flush()
     for participant_id in (ana.id, beto.id, None):
         db.add(OrderItem(
             order_id=order.id, product_variant_id=variant.id, participant_id=participant_id,
-            quantity=1, unit_price=PRECIO, estado_cocina="listo",
+            quantity=1, unit_price=PRECIO, estado_cocina="entregado",
         ))
     db.flush()
     return dict(shift=shift.id, user=user.id, method=method.id, table=table.id,
@@ -443,10 +446,12 @@ def unidades():
                    {f.unit_price for f in filas}, {PRECIO})
 
         # --- no se parte lo que cocina aún no terminó -------------------------
+        # Spec 147: 'en_preparacion' ya no existe -- 'pendiente' es el único
+        # valor no terminal (`EN_CURSO`) que bloquea el reparto por unidades.
         with with_db(schema) as db:
             otra = OrderItem(
                 order_id=fx["order"], product_variant_id=fx["variant"], participant_id=None,
-                quantity=2, unit_price=PRECIO, estado_cocina="en_preparacion",
+                quantity=2, unit_price=PRECIO, estado_cocina="pendiente",
             )
             db.add(otra); db.commit()
             otra_id = otra.id

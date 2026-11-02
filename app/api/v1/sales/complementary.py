@@ -38,7 +38,7 @@ def _pending_option_rows(db: Session, order_id: UUID) -> list[OrderItemOption]:
         )
         .where(
             OrderItem.order_id == order_id,
-            OrderItem.estado_cocina != "anulado",
+            OrderItem.estado_cocina != "cancelado",
             OrderItemOption.added_after_sale.is_(True),
             OrderItemOption.complementary_sale_id.is_(None),
         )
@@ -54,7 +54,7 @@ def _pending_topping_rows(db: Session, order_id: UUID) -> list[OrderItemTopping]
         .options(selectinload(OrderItemTopping.order_item))
         .where(
             OrderItem.order_id == order_id,
-            OrderItem.estado_cocina != "anulado",
+            OrderItem.estado_cocina != "cancelado",
             OrderItemTopping.added_after_sale.is_(True),
             OrderItemTopping.complementary_sale_id.is_(None),
         )

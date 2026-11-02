@@ -21,7 +21,7 @@ from math import ceil
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import cast, exists, func, or_, select
+from sqlalchemy import cast, func, or_, select
 from sqlalchemy.types import String
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 #: importarlo) porque cada módulo de este paquete define el suyo (ver
 #: `checkout.TERMINAL`), y `cart.service` ya importa de `table_sessions.service`,
 #: que a su vez depende de `orders.checkout`.
-_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "abierta", "bloqueada")
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "entregada")
 
 #: Combinaciones canal × tipo de orden con sentido de negocio (spec 055,
 #: FR-006; research.md D4) — validado solo aquí: es el único punto donde
@@ -122,7 +122,7 @@ def order_pending_balance(db: Session, order_id: UUID) -> Decimal:
         .join(Option, Option.id == OrderItemOption.option_id)
         .where(
             OrderItem.order_id == order_id,
-            OrderItem.estado_cocina != "anulado",
+            OrderItem.estado_cocina != "cancelado",
             OrderItemOption.added_after_sale.is_(True),
             OrderItemOption.complementary_sale_id.is_(None),
         )
@@ -136,7 +136,7 @@ def order_pending_balance(db: Session, order_id: UUID) -> Decimal:
         .join(OrderItem, OrderItem.id == OrderItemTopping.order_item_id)
         .where(
             OrderItem.order_id == order_id,
-            OrderItem.estado_cocina != "anulado",
+            OrderItem.estado_cocina != "cancelado",
             OrderItemTopping.added_after_sale.is_(True),
             OrderItemTopping.complementary_sale_id.is_(None),
         )
@@ -148,8 +148,9 @@ def order_pending_balance(db: Session, order_id: UUID) -> Decimal:
 
 #: Valor de `estado_cocina` que excluye una línea de toda suma (FR-019). Es el
 #: mismo filtro que `checkout.order_sale_lines` aplica al facturar: por eso la
-#: suma de lo visible coincide con el subtotal de la factura.
-_ESTADO_ANULADO = "anulado"
+#: suma de lo visible coincide con el subtotal de la factura. Spec 147:
+#: 'anulado' -> 'cancelado'.
+_ESTADO_ANULADO = "cancelado"
 
 
 def _venta_propia(db: Session, order_id: UUID) -> Sale | None:
@@ -285,8 +286,9 @@ def build_billing_summary(db: Session, order: CustomerOrder) -> OrderBillingSumm
     3. en cualquier otro caso ⇒ `sin_factura` (FR-023).
 
     La condición del cancelado de la regla 2 es la garantía G4b: el cierre de
-    sesión solo cobra pedidos con `status NOT IN ('cancelada','pagada')`
-    (`table_sessions/service.py:180`), así que un pedido cancelado antes del
+    sesión solo cobra pedidos con `status != 'cancelada' and payment_status !=
+    'PAID'` (`table_sessions/service.py::_billable_orders`, criterio
+    reescrito spec 147), así que un pedido cancelado antes del
     cierre se queda en la sesión con su `table_session_id` intacto y sin
     haberse cobrado nunca. Sin la exclusión, la pantalla le mostraría el
     literal de FR-024a —"Este pedido **se cobró** junto con otros…"—
@@ -497,17 +499,19 @@ def list_orders(
     return db.execute(q).scalars().all()
 
 
-#: Los 6 valores exactos del filtro de estado de la pantalla "Órdenes" — el
-#: conjunto cerrado que acepta la rama paginada de `GET /orders` (spec 079,
-#: FR-008, data-model.md §3). `None` / ausente = "Todos" (sin predicado). El
-#: router valida contra este conjunto y responde 422 fuera de rango.
-ESTADOS_MOSTRADOS_ORDENES = ("pendiente", "abierta", "bloqueada", "pagada", "cancelada")
+#: Los 3 valores exactos del filtro de estado de la pantalla "Órdenes" (spec
+#: 147: colapsado de 5 a 3) — el conjunto cerrado que acepta la rama paginada
+#: de `GET /orders` (spec 079, FR-008, data-model.md §3). `None` / ausente =
+#: "Todos" (sin predicado). El router valida contra este conjunto y responde
+#: 422 fuera de rango.
+ESTADOS_MOSTRADOS_ORDENES = ("pendiente", "entregada", "cancelada")
 
 
 def list_orders_query(
     tenant,
     status_mostrado: str | None = None, order_type: str | None = None,
     date_from: date | None = None, date_to: date | None = None, q: str | None = None,
+    entregadas_sin_cobrar: bool = False,
 ) -> Select:
     """`Select` de comandas para la rama **paginada** de `GET /orders` (spec 079).
 
@@ -516,15 +520,21 @@ def list_orders_query(
     pero no cronológico) desempata los `created_at` idénticos para que recorrer
     las páginas cubra el conjunto sin huecos ni repeticiones.
 
-    `status_mostrado` traduce el "estado que ve la persona" a predicado — el port
-    fiel de `displayOrderStatus()` del frontend, movido al servidor (FR-016,
-    data-model.md §3): "cancelada" gana siempre; una orden se ve "Pagada" si
-    tiene `Sale` **o** si su `status` crudo ya es `'pagada'` y no está cancelada;
-    los estados no terminales conservan su `status` crudo solo si aún no tienen
-    venta. `order_type` filtra por la columna homónima; `order_type IS NULL`
-    (órdenes históricas sin clasificar) nunca satisface un `=` concreto, así que
-    queda fuera al filtrar por un tipo y dentro en "Todos" (FR-018), sin
-    `COALESCE` ni centinela.
+    `status_mostrado` filtra directamente por el `status` crudo de 3 valores
+    (spec 147: colapso de 5 a 3 — "estado que ve la persona" y `status` crudo
+    ya coinciden, a diferencia del modelo anterior donde "Pagada" se derivaba
+    de la existencia de una `Sale` porque `status` rara vez llegaba a
+    `'pagada'` por sí solo). El pago (`payment_status`, FR-012) se filtra por
+    separado con `entregadas_sin_cobrar` (FR-014/SC-003), no aquí. `order_type`
+    filtra por la columna homónima; `order_type IS NULL` (órdenes históricas
+    sin clasificar) nunca satisface un `=` concreto, así que queda fuera al
+    filtrar por un tipo y dentro en "Todos" (FR-018), sin `COALESCE` ni
+    centinela.
+
+    `entregadas_sin_cobrar=True` (spec 147, FR-014/SC-003) acota a
+    `status == 'entregada' AND payment_status == 'UNPAID'`, sin importar
+    `status_mostrado` — el filtro "Entregadas sin cobrar" de la pantalla es
+    independiente del selector de estado.
 
     `list_orders()` (Terminal/Dashboard) **no se toca**: conserva su firma y su
     salida (plan.md, Constitution Check, Principio III).
@@ -549,21 +559,13 @@ def list_orders_query(
         .order_by(CustomerOrder.created_at.desc(), CustomerOrder.id.desc())
     )
 
-    tiene_venta = exists(
-        select(Sale.id).where(Sale.customer_order_id == CustomerOrder.id)
-    )
+    if status_mostrado is not None:
+        stmt = stmt.where(CustomerOrder.status == status_mostrado)
 
-    if status_mostrado in ("pendiente", "abierta", "bloqueada"):
+    if entregadas_sin_cobrar:
         stmt = stmt.where(
-            CustomerOrder.status == status_mostrado, ~tiene_venta,
+            CustomerOrder.status == "entregada", CustomerOrder.payment_status == "UNPAID",
         )
-    elif status_mostrado == "pagada":
-        stmt = stmt.where(
-            CustomerOrder.status != "cancelada",
-            or_(tiene_venta, CustomerOrder.status == "pagada"),
-        )
-    elif status_mostrado == "cancelada":
-        stmt = stmt.where(CustomerOrder.status == "cancelada")
 
     if order_type is not None:
         stmt = stmt.where(CustomerOrder.order_type == order_type)

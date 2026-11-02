@@ -8,8 +8,8 @@ from datetime import datetime
 
 class OrderItemVoidLog(UUIDPrimaryKeyMixin, Base):
     """Auditoría de anulación/reemplazo de un ítem individual (Fase 6). El ítem
-    anulado no se elimina (estado_cocina='anulado'); si se reemplaza, el nuevo
-    ítem apunta al anulado vía order_items.void_de."""
+    anulado no se elimina (estado_cocina='cancelado', spec 147); si se
+    reemplaza, el nuevo ítem apunta al anulado vía order_items.void_de."""
 
     __tablename__ = "order_item_void_logs"
 

@@ -134,8 +134,10 @@ def close_session(
     user: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
 ):
-    """Cierra en cascada: cobra, marca los pedidos `pagada`, cierra a los
-    comensales, abandona sus carritos y libera la mesa. Todo en una transacción."""
+    """Cierra en cascada: cobra (deja `payment_status='PAID'`; `status` ya
+    estaba `'entregada'`, exigido por `_assert_closable`, spec 147), cierra a
+    los comensales, abandona sus carritos y libera la mesa. Todo en una
+    transacción."""
     return service.close_session(
         db, table_session_id, body, user,
         invoice_prefix=tenant.invoice_prefix or "",
@@ -147,7 +149,7 @@ def close_session(
 @router.post(
     "/{table_session_id}/release",
     response_model=ReleaseSessionResponse,
-    summary="Liberar una sesión ya completamente pagada (sin nada por cobrar)",
+    summary="Liberar manualmente una mesa sin órdenes abiertas (spec 147, FR-015/FR-016)",
 )
 def release_paid_session(
     table_session_id: UUID,

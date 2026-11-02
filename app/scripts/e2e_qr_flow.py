@@ -277,12 +277,12 @@ def main():
         check("confirmar descuenta 3 unidades × 2 de receta",
               stock_0 - stock(fx), POR_UNIDAD * 3)
 
-        # --- la terminal marca los pedidos listos ---------------------------
+        # --- la terminal entrega los pedidos (spec 147: acción única) ------
         for o in (o1, o2):
-            listo = api("POST", f"/api/v1/orders/{o['id']}/ready").json()
-            check("marcar listo deja todos los ítems en 'listo'",
-                  {it["estado_cocina"] for it in listo["items"]}, {"listo"})
-        note("la terminal marcó ambos pedidos listos, una llamada por pedido")
+            entregado = api("POST", f"/api/v1/orders/{o['id']}/deliver").json()
+            check("entregar deja todos los ítems en 'entregado'",
+                  {it["estado_cocina"] for it in entregado["items"]}, {"entregado"})
+        note("la terminal entregó ambos pedidos, una llamada por pedido")
 
         # --- cuenta con split ----------------------------------------------
         bill = api("GET", f"/api/v1/table-sessions/{ts_id}/bill").json()

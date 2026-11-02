@@ -85,8 +85,8 @@ from app.core.timezone import utc_now_naive
 #: Estados no terminales de `CustomerOrder` — mientras el comensal tenga una
 #: orden en alguno de estos, no puede crear otra (spec 024, FR-005/FR-006;
 #: research.md spec 024, Decisión 8, mismo criterio de "terminal" que ya usa
-#: `checkout.TERMINAL`/`mark_order_ready`).
-_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "abierta", "bloqueada")
+#: `checkout.TERMINAL`/`mark_order_ready`). Spec 147: colapsado a 2 estados.
+_NON_TERMINAL_ORDER_STATUSES = ("pendiente", "entregada")
 
 logger = logging.getLogger(__name__)
 
@@ -670,15 +670,15 @@ def cancel_my_order(
     tenant_id: int | None = None,
     request_id: str | None = None,
 ) -> CustomerOrder:
-    """Cancelación por el propio comensal. Solo hasta que cocina empieza:
+    """Cancelación por el propio comensal. Solo hasta que cocina empieza
+    (spec 147: ya no hay paso intermedio por ítem -- solo `'pendiente'` y
+    `'entregado'`/`'cancelado'`):
 
-    - `pendiente`: siempre, salvo que ya se haya "aceptado para cocina" sin
-      cobrar (`POST /orders/{id}/start-preparation`) -- ahí ya hay ítems
-      `en_preparacion` aunque el pago siga pendiente y `status` no se haya
-      movido de `pendiente`;
-    - `abierta`: solo si **todos** sus ítems siguen `pendiente`;
-    - a partir de `en_preparacion` el insumo ya se combinó y la decisión de cuánto
-      se pierde es del staff, no del cliente.
+    - permitido solo si `status == 'pendiente'` **y** ningún ítem salió de
+      `'pendiente'` todavía;
+    - en cuanto un ítem queda `'entregado'` (la orden ya se entregó, aunque
+      sea parcialmente vía FR-002a) la decisión de cuánto se pierde es del
+      staff, no del cliente.
 
     Delega la política de inventario en `checkout.cancel_order`, que ya sabe qué
     revertir y qué contar como pérdida — y que emite el evento de auditoría
@@ -701,9 +701,9 @@ def cancel_my_order(
         )
     en_cocina = [
         it for it in order.items
-        if it.estado_cocina not in ("pendiente", "anulado")
+        if it.estado_cocina not in ("pendiente", "cancelado")
     ]
-    if en_cocina or order.status not in ("pendiente", "abierta"):
+    if en_cocina or order.status not in ("pendiente",):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "El pedido ya está en preparación; pide al personal que lo cancele.",

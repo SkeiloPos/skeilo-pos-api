@@ -345,7 +345,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         )
         self.assertEqual(result.status, "confirmado")
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
 
         with self.assertRaises(HTTPException) as ctx:
             checkout.confirm_order(db, order.id, self._user())
@@ -362,8 +362,12 @@ class TestOrdersPaymentGate(unittest.TestCase):
         db.commit()
 
         result = checkout.confirm_order(db, order.id, self._user())
-        self.assertEqual(result.status, "abierta")
+        # Spec 147: ya no hay transición a 'abierta'; sigue 'pendiente'.
+        self.assertEqual(result.status, "pendiente")
 
+        # El guard de idempotencia ya no lee `status` (siempre 'pendiente'
+        # hasta la entrega) -- mira si el inventario de esta orden ya se
+        # descontó (`InventoryMovement` real), mismo resultado observable.
         with self.assertRaises(HTTPException) as ctx:
             checkout.confirm_order(db, order.id, self._user())
         self.assertEqual(ctx.exception.status_code, 409)
@@ -385,7 +389,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         )
 
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()
@@ -405,7 +409,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
 
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()
@@ -435,7 +439,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         self.assertEqual(result.status, "confirmado")
         self.assertEqual(result.change_amount, Decimal("2000"))
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
 
         db2, order2 = self._seed_order_recibida(autoflush=False)
         nequi = fx.make_payment_method(db2, name="Nequi", is_cash=False, type="transfer")
@@ -447,7 +451,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         result2 = checkout.approve_payment_attempt(db2, attempt2.id, self._shift(db2).id, self._user())
         self.assertEqual(result2.status, "confirmado")
         db2.refresh(order2)
-        self.assertEqual(order2.status, "pagada")
+        self.assertEqual(order2.payment_status, "PAID")
 
     def test_confirm_cash_stock_insuficiente_no_confirma_el_pago(self):
         """spec 026, FR-002 (US1, escenario 3): si el descuento automático de
@@ -554,7 +558,7 @@ class TestOrdersPaymentGate(unittest.TestCase):
         # 'pagada' (con su venta) en la misma llamada — no hace falta una
         # segunda llamada manual a confirm_order.
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
 
 
 class TestConfirmCashChequeoPrevioConPromocion073(unittest.TestCase):
@@ -890,7 +894,7 @@ class TestPagoMixtoGate130(unittest.TestCase):
         )
         self.assertIsNotNone(result2.cash_confirmed_at)
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
         sale = db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalar_one()
         self.assertEqual(sale.total, PRECIO)
 
@@ -913,7 +917,7 @@ class TestPagoMixtoGate130(unittest.TestCase):
         result2 = checkout.approve_payment_attempt(db, attempt.id, self._shift(db).id, self._user())
         self.assertEqual(result2.status, "confirmado")
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")
+        self.assertEqual(order.payment_status, "PAID")
         sale = db.execute(select(Sale).where(Sale.customer_order_id == order.id)).scalar_one()
         self.assertEqual(sale.total, PRECIO)
 

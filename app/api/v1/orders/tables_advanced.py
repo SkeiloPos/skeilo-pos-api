@@ -25,36 +25,42 @@ def _has_pending_kitchen_work(order: CustomerOrder) -> bool:
     return any(it.estado_cocina in EN_CURSO for it in order.items)
 
 
+def _order_closed(order: CustomerOrder) -> bool:
+    """Pedido cerrado (FR-006, spec 147): `'entregada'`+`'PAID'`. Ya no existe
+    `status == 'pagada'` — el pago es independiente del status."""
+    return order.status == "entregada" and order.payment_status == "PAID"
+
+
 def _table_occupied_by_order(order: CustomerOrder) -> bool:
     """¿Esta orden hace que su mesa cuente como "con trabajo pendiente" para
     liberarla/reservarla, o como destino/origen ocupado al mover otra orden?
-    (spec 035, A-52 de `registro-de-anomalias.md`). `'cancelada'` nunca ocupa
-    la mesa. Una orden `'pagada'` deja de ocuparla salvo que le queden ítems
-    sin terminar de preparar — antes de esta spec, `'pagada'` dejaba de
-    ocupar la mesa de inmediato, sin mirar cocina; ahora que
-    `checkout_and_send` puede dejar una orden `'pagada'` con comida todavía
-    en preparación (spec 028: se cobra antes de enviar a cocina), esa señal
-    ya no basta por sí sola. Cualquier otro estado (`'pendiente'`, `'abierta'`,
-    `'bloqueada'`) sigue ocupando la mesa sin condición, igual que antes."""
+    (spec 035, A-52 de `registro-de-anomalias.md`; criterio de "cerrado"
+    reescrito spec 147). `'cancelada'` nunca ocupa la mesa. Un pedido cerrado
+    (`'entregada'`+`'PAID'`) deja de ocuparla salvo que le queden ítems sin
+    terminar de preparar — `checkout_and_send` puede dejar un pedido cerrado
+    con comida todavía en preparación (spec 028: se cobra antes de enviar a
+    cocina), esa señal ya no basta por sí sola. Cualquier otro caso
+    (`'pendiente'`, o `'entregada'` sin cobrar) sigue ocupando la mesa sin
+    condición, igual que antes."""
     if order.status == "cancelada":
         return False
-    if order.status == "pagada":
+    if _order_closed(order):
         return _has_pending_kitchen_work(order)
     return True
 
 
 def _order_locked_for_move_or_merge(order: CustomerOrder) -> bool:
     """¿Esta orden específica no se puede mover ni fusionar todavía? (spec
-    035, A-52). Distinto de `_table_occupied_by_order`: una orden
-    `'cancelada'` siempre lo impide (igual que antes de esta spec) aunque
-    nunca ocupe la mesa por sí sola; una orden no-terminal
-    (`'pendiente'`/`'abierta'`/`'bloqueada'`) nunca lo impide (igual que
-    antes). Una orden `'pagada'` lo impide solo mientras le queden ítems sin
-    terminar de preparar — antes de esta spec, `'pagada'` siempre lo impedía,
-    sin mirar cocina."""
+    035, A-52; criterio de "cerrado" reescrito spec 147). Distinto de
+    `_table_occupied_by_order`: una orden `'cancelada'` siempre lo impide
+    (igual que antes de esta spec) aunque nunca ocupe la mesa por sí sola; una
+    orden no-terminal (`'pendiente'`, o `'entregada'` sin cobrar) nunca lo
+    impide (igual que antes). Un pedido cerrado (`'entregada'`+`'PAID'`) lo
+    impide solo mientras le queden ítems sin terminar de preparar — antes de
+    esta spec, `'pagada'` siempre lo impedía, sin mirar cocina."""
     if order.status == "cancelada":
         return True
-    if order.status == "pagada":
+    if _order_closed(order):
         return _has_pending_kitchen_work(order)
     return False
 
@@ -132,8 +138,9 @@ def merge_orders(db: Session, order_ids: list[UUID]) -> dict:
 
 def group_bill(db: Session, group_id: UUID, *, tenant: Tenant | None = None) -> dict:
     """Cuenta consolidada de un grupo de mesas fusionadas — corrige A-01 camino C
-    (`registro-de-anomalias.md`, RN-ORD-64): excluye órdenes `pagada`/`cancelada`
-    del cálculo y aplica promociones/combos vigentes, igual que
+    (`registro-de-anomalias.md`, RN-ORD-64): excluye órdenes cerradas
+    (`'entregada'`+`'PAID'`, criterio reescrito spec 147) o `cancelada` del
+    cálculo y aplica promociones/combos vigentes, igual que
     `table_sessions.compute_bill` (camino A, referencia). Evalúa descuentos por
     orden, no por comensal — equivalente en total a agrupar por comensal
     (research.md Decisión 1 de specs/019-correccion-cuenta-mesas-fusionadas)."""
@@ -147,7 +154,7 @@ def group_bill(db: Session, group_id: UUID, *, tenant: Tenant | None = None) -> 
     per_order = []
     total = Decimal("0")
     for o in orders:
-        if o.status in checkout.TERMINAL:
+        if o.status == "cancelada" or _order_closed(o):
             sub = Decimal("0")
         else:
             lines = checkout.order_sale_lines(db, o.id)

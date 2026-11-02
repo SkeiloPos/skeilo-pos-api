@@ -194,8 +194,11 @@ def main():
         with with_db(schema) as db:
             checkout.confirm_order(db, oid2, _staff(db))
         with with_db(schema) as db:
-            _check("con receta el pedido pasa a 'abierta'",
-                   db.get(CustomerOrder, oid2).status, "abierta")
+            # Spec 147: confirmar ya no mueve `status` (no existe 'abierta');
+            # el pedido sigue 'pendiente' hasta que se entregue. La señal de
+            # "ya confirmado" es el movimiento de inventario, no el status.
+            _check("con receta el pedido sigue 'pendiente'",
+                   db.get(CustomerOrder, oid2).status, "pendiente")
             _check("y escribe un movimiento por insumo", _movs(db, oid2), 1)
             _check("descontando la cantidad de la receta",
                    _stock(db, item_id), STOCK_INICIAL - POR_UNIDAD)
@@ -221,7 +224,7 @@ def main():
         # Es lo que garantiza que consolidación y adición de ítem tampoco puedan
         # colarse: comparten esta función.
         with with_db(schema) as db:
-            order4 = _order(db, [db.get(ProductVariant, sin_id)], status="abierta")
+            order4 = _order(db, [db.get(ProductVariant, sin_id)], status="pendiente")
             db.commit()
             entries = [(it, []) for it in order4.items]
             _expect_409(
