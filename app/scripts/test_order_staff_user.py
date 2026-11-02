@@ -81,7 +81,7 @@ def _pedido(schema, table_id, user_id):
             dining_table_id=table_id,
             channel="POS",
             order_type="DINE_IN",
-            status="abierta",
+            status="pendiente",
             user_id=user_id,
         )
         db.add(order)

@@ -376,7 +376,9 @@ class EndToEndQuantityConsumptionTests(unittest.TestCase):
         checkout._deduct_and_open(db, order, fx.make_user_double())
         db.commit()
 
-        self.assertEqual(order.status, "abierta")
+        # Spec 147: _deduct_and_open ya no mueve `status` a 'abierta' (no
+        # existe) -- sigue 'pendiente' hasta la entrega.
+        self.assertEqual(order.status, "pendiente")
         movimientos = db.execute(
             select(InventoryMovement).where(InventoryMovement.reference_id == order.id)
         ).scalars().all()

@@ -362,8 +362,8 @@ class TestCartRouter(unittest.TestCase):
 
         service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
         order2 = service.submit_cart(db, participant, efectivo.id)
-        order2.status = "abierta"
-        order2.items[0].estado_cocina = "en_preparacion"
+        order2.status = "entregada"
+        order2.items[0].estado_cocina = "entregado"
         db.commit()
 
         with self.assertRaises(HTTPException) as ctx_err:

@@ -37,7 +37,9 @@ from app.api.v1.orders.schemas import (
     CancelIn, CheckoutAndSendIn, OrderChannel, OrderCreate, OrderItemIn, OrderType,
 )
 from app.api.v1.sales.schemas import PaymentIn
+from app.core import inventory_reasons
 from app.core.config import settings
+from app.models.inventory_movement import InventoryMovement
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -391,7 +393,10 @@ class TestOrderAuditIntegration(unittest.TestCase):
         with mock.patch.object(checkout, "record_order_audit_event") as rec:
             result = checkout.confirm_order(db, order.id, user)
 
-        self.assertEqual(result.status, "abierta")  # la transición sí ocurrió
+        # Spec 147: confirmar ya no mueve `status` (no existe 'abierta') --
+        # sigue 'pendiente'; la transición que sí ocurrió es el descuento de
+        # inventario (verificado por el evento ORDER_CONFIRMED mismo).
+        self.assertEqual(result.status, "pendiente")
         eventos = _eventos(rec, OrderAuditEventType.ORDER_CONFIRMED)
         self.assertEqual(len(eventos), 1)
         self.assertEqual(eventos[0]["order_id"], order.id)
@@ -455,12 +460,20 @@ class TestOrderAuditIntegration(unittest.TestCase):
     def test_cancel_order_emite_order_cancelled_por_staff_y_por_comensal(self):
         """FR-009: `initiated_by` distingue las dos rutas de entrada, y
         `inventory_loss` marca si algún ítem ya consumido no volvió al stock."""
-        # (a) staff, con un ítem ya 'en_preparacion' sobre una orden abierta:
-        # ese insumo ya se combinó, no vuelve al inventario → pérdida.
+        # (a) staff, con un ítem ya 'entregado' sobre una orden 'entregada'
+        # ya descontada (spec 147: el inventario descontado ya no se infiere
+        # de `status`, se verifica con un `InventoryMovement` real -- ver
+        # `checkout.cancel_order`): ese insumo ya se combinó, no vuelve al
+        # inventario → pérdida.
         db, order, _ = self._seed_orden_recibida()
-        order.status = "abierta"
+        order.status = "entregada"
         for item in order.items:
-            item.estado_cocina = "en_preparacion"
+            item.estado_cocina = "entregado"
+        db.add(InventoryMovement(
+            inventory_item_id=fx.make_inventory_item(db, current_stock=Decimal("1000")).id,
+            type="out", quantity=Decimal("1"), reason=inventory_reasons.VENTA,
+            reference_type=inventory_reasons.REF_ORDER, reference_id=order.id,
+        ))
         db.commit()
         user = _staff()
 
@@ -759,7 +772,9 @@ class TestOrderAuditIntegration(unittest.TestCase):
             sale = checkout.checkout_and_send(db, order.id, data, cashier)
 
         db.refresh(order)
-        self.assertEqual(order.status, "pagada")  # la transición sí ocurrió
+        # Spec 147: checkout_and_send ya no mueve `status` a 'pagada' (no
+        # existe) -- deja `payment_status='PAID'`.
+        self.assertEqual(order.payment_status, "PAID")
 
         confirmados = _eventos(rec, OrderAuditEventType.ORDER_CONFIRMED)
         self.assertEqual(len(confirmados), 1)

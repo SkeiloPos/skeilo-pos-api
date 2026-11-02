@@ -154,7 +154,7 @@ class TestOrderItemToppingAttach(unittest.TestCase):
         self.assertEqual(item.addons_total, Decimal("0"))
 
     def test_linea_en_estado_listo_rechaza_con_409(self):
-        item = self._item(estado_cocina="listo")
+        item = self._item(estado_cocina="entregado")
         body = ToppingSelectionIn(topping_product_id=self.gomitas_product.id, quantity=1)
         with self.assertRaises(HTTPException) as ctx:
             toppings.add_topping_to_order_item(self.db, item.id, body, self.user, self.tenant)

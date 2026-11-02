@@ -275,10 +275,18 @@ class TestContadoresDePedidosActivos(unittest.TestCase):
         for canal in canales:
             for _ in range(n_por_canal):
                 fx.make_customer_order(
-                    db, fx.make_table_session(db), order_type=canal, status="abierta",
+                    db, fx.make_table_session(db), order_type=canal, status="pendiente",
                 )
-        for estado in ("pagada", "cancelada"):
-            fx.make_customer_order(db, fx.make_table_session(db), order_type="DINE_IN", status=estado)
+        # Spec 147: 'pagada' ya no existe -- un pedido cerrado es
+        # 'entregada'+'PAID'; junto con 'cancelada' son los dos casos que no
+        # cuentan como activos.
+        fx.make_customer_order(
+            db, fx.make_table_session(db), order_type="DINE_IN",
+            status="entregada", payment_status="PAID",
+        )
+        fx.make_customer_order(
+            db, fx.make_table_session(db), order_type="DINE_IN", status="cancelada",
+        )
         db.commit()
 
     def test_el_conteo_coincide_con_la_longitud_de_la_lista_de_activos(self):
@@ -314,7 +322,7 @@ class TestContadoresDePedidosActivos(unittest.TestCase):
             shift = fx.make_cash_shift(db)
             db.commit()
             for _ in range(n_pedidos):
-                fx.make_customer_order(db, fx.make_table_session(db), order_type="TAKEAWAY", status="abierta")
+                fx.make_customer_order(db, fx.make_table_session(db), order_type="TAKEAWAY", status="pendiente")
             db.commit()
             resultado, sql = _capturar(db, lambda: router.shift_sales_report(shift.id, db))
             return resultado["active_orders_count"], len(sql)

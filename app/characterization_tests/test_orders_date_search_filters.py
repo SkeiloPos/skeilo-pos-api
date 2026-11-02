@@ -47,6 +47,12 @@ def _ids(db, *, date_from=None, date_to=None, q=None, status=None, order_type=No
         date_from=date_from,
         date_to=date_to,
         q=q,
+        # Spec 147: `entregadas_sin_cobrar` tiene default `Query(False, ...)`
+        # -- al llamar el endpoint directo como función (sin pasar por
+        # FastAPI), un kwarg omitido llega como el objeto `Query` crudo, no
+        # como `False` (mismo gotcha ya documentado para otros params Query
+        # de este router). Hay que pasarlo explícito.
+        entregadas_sin_cobrar=False,
         db=db,
         tenant=fx.make_tenant_double(),
         _=fx.make_user_double(),
@@ -59,7 +65,7 @@ class _Base(unittest.TestCase):
         self.db = fx.new_session()
         self.ts = fx.make_table_session(self.db)
 
-    def _order(self, *, created_at, customer_name=None, status="abierta", order_type="DINE_IN"):
+    def _order(self, *, created_at, customer_name=None, status="pendiente", order_type="DINE_IN"):
         order = fx.make_customer_order(
             self.db, self.ts,
             status=status, order_type=order_type,
@@ -164,7 +170,7 @@ class TestCombinacionConFiltrosExistentes(_Base):
         objetivo = self._order(
             created_at=datetime(2026, 10, 15, 9, 0),
             customer_name="Deimer Hernández",
-            status="abierta", order_type="TAKEAWAY",
+            status="pendiente", order_type="TAKEAWAY",
         )
         self._order(
             created_at=datetime(2026, 10, 15, 9, 0),
@@ -174,14 +180,14 @@ class TestCombinacionConFiltrosExistentes(_Base):
         self._order(
             created_at=datetime(2026, 10, 10, 9, 0),
             customer_name="Deimer Hernández",
-            status="abierta", order_type="TAKEAWAY",
+            status="pendiente", order_type="TAKEAWAY",
         )
         self.db.commit()
 
         ids = _ids(
             self.db, q="deimer",
             date_from=date(2026, 10, 15), date_to=date(2026, 10, 15),
-            status="abierta", order_type=OrderType.TAKEAWAY,
+            status="pendiente", order_type=OrderType.TAKEAWAY,
         )
         self.assertEqual(ids, {objetivo.id})
 

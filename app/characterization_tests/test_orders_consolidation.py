@@ -263,7 +263,7 @@ class TestConsolidation(unittest.TestCase):
 
         order = consolidation.get_or_create_open_order(db, table.id, user_id)
         db.commit()
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "pendiente")
         self.assertEqual(order.channel, "POS")
         self.assertTrue(order.is_consolidation_order)
         self.assertEqual(order.order_type, "DINE_IN")
@@ -293,7 +293,7 @@ class TestConsolidation(unittest.TestCase):
         data = OrderItemIn(product_variant_id=variant.id, quantity=1)
         order = consolidation.add_item_to_order(db, order.id, data, user)
 
-        self.assertEqual(order.status, "abierta")
+        self.assertEqual(order.status, "pendiente")
         self.assertEqual(order.channel, "POS")
         self.assertTrue(order.is_consolidation_order)
         self.assertIsNotNone(order.table_session_id)
@@ -314,9 +314,10 @@ class TestConsolidation(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_add_item_to_order_409_si_pedido_pagado_o_cancelado(self):
-        """Spec 087 (FR-009, A-85): un pedido `pagada` o `cancelada` rechaza
-        el anexo con 409 — hay que crear un pedido nuevo en vez de reabrir
-        uno ya cerrado."""
+        """Spec 087 (FR-009, A-85), criterio reescrito spec 147: un pedido
+        cerrado (`'entregada'`+`'PAID'`) o `'cancelada'` rechaza el anexo con
+        409 — hay que crear un pedido nuevo en vez de reabrir uno ya
+        cerrado."""
         db = fx.new_session()
         table = fx.make_dining_table(db)
         ts = fx.make_table_session(db, table=table)
@@ -324,10 +325,13 @@ class TestConsolidation(unittest.TestCase):
         db.commit()
         user = self._user()
 
-        for estado in ("pagada", "cancelada"):
+        for kwargs in (
+            {"status": "entregada", "payment_status": "PAID"},
+            {"status": "cancelada"},
+        ):
             order = fx.make_customer_order(
                 db, ts, dining_table_id=table.id, channel="POS",
-                is_consolidation_order=True, status=estado,
+                is_consolidation_order=True, **kwargs,
             )
             db.commit()
 
@@ -355,7 +359,7 @@ class TestConsolidation(unittest.TestCase):
         _, _, variant, _ = self._seed_variant_con_receta(db)
 
         order = fx.make_customer_order(
-            db, ts, channel="POS", is_consolidation_order=True, status="abierta",
+            db, ts, channel="POS", is_consolidation_order=True, status="pendiente",
         )
         item_previo = fx.make_order_item(db, order, variant, estado_cocina="pendiente")
 
@@ -427,19 +431,19 @@ class TestConsolidation(unittest.TestCase):
         """El hallazgo central del plan de spec 055: fusionar 'counter' y
         'waiter' en un único canal 'POS' no puede hacer que el mesero, al
         agregar un ítem directo a la mesa, reabra por accidente una comanda
-        de mostrador que ya se cobró (`checkout_and_send` deja la orden en
-        'abierta' a propósito, con la venta ya emitida) — `is_consolidation_order`
-        es justo lo que evita esa colisión."""
+        de mostrador que ya se cobró (`checkout_and_send` deja el pago en
+        `payment_status='PAID'` a propósito, sin tocar `status`, spec 147) —
+        `is_consolidation_order` es justo lo que evita esa colisión."""
         db = fx.new_session()
         table = fx.make_dining_table(db)
         ts = fx.make_table_session(db, table=table)
         db.commit()
 
-        # Comanda de mostrador ya cobrada: status='abierta' + Sale emitida,
-        # is_consolidation_order=False (no la abrió el mesero).
+        # Comanda de mostrador ya cobrada: payment_status='PAID' + Sale
+        # emitida, is_consolidation_order=False (no la abrió el mesero).
         comanda_cobrada = fx.make_customer_order(
             db, ts, dining_table_id=table.id, channel="POS",
-            is_consolidation_order=False, status="abierta",
+            is_consolidation_order=False, status="entregada", payment_status="PAID",
         )
         shift = fx.make_cash_shift(db)
         cajero = fx.make_user_double()

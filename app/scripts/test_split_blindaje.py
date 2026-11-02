@@ -395,7 +395,7 @@ def unidades():
                    {"o": str(fx["order"])})
         db.add(OrderItem(
             order_id=fx["order"], product_variant_id=fx["variant"], participant_id=None,
-            quantity=2, unit_price=PRECIO, estado_cocina="listo",
+            quantity=2, unit_price=PRECIO, estado_cocina="entregado",
         ))
         db.commit()
 
