@@ -40,6 +40,7 @@ class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     inventario_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     promociones_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    cocina_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
     # Precios de referencia (spec 033, ampliación precio/duración/renovación).
     # Sin cobro real asociado — solo el dato que el Super Admin captura

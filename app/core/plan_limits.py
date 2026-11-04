@@ -30,7 +30,7 @@ from app.models.product import Product
 
 #: Catálogo único de módulos que un plan puede incluir (spec 141, FR-001). «Proveedores» y «Compras» no son
 #: módulos: viven dentro de `inventario` (A-150). Cada funcionalidad pertenece a uno solo (FR-002).
-PLAN_MODULES = ("inventario", "promociones")
+PLAN_MODULES = ("inventario", "promociones", "cocina")
 
 
 @dataclass(frozen=True)

@@ -137,6 +137,42 @@ class TestSuperAdminPlans(unittest.TestCase):
         updated = router.update_plan(created.id, cambio, db)
         self.assertFalse(updated.inventario_access)
 
+    # ---------------------------------------------------------- spec 149: cocina_access
+
+    def test_crear_plan_con_cocina_access_true_queda_persistido(self):
+        db = fx.new_session()
+        created = router.create_plan(PlanCreate(name="Con cocina", cocina_access=True), db)
+        self.assertTrue(created.cocina_access)
+
+    def test_crear_plan_sin_enviar_cocina_access_queda_en_false(self):
+        """FR-003: una característica omitida se guarda en su default — `false`
+        para accesos de módulo, igual que `inventario_access`/`promociones_access`."""
+        db = fx.new_session()
+        created = router.create_plan(PlanCreate(name="Sin cocina"), db)
+        self.assertFalse(created.cocina_access)
+
+    def test_editar_cocina_access_de_true_a_false_se_refleja_en_el_listado(self):
+        db = fx.new_session()
+        plan = fx.make_plan(db, cocina_access=True)
+        db.commit()
+
+        router.update_plan(plan.id, PlanUpdate(cocina_access=False), db)
+
+        listed = {p.id: p for p in router.list_plans(db)}
+        self.assertFalse(listed[plan.id].cocina_access)
+
+    def test_get_plan_de_un_tenant_refleja_cocina_access_vigente(self):
+        db = fx.new_session()
+        plan = fx.make_plan(db, cocina_access=True)
+        tenant = fx.make_tenant(db, plan=plan)
+        user = fx.make_user(db, tenant)
+        db.commit()
+
+        from app.api.v1.plan import router as plan_router
+
+        summary = plan_router.get_plan_summary(db=db, tenant=tenant, _=user)
+        self.assertTrue(summary["modules"]["cocina"])
+
 
 if __name__ == "__main__":
     unittest.main()
