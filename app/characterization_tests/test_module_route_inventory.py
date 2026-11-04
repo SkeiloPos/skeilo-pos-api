@@ -30,6 +30,9 @@ TABLA = {
         43,
     ),
     "promociones": ((f"{API}/promotions",), 7),
+    # spec 150: primer punto real de enforcement de `cocina_access` (spec 149
+    # ya había agregado el módulo al catálogo, sin ninguna ruta que lo exigiera).
+    "cocina": ((f"{API}/orders/{{order_id}}/send-to-kitchen",), 1),
 }
 
 #: Rutas de reportes que sí pertenecen a `inventario` (el resto de /reports es ventas y no lleva módulo).

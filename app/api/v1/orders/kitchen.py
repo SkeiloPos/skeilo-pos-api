@@ -14,8 +14,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.crud import get_or_404
+from app.core.domain_errors import ConflictError
 from app.core.models import User
 from app.core import events
+from app.core.timezone import utc_now_naive
 from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem, OrderItemOption
@@ -124,6 +126,58 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     db.refresh(order)
 
     events.order_delivered(tenant_id, order_id=order.id, table_session_id=order.table_session_id)
+
+    return order
+
+
+def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
+    """Envía un pedido confirmado y pagado a la cola de preparación de cocina
+    (spec 150, FR-001/FR-003/FR-004). `SELECT ... FOR UPDATE` serializa dos
+    envíos casi simultáneos sobre el mismo pedido (doble clic o reintento de
+    red, FR-008/SC-003): la segunda transacción ve `kitchen_status` ya
+    escrito por la primera tan pronto como adquiere el lock, y cae en
+    `ALREADY_IN_KITCHEN`.
+
+    Orden determinístico de validaciones (data-model.md, research.md
+    Decisión 6):
+    1. Pedido no existe → 404.
+    2. `status == 'cancelada'` (research.md Decisión 0: "orden confirmada" es
+       cualquier pedido vivo) → 409 `ORDER_NOT_CONFIRMED`.
+    3. `kitchen_status IS NOT NULL` → 409 `ALREADY_IN_KITCHEN`.
+    4. `payment_status != 'PAID'` → 409 `ORDER_NOT_PAID`.
+    5. Éxito: `kitchen_status = 'SIN_PREPARAR'`, `sent_to_kitchen_at` con la
+       hora del servidor, commit, emite `events.order_sent_to_kitchen`
+       post-commit."""
+    order = db.execute(
+        select(CustomerOrder)
+        .where(CustomerOrder.id == order_id)
+        .with_for_update(of=CustomerOrder)
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    if order.status == "cancelada":
+        raise ConflictError(
+            "El pedido no está en un estado válido para enviarse a cocina.",
+            code="ORDER_NOT_CONFIRMED",
+        )
+    if order.kitchen_status is not None:
+        raise ConflictError("El pedido ya está en la cola de cocina.", code="ALREADY_IN_KITCHEN")
+    if order.payment_status != "PAID":
+        raise ConflictError("El pedido no está pagado.", code="ORDER_NOT_PAID")
+
+    order.kitchen_status = "SIN_PREPARAR"
+    order.sent_to_kitchen_at = utc_now_naive()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Error enviando el pedido a cocina")
+        raise
+    db.refresh(order)
+
+    events.order_sent_to_kitchen(
+        tenant_id, order_id=order.id, table_session_id=order.table_session_id
+    )
 
     return order
 

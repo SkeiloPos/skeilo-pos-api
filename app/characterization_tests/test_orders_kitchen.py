@@ -26,6 +26,7 @@ from app.api.v1.catalog.schemas import OptionSelectionIn
 from app.api.v1.orders import checkout, kitchen
 from app.api.v1.orders.schemas import BlockIn, CancelIn, OrderItemIn, PayIn, VoidItemIn
 from app.api.v1.sales.schemas import PaymentIn
+from app.core.domain_errors import ConflictError
 from app.models.sale import Sale
 
 PRECIO = Decimal("10000")
@@ -34,7 +35,10 @@ PRECIO = Decimal("10000")
 class TestKitchen(unittest.TestCase):
     # ------------------------------------------------------------- Helpers
 
-    def _seed_item(self, *, order_status="pendiente", estado_cocina="pendiente", payment_status="UNPAID"):
+    def _seed_item(
+        self, *, order_status="pendiente", estado_cocina="pendiente", payment_status="UNPAID",
+        kitchen_status=None,
+    ):
         db = fx.new_session()
         ts = fx.make_table_session(db)
         category = fx.make_category(db)
@@ -44,6 +48,7 @@ class TestKitchen(unittest.TestCase):
         fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
         order = fx.make_customer_order(
             db, ts, status=order_status, payment_status=payment_status, channel="POS",
+            kitchen_status=kitchen_status,
         )
         item = fx.make_order_item(db, order, variant, estado_cocina=estado_cocina)
         db.commit()
@@ -167,6 +172,109 @@ class TestKitchen(unittest.TestCase):
 
         self.assertEqual(actualizado.status, "entregada")
         self.assertTrue(all(it.estado_cocina == "entregado" for it in actualizado.items))
+
+    # ----------------------------------------- send_to_kitchen (spec 150)
+
+    def _seed_order_sin_items(self, *, order_status="pendiente", payment_status="PAID", channel="POS", order_type="DINE_IN"):
+        """Variante sin ítem (innecesario para `send_to_kitchen`, que no toca
+        `estado_cocina` de ningún ítem) -- más liviana para ejercitar los 3
+        orígenes (manual/mesa/domicilio) sin arrastrar producto/variante."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, status=order_status, payment_status=payment_status,
+            channel=channel, order_type=order_type,
+        )
+        db.commit()
+        return db, order
+
+    def test_send_to_kitchen_exitoso_origen_mesa_usa_hora_del_servidor(self):
+        """Historia 1 (FR-001/FR-003/FR-004): pedido confirmado y pagado de
+        mesa (POS/DINE_IN) → `kitchen_status` pasa a `'SIN_PREPARAR'` y
+        `sent_to_kitchen_at` queda poblado con la hora del SERVIDOR (no hay
+        ningún valor de cliente que pudiera colarse: la función no recibe
+        ningún timestamp como parámetro)."""
+        db, order = self._seed_order_sin_items(channel="POS", order_type="DINE_IN")
+
+        with mock.patch("app.core.events.order_sent_to_kitchen") as publicar:
+            actualizado = kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+            publicar.assert_called_once()
+
+        self.assertEqual(actualizado.kitchen_status, "SIN_PREPARAR")
+        self.assertIsNotNone(actualizado.sent_to_kitchen_at)
+
+    def test_send_to_kitchen_exitoso_origen_manual_mostrador(self):
+        """Historia 1 (FR-002): mismo comportamiento para un pedido de
+        mostrador (sin mesa, DINE_IN/TAKEAWAY vía POS) -- la elegibilidad no
+        depende de `channel`/`order_type` (research.md Decisión 7)."""
+        db, order = self._seed_order_sin_items(channel="POS", order_type="TAKEAWAY")
+
+        actualizado = kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+
+        self.assertEqual(actualizado.kitchen_status, "SIN_PREPARAR")
+        self.assertIsNotNone(actualizado.sent_to_kitchen_at)
+
+    def test_send_to_kitchen_exitoso_origen_domicilio(self):
+        """Historia 1 (FR-002): mismo comportamiento para un pedido a
+        domicilio (WHATSAPP/DELIVERY)."""
+        db, order = self._seed_order_sin_items(channel="WHATSAPP", order_type="DELIVERY")
+
+        actualizado = kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+
+        self.assertEqual(actualizado.kitchen_status, "SIN_PREPARAR")
+        self.assertIsNotNone(actualizado.sent_to_kitchen_at)
+
+    def test_send_to_kitchen_404_si_no_existe(self):
+        db, _ = self._seed_order_sin_items()
+        import uuid
+        with self.assertRaises(HTTPException) as ctx:
+            kitchen.send_to_kitchen(db, uuid.uuid4(), tenant_id=1)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_send_to_kitchen_409_order_not_confirmed_si_cancelada(self):
+        """Historia 1/FR-010 (edge case, data-model.md): `status == 'cancelada'`
+        es la única exclusión de "orden confirmada" (research.md Decisión 0)."""
+        db, order = self._seed_order_sin_items(order_status="cancelada", payment_status="PAID")
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_CONFIRMED")
+        db.refresh(order)
+        self.assertIsNone(order.kitchen_status)
+
+    def test_send_to_kitchen_409_order_not_paid_si_unpaid(self):
+        """Historia 2 (FR-006): `payment_status != 'PAID'` rechaza el envío
+        sin mutar `kitchen_status`."""
+        db, order = self._seed_order_sin_items(payment_status="UNPAID")
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_PAID")
+        db.refresh(order)
+        self.assertIsNone(order.kitchen_status)
+
+    def test_send_to_kitchen_409_already_in_kitchen_en_segundo_intento(self):
+        """Historia 3 (FR-007/FR-008/SC-003): un segundo envío sobre el mismo
+        pedido (doble clic o reintento de red) se rechaza con
+        `ALREADY_IN_KITCHEN`, sin duplicar la cola ni alterar
+        `sent_to_kitchen_at` del envío original. El `SELECT ... FOR UPDATE`
+        serializa la carrera concurrente real contra Postgres (ver
+        quickstart.md); en SQLite en memoria (sin bloqueo real de fila) dos
+        invocaciones secuenciales sobre la misma fila ya ejercitan la misma
+        rama de código que vería la segunda transacción tras adquirir el
+        lock."""
+        db, order = self._seed_order_sin_items()
+
+        primero = kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+        momento_original = primero.sent_to_kitchen_at
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "ALREADY_IN_KITCHEN")
+
+        db.refresh(order)
+        self.assertEqual(order.kitchen_status, "SIN_PREPARAR")
+        self.assertEqual(order.sent_to_kitchen_at, momento_original)
 
     # ------------------------ void_item ya no anula un pedido pagado (spec 029/147)
 
@@ -383,6 +491,47 @@ class TestVoidItemRevertsDiscounts118(unittest.TestCase):
         db.refresh(item_b)
         self.assertIsNone(item_b.discounted_unit_price)
         self.assertIsNone(item_b.discounted_line_total)
+
+
+class TestSendToKitchenRouteWiring(unittest.TestCase):
+    """Edge cases de `spec.md` (FR-011, módulo de plan) que no se pueden
+    ejercitar llamando a `kitchen.send_to_kitchen` directamente -- viven en
+    las dependencias de la ruta, resueltas por FastAPI antes de llegar a la
+    función. Mismo idioma que `test_module_route_inventory.py`: inspecciona
+    `route.dependant.dependencies` de la app real en vez de levantar un
+    servidor HTTP."""
+
+    @classmethod
+    def setUpClass(cls):
+        from unittest import mock as _mock
+        from fastapi.routing import APIRoute
+        # `app.main` ejecuta `create_app()` al importarse, que abre Postgres y
+        # migra -- se sustituye por un no-op antes de importar (mismo patrón
+        # que `test_module_route_inventory._aplicacion_real`).
+        with _mock.patch("app.core.db.initialize_database", lambda *a, **k: None):
+            from app.main import app
+        cls.route = next(
+            r for r in app.routes
+            if isinstance(r, APIRoute) and r.path == "/api/v1/orders/{order_id}/send-to-kitchen"
+        )
+
+    def test_la_ruta_exige_admin_o_cajero(self):
+        """FR-011: cualquier otro rol recibe 403 — dependencia
+        `require_tenant_admin_or_cashier`, a diferencia de `/receive` y
+        `/deliver`, que solo exigen `get_current_user`."""
+        from app.core.dependencies import require_tenant_admin_or_cashier
+        llamadas = {d.call for d in self.route.dependant.dependencies}
+        self.assertIn(require_tenant_admin_or_cashier, llamadas)
+
+    def test_la_ruta_exige_el_modulo_cocina_del_plan(self):
+        """Edge case de `spec.md`: un tenant sin `cocina` en el plan recibe
+        403 `MODULE_NOT_IN_PLAN` -- dependencia `require_module_access("cocina")`
+        (gating ya existente desde spec 149, primer punto real de
+        enforcement)."""
+        module_keys = {
+            getattr(d.call, "module_key", None) for d in self.route.dependant.dependencies
+        }
+        self.assertIn("cocina", module_keys)
 
 
 if __name__ == "__main__":

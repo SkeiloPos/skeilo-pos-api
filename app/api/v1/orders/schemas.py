@@ -374,6 +374,10 @@ class OrderResponse(BaseModel):
     # conteo de resultados de la página) -- este es el monto en dinero de ESTA
     # orden puntual, un campo totalmente distinto que vive un nivel más abajo.
     total: Decimal | None = None
+    # spec 150 (data-model.md): `None` si el pedido nunca se envió a la cola
+    # de preparación de cocina.
+    kitchen_status: str | None = None
+    sent_to_kitchen_at: UtcDatetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

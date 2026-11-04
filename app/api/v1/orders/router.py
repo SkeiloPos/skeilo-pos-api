@@ -12,7 +12,10 @@ from app.core.notifications.dispatch import notify_payment_completed
 from app.core.crud import get_or_404
 from app.core.error_middleware import current_request_id
 from app.core.http_cache import json_or_304
-from app.core.dependencies import get_current_user, require_tenant_admin
+from app.core.dependencies import (
+    get_current_user, require_tenant_admin, require_tenant_admin_or_cashier,
+)
+from app.core.plan_limits import require_module_access
 from app.core.models import User, Tenant
 from app.core.plan_limits import enforce_plan_limit
 from app.core.pagination import Page, paginate
@@ -416,6 +419,29 @@ def deliver_order(
     /items/{id}/kitchen`, `POST /{id}/start-preparation` y `POST /{id}/ready`
     (retirados, FR-002/research.md R4)."""
     kitchen.deliver_order(db, order_id, tenant_id=tenant.id)
+    return _load_order(db, order_id)
+
+
+# ====================== Envío a cocina (spec 150) ===========================
+@router.post(
+    "/{order_id}/send-to-kitchen",
+    response_model=OrderResponse,
+    summary="Enviar un pedido confirmado y pagado a la cola de preparación de cocina",
+)
+def send_to_kitchen(
+    order_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_tenant_admin_or_cashier),
+    __: None = Depends(require_module_access("cocina")),
+    tenant: Tenant = Depends(get_tenant),
+):
+    """Spec 150 (FR-001/FR-003/FR-004/FR-011): única acción de envío a
+    cocina, idempotente ante dobles clics/reintentos (409
+    `ALREADY_IN_KITCHEN`). Restringida a `ADMIN`/`CASHIER` (FR-011) y al
+    módulo de plan `"cocina"` (gating ya existente desde spec 149, sin
+    enforcement hasta ahora) -- a diferencia de `/receive` y `/deliver`, que
+    solo exigen sesión autenticada."""
+    kitchen.send_to_kitchen(db, order_id, tenant_id=tenant.id)
     return _load_order(db, order_id)
 
 
