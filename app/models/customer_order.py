@@ -168,6 +168,18 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
     # Nullable y sin backfill (Principio VII): todo pedido ya existente queda en NULL.
     client_request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
+    # spec 150 (data-model.md): `NULL` = nunca enviado a la cola de
+    # preparación de cocina; cualquier valor no nulo = ya enviado. Sin
+    # `CheckConstraint` a propósito (clarificación 4 de spec.md): un valor
+    # futuro distinto de `"SIN_PREPARAR"` debe seguir leyéndose como "ya
+    # enviado" sin otra migración de constraint. Nace `NULL` para todo pedido
+    # existente (sin backfill).
+    kitchen_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # spec 150: hora del SERVIDOR (`utc_now_naive()`) en que se envió a
+    # cocina, fijada una sola vez por `kitchen.send_to_kitchen`. `NULL` hasta
+    # el primer envío exitoso.
+    sent_to_kitchen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     items: Mapped[List["OrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan"
     )
@@ -259,6 +271,17 @@ class CustomerOrder(UUIDPrimaryKeyMixin, Base):
             "client_request_id",
             unique=True,
             postgresql_where=text("client_request_id IS NOT NULL"),
+        ),
+        # spec 150 (data-model.md): cola de preparación calculada bajo demanda
+        # (`ORDER BY sent_to_kitchen_at` sobre los pedidos ya enviados) -- sin
+        # tabla ni columna de posición propia. Índice parcial, mismo patrón que
+        # `idx_active_order_per_participant`: no es un requisito funcional de
+        # esta spec (que no define ningún endpoint de lectura de la cola),
+        # solo evita un table scan para una spec futura que la consuma.
+        Index(
+            "idx_customer_orders_kitchen_queue",
+            "sent_to_kitchen_at",
+            postgresql_where=text("kitchen_status IS NOT NULL"),
         ),
         {"schema": "tenant"},
     )

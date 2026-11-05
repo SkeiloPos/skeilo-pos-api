@@ -319,7 +319,7 @@ def get_db(tenant: Tenant = Depends(get_tenant)):
         yield db
 
 
-ROLE_NAMES = ("SUPER_ADMIN", "ADMIN", "CASHIER", "MESERO")
+ROLE_NAMES = ("SUPER_ADMIN", "ADMIN", "CASHIER", "MESERO", "KITCHEN")
 
 
 def _seed_shared_data(db):

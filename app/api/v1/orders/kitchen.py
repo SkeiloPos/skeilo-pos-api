@@ -14,8 +14,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.crud import get_or_404
+from app.core.domain_errors import ConflictError
 from app.core.models import User
 from app.core import events
+from app.core.timezone import utc_now_naive
 from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem, OrderItemOption
@@ -27,8 +29,20 @@ from app.api.v1.orders.consumption import (
 )
 from app.api.v1.catalog.line_pricing import load_valid_options
 from app.api.v1.orders.schemas import VoidItemIn
+from app.models.dining_table import DiningTable
+from app.models.product import Product
 
 logger = logging.getLogger(__name__)
+
+#: `order_type` → `origin` de la tarjeta del tablero (contracts/kitchen-board.md,
+#: data-model.md §CustomerOrder). `None`/cualquier otro valor cae en `"caja"`
+#: (mostrador), el mismo origen que un pedido de mostrador sin `order_type`
+#: explícito.
+_KITCHEN_CARD_ORIGIN_BY_ORDER_TYPE = {
+    "DINE_IN": "mesa",
+    "TAKEAWAY": "caja",
+    "DELIVERY": "domicilio",
+}
 
 
 def receive_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
@@ -126,6 +140,216 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     events.order_delivered(tenant_id, order_id=order.id, table_session_id=order.table_session_id)
 
     return order
+
+
+def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
+    """Envía un pedido confirmado y pagado a la cola de preparación de cocina
+    (spec 150, FR-001/FR-003/FR-004). `SELECT ... FOR UPDATE` serializa dos
+    envíos casi simultáneos sobre el mismo pedido (doble clic o reintento de
+    red, FR-008/SC-003): la segunda transacción ve `kitchen_status` ya
+    escrito por la primera tan pronto como adquiere el lock, y cae en
+    `ALREADY_IN_KITCHEN`.
+
+    Orden determinístico de validaciones (data-model.md, research.md
+    Decisión 6):
+    1. Pedido no existe → 404.
+    2. `status == 'cancelada'` (research.md Decisión 0: "orden confirmada" es
+       cualquier pedido vivo) → 409 `ORDER_NOT_CONFIRMED`.
+    3. `kitchen_status IS NOT NULL` → 409 `ALREADY_IN_KITCHEN`.
+    4. `payment_status != 'PAID'` → 409 `ORDER_NOT_PAID`.
+    5. Éxito: `kitchen_status = 'SIN_PREPARAR'`, `sent_to_kitchen_at` con la
+       hora del servidor, commit, emite `events.order_sent_to_kitchen`
+       post-commit."""
+    order = db.execute(
+        select(CustomerOrder)
+        .where(CustomerOrder.id == order_id)
+        .with_for_update(of=CustomerOrder)
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    if order.status == "cancelada":
+        raise ConflictError(
+            "El pedido no está en un estado válido para enviarse a cocina.",
+            code="ORDER_NOT_CONFIRMED",
+        )
+    if order.kitchen_status is not None:
+        raise ConflictError("El pedido ya está en la cola de cocina.", code="ALREADY_IN_KITCHEN")
+    if order.payment_status != "PAID":
+        raise ConflictError("El pedido no está pagado.", code="ORDER_NOT_PAID")
+
+    order.kitchen_status = "SIN_PREPARAR"
+    order.sent_to_kitchen_at = utc_now_naive()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Error enviando el pedido a cocina")
+        raise
+    db.refresh(order)
+
+    events.order_sent_to_kitchen(
+        tenant_id, order_id=order.id, table_session_id=order.table_session_id
+    )
+
+    return order
+
+
+def _kitchen_card_product_names(db: Session, orders: list[CustomerOrder]) -> dict[UUID, str]:
+    """Nombres de producto para las líneas de todas las órdenes del tablero,
+    resueltos en un solo `SELECT` (sin N+1 por tarjeta, data-model.md §Vista
+    del tablero)."""
+    variant_ids = {it.product_variant_id for o in orders for it in o.items}
+    if not variant_ids:
+        return {}
+    rows = db.execute(
+        select(ProductVariant.id, Product.name)
+        .join(Product, Product.id == ProductVariant.product_id)
+        .where(ProductVariant.id.in_(variant_ids))
+    ).all()
+    return dict(rows)
+
+
+def _kitchen_card_table_numbers(db: Session, orders: list[CustomerOrder]) -> dict[UUID, int]:
+    table_ids = {o.dining_table_id for o in orders if o.dining_table_id is not None}
+    if not table_ids:
+        return {}
+    rows = db.execute(
+        select(DiningTable.id, DiningTable.number).where(DiningTable.id.in_(table_ids))
+    ).all()
+    return dict(rows)
+
+
+def _serialize_kitchen_card(
+    order: CustomerOrder, *, table_numbers: dict[UUID, int], product_names: dict[UUID, str]
+) -> dict:
+    """Arma el `CardResponse` de una orden (contracts/kitchen-board.md,
+    FR-012). Un ítem `estado_cocina == 'cancelado'` (anulado) no se incluye --
+    ya no hace parte de lo que cocina debe preparar."""
+    origin = _KITCHEN_CARD_ORIGIN_BY_ORDER_TYPE.get(order.order_type, "caja")
+    items = []
+    for it in order.items:
+        if it.estado_cocina == "cancelado":
+            continue
+        addons = [
+            {"name": opt.name, "quantity": opt.quantity} for opt in it.options
+        ] + [
+            {"name": tp.name, "quantity": tp.quantity} for tp in it.toppings
+        ]
+        items.append({
+            "product_name": product_names.get(it.product_variant_id, ""),
+            "quantity": it.quantity,
+            "addons": addons,
+            "notes": it.notes,
+        })
+    return {
+        "order_id": order.id,
+        "table_order_number": order.table_order_number,
+        "kitchen_status": order.kitchen_status,
+        "version": order.version,
+        "sent_to_kitchen_at": order.sent_to_kitchen_at,
+        "origin": origin,
+        "table_number": table_numbers.get(order.dining_table_id) if origin == "mesa" else None,
+        "customer_name": order.customer_name,
+        "delivery_address": order.delivery_address if origin == "domicilio" else None,
+        "notes": order.notes,
+        "items": items,
+    }
+
+
+def get_kitchen_board(db: Session) -> dict:
+    """Lectura agregada del tablero de cocina (data-model.md §Vista del
+    tablero, FR-001/FR-002/FR-003/FR-011): un solo `SELECT` filtrado por
+    `kitchen_status IS NOT NULL AND status NOT IN ('cancelada', 'entregada')`,
+    ordenado FIFO (`sent_to_kitchen_at ASC`, desempate `id ASC`), agrupado en
+    Python en las tres columnas fijas."""
+    orders = db.execute(
+        select(CustomerOrder)
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
+        .where(CustomerOrder.kitchen_status.isnot(None))
+        .where(CustomerOrder.status.notin_(["cancelada", "entregada"]))
+        .order_by(CustomerOrder.sent_to_kitchen_at.asc(), CustomerOrder.id.asc())
+    ).scalars().all()
+
+    table_numbers = _kitchen_card_table_numbers(db, orders)
+    product_names = _kitchen_card_product_names(db, orders)
+
+    columns: dict[str, list[dict]] = {"SIN_PREPARAR": [], "EN_PROGRESO": [], "LISTO": []}
+    for order in orders:
+        columns[order.kitchen_status].append(
+            _serialize_kitchen_card(order, table_numbers=table_numbers, product_names=product_names)
+        )
+    return columns
+
+
+def change_kitchen_status(
+    db: Session, order_id: UUID, kitchen_status: str, version: int, tenant_id: int | None = None
+) -> dict:
+    """Mueve una tarjeta entre columnas del tablero de cocina (spec 151,
+    contracts/move-kitchen-status.md). `SELECT ... FOR UPDATE` serializa dos
+    movimientos casi simultáneos sobre la misma orden (FR-008), mismo patrón
+    que `send_to_kitchen`/`receive_order`/`deliver_order`.
+
+    Orden determinístico de validaciones (data-model.md §Reglas de
+    transición):
+    1. Pedido no existe → 404.
+    2. `kitchen_status IS NULL` (nunca se envió a cocina) → 409
+       `NOT_IN_KITCHEN`.
+    3. `version` recibido != `order.version` vigente → 409
+       `KITCHEN_STATUS_CONFLICT` (payload incluye el `kitchen_status`
+       vigente).
+    4. `payment_status != 'PAID'` → 409 `PAYMENT_NOT_PAID`.
+    5. `status IN ('cancelada', 'entregada')` → 409 `ORDER_NOT_ACTIVE`.
+    6. Éxito: `kitchen_status` actualizado, `version += 1` (sin tocar
+       `sent_to_kitchen_at` -- FR-002), commit, emite
+       `events.order_kitchen_status_changed` post-commit."""
+    order = db.execute(
+        select(CustomerOrder)
+        .options(
+            selectinload(CustomerOrder.items).selectinload(OrderItem.options),
+            selectinload(CustomerOrder.items).selectinload(OrderItem.toppings),
+        )
+        .where(CustomerOrder.id == order_id)
+        .with_for_update(of=CustomerOrder)
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    if order.kitchen_status is None:
+        raise ConflictError(
+            "El pedido no está en la cola de cocina.", code="NOT_IN_KITCHEN"
+        )
+    if order.version != version:
+        raise ConflictError(
+            "La orden ya cambió de estado.", code="KITCHEN_STATUS_CONFLICT",
+            details={"kitchen_status": order.kitchen_status},
+        )
+    if order.payment_status != "PAID":
+        raise ConflictError("El pedido no está pagado.", code="PAYMENT_NOT_PAID")
+    if order.status in ("cancelada", "entregada"):
+        raise ConflictError("El pedido ya no está activo.", code="ORDER_NOT_ACTIVE")
+
+    order.kitchen_status = kitchen_status
+    order.version += 1
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Error moviendo el pedido en el tablero de cocina")
+        raise
+    db.refresh(order)
+
+    events.order_kitchen_status_changed(
+        tenant_id, order_id=order.id, table_session_id=order.table_session_id,
+        kitchen_status=order.kitchen_status, version=order.version,
+    )
+
+    return _serialize_kitchen_card(
+        order,
+        table_numbers=_kitchen_card_table_numbers(db, [order]),
+        product_names=_kitchen_card_product_names(db, [order]),
+    )
 
 
 def void_item(db: Session, item_id: UUID, data: VoidItemIn, user: User) -> CustomerOrder:

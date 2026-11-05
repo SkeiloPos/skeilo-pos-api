@@ -86,8 +86,11 @@ class TestPlanModuleAccess(unittest.TestCase):
 
     # ---------------------------------------------------------- Catálogo (spec 141, FR-001)
 
-    def test_el_catalogo_de_modulos_son_inventario_y_promociones(self):
-        self.assertEqual(PLAN_MODULES, ("inventario", "promociones"))
+    def test_el_catalogo_de_modulos_son_inventario_promociones_y_cocina(self):
+        """Spec 149: el catálogo pasa de dos a tres entradas — se agrega
+        `"cocina"` como característica de plan, sin enforcement de endpoint
+        todavía (research.md Decisión 0)."""
+        self.assertEqual(PLAN_MODULES, ("inventario", "promociones", "cocina"))
 
     def test_compras_ya_no_es_un_modulo_y_falla_al_construir_la_dependencia(self):
         """research D2: una clave fuera del catálogo es un error de programación

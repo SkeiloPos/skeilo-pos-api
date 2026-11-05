@@ -141,6 +141,7 @@ class PlanCreate(BaseModel):
 
     inventario_access: bool = False
     promociones_access: bool = False
+    cocina_access: bool = False
 
     precio_mensual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
     precio_anual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
@@ -163,6 +164,7 @@ class PlanUpdate(BaseModel):
 
     inventario_access: Optional[bool] = None
     promociones_access: Optional[bool] = None
+    cocina_access: Optional[bool] = None
 
     precio_mensual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
     precio_anual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
@@ -181,6 +183,7 @@ class PlanResponse(BaseModel):
 
     inventario_access: bool
     promociones_access: bool
+    cocina_access: bool
 
     precio_mensual: Optional[Decimal] = None
     precio_anual: Optional[Decimal] = None

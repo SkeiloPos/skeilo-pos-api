@@ -13,6 +13,7 @@ class ResourceUsage(BaseModel):
 class ModuleAccess(BaseModel):
     inventario: bool
     promociones: bool
+    cocina: bool
 
 
 class PlanSummaryResponse(BaseModel):
