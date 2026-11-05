@@ -1,3 +1,4 @@
+from decimal import Decimal
 from enum import Enum
 from uuid import UUID
 
@@ -206,8 +207,30 @@ class ProductResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class ProductListResponse(ProductResponse):
-    pass
+class ProductListResponse(BaseModel):
+    """Spec 152: forma recortada de `Product` para `GET /products` -- solo los campos
+    que la tarjeta (móvil/tablet) o la fila de tabla (escritorio) despliegan (FR-008).
+    `code`, `description`, `tracks_inventory`, `is_topping`, `visible_en_qr` y
+    `available_changed_by_name` quedan excluidos (ver data-model.md "Campos
+    excluidos"); siguen disponibles solo en `ProductDetailResponse`."""
+
+    id: UUID
+    category_id: UUID
+    category_name: str | None = None
+    name: str
+    image_url: AssetUrl = None
+    preparation_type: PreparationType
+    active: bool
+    available: bool
+    available_changed_at: UtcDatetime | None = None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None = None
+    # spec 152 (data-model.md "Regla de cómputo"): derivados, calculados en servicio
+    # a partir de las variantes activas con precio > 0 -- no son columnas de `Product`.
+    price_display: Decimal | None = Field(None, max_digits=12, decimal_places=2)
+    price_from: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class VariantDetailResponse(VariantResponse):
