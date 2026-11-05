@@ -81,14 +81,18 @@ class ProductService:
         search: str | None = None,
         available: bool | None = None,
         is_topping: bool | None = None,
+        category_id: UUID | None = None,
     ) -> Select:
         # spec 097 (research.md D1): JOIN contra Category en la propia consulta, para que
         # `category_name` (ver Product.category_name) no dependa de la paginación de
         # `GET /categories` (tope 100). `joinedload` sobre una relación many-to-one no
         # multiplica filas ni exige `.unique()`.
+        # spec 152 (research.md D2): `selectinload(Product.variants)` -- una sola consulta
+        # adicional para todo el lote (no una por fila) para que `attach_price_fields`
+        # calcule `price_display`/`price_from` sin N+1.
         stmt = (
             select(Product)
-            .options(joinedload(Product.category))
+            .options(joinedload(Product.category), selectinload(Product.variants))
             .order_by(Product.created_at.desc())
         )
         if active is not None:
@@ -101,7 +105,32 @@ class ProductService:
         if is_topping is not None:
             # spec 129: selector de "Adiciones disponibles" en el formulario de producto.
             stmt = stmt.where(Product.is_topping == is_topping)
+        if category_id is not None:
+            # spec 152 (FR-004, data-model.md): combinado con AND al resto de filtros.
+            stmt = stmt.where(Product.category_id == category_id)
         return stmt
+
+    def attach_price_fields(self, products: list[Product]) -> list[Product]:
+        """Spec 152 (data-model.md "Regla de cómputo"): calcula `price_display`/
+        `price_from` en Python sobre `product.variants` ya precargado por
+        `selectinload` en `list_query` -- sin disparar consultas adicionales por
+        producto. Los atributos se asignan directamente sobre la instancia ORM
+        (transitorios, no columnas) para que `ProductListResponse.model_validate`
+        (`from_attributes`) los lea igual que cualquier otro campo."""
+        for product in products:
+            priced = sorted(
+                v.price for v in product.variants if v.active and v.price > 0
+            )
+            if not priced:
+                product.price_display = None
+                product.price_from = False
+            elif len(priced) == 1:
+                product.price_display = priced[0]
+                product.price_from = False
+            else:
+                product.price_display = priced[0]
+                product.price_from = True
+        return products
 
     def get_or_404(self, db: Session, id: UUID) -> Product:
         return get_or_404(db, Product, id, "Product not found")

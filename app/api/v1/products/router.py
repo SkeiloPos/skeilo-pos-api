@@ -210,10 +210,17 @@ def list_products(
             "(topping) -- usado por el selector de 'Adiciones disponibles'."
         ),
     ),
+    category_id: UUID | None = Query(
+        None, description="spec 152: filtra por categoría, combinado con AND al resto."
+    ),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    return paginate(db, service.list_query(active, search, available, is_topping), page, size)
+    result = paginate(
+        db, service.list_query(active, search, available, is_topping, category_id), page, size
+    )
+    service.attach_price_fields(result["items"])
+    return result
 
 
 @router.get(
