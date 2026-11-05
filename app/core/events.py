@@ -329,6 +329,28 @@ def order_sent_to_kitchen(tenant_id: int, *, order_id, table_session_id) -> str 
     )
 
 
+def order_kitchen_status_changed(
+    tenant_id: int, *, order_id, table_session_id, kitchen_status, version
+) -> str | None:
+    """Spec 151 (research.md Decisión 0, data-model.md §Evento realtime
+    nuevo): `kitchen_status` de un pedido en la cola de cocina cambió de
+    columna (incluso hacia atrás). Mismo molde que `order_sent_to_kitchen`
+    (post-commit, canales staff + sesión) -- reutiliza `CH_STAFF`, ningún
+    canal/stream nuevo."""
+    channels = [CH_STAFF]
+    if table_session_id is not None:
+        channels.append(session_channel(table_session_id))
+    return publish(
+        tenant_id,
+        type="order.kitchen_status_changed",
+        channels=channels,
+        payload={
+            "order_id": order_id, "table_session_id": table_session_id,
+            "kitchen_status": kitchen_status, "version": version,
+        },
+    )
+
+
 def bill_changed(tenant_id: int, *, table_session_id) -> str | None:
     """La cuenta de la mesa dejó de estar al día.
 

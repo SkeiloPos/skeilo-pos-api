@@ -15,6 +15,7 @@ Ejecutar solo este módulo:
 
     python -m unittest app.characterization_tests.test_orders_kitchen -v
 """
+from datetime import datetime, timedelta
 from decimal import Decimal
 import unittest
 from unittest import mock
@@ -448,6 +449,301 @@ class TestKitchen(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx7:
             checkout.cancel_order(s7["db"], s7["order"].id, CancelIn(motivo="x"), self._user())
         self.assertEqual(ctx7.exception.status_code, 409)
+
+
+class TestKitchenBoard(unittest.TestCase):
+    """Spec 151, Historia 1 (FR-001/FR-002/FR-003/FR-011): lectura agregada
+    del tablero (`kitchen.get_kitchen_board`)."""
+
+    def _seed_kitchen_order(
+        self, *, order_status="pendiente", payment_status="PAID", kitchen_status="SIN_PREPARAR",
+        version=0, sent_to_kitchen_at=None, order_type="DINE_IN", channel="POS",
+    ):
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, status=order_status, payment_status=payment_status, channel=channel,
+            order_type=order_type, kitchen_status=kitchen_status, version=version,
+            sent_to_kitchen_at=sent_to_kitchen_at or datetime.now(),
+        )
+        db.commit()
+        return db, order
+
+    def test_tablero_vacio_sin_pedidos_en_cocina(self):
+        db = fx.new_session()
+        columnas = kitchen.get_kitchen_board(db)
+        self.assertEqual(columnas, {"SIN_PREPARAR": [], "EN_PROGRESO": [], "LISTO": []})
+
+    def test_dos_pedidos_quedan_en_orden_fifo_por_sent_to_kitchen_at(self):
+        """FR-003: orden ascendente por `sent_to_kitchen_at`."""
+        db, mas_viejo = self._seed_kitchen_order(sent_to_kitchen_at=datetime(2026, 1, 1, 10, 0))
+        ts = fx.make_table_session(db)
+        mas_nuevo = fx.make_customer_order(
+            db, ts, status="pendiente", payment_status="PAID", channel="POS", order_type="DINE_IN",
+            kitchen_status="SIN_PREPARAR", version=0, sent_to_kitchen_at=datetime(2026, 1, 1, 10, 5),
+        )
+        db.commit()
+
+        columnas = kitchen.get_kitchen_board(db)
+
+        ids = [c["order_id"] for c in columnas["SIN_PREPARAR"]]
+        self.assertEqual(ids, [mas_viejo.id, mas_nuevo.id])
+
+    def test_empate_de_sent_to_kitchen_at_se_desempata_por_id_ascendente(self):
+        """FR-003: mismo `sent_to_kitchen_at` → desempate por `id`."""
+        momento = datetime(2026, 1, 1, 10, 0)
+        db, primero = self._seed_kitchen_order(sent_to_kitchen_at=momento)
+        ts = fx.make_table_session(db)
+        segundo = fx.make_customer_order(
+            db, ts, status="pendiente", payment_status="PAID", channel="POS", order_type="DINE_IN",
+            kitchen_status="SIN_PREPARAR", version=0, sent_to_kitchen_at=momento,
+        )
+        db.commit()
+
+        ids_esperados = sorted([primero.id, segundo.id])
+
+        columnas = kitchen.get_kitchen_board(db)
+
+        ids = [c["order_id"] for c in columnas["SIN_PREPARAR"]]
+        self.assertEqual(ids, ids_esperados)
+
+    def test_pedido_cancelado_con_kitchen_status_no_nulo_no_aparece(self):
+        """FR-011 (adelantado desde US4): `status == 'cancelada'` excluye la
+        orden del tablero aunque `kitchen_status` siga sin limpiarse."""
+        db, cancelado = self._seed_kitchen_order(order_status="cancelada", kitchen_status="EN_PROGRESO")
+
+        columnas = kitchen.get_kitchen_board(db)
+
+        todos_los_ids = [c["order_id"] for lst in columnas.values() for c in lst]
+        self.assertNotIn(cancelado.id, todos_los_ids)
+
+    def test_pedido_entregado_con_kitchen_status_no_nulo_no_aparece(self):
+        db, entregado = self._seed_kitchen_order(order_status="entregada", kitchen_status="LISTO")
+
+        columnas = kitchen.get_kitchen_board(db)
+
+        todos_los_ids = [c["order_id"] for lst in columnas.values() for c in lst]
+        self.assertNotIn(entregado.id, todos_los_ids)
+
+
+class TestKitchenCardSerialization(unittest.TestCase):
+    """Spec 151, Historia 3 (FR-012): serialización de `CardResponse` vía
+    `kitchen.get_kitchen_board` (contracts/kitchen-board.md)."""
+
+    def _seed_order_type(self, *, order_type, customer_name=None, delivery_address=None):
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, status="pendiente", payment_status="PAID", channel="POS",
+            order_type=order_type, kitchen_status="SIN_PREPARAR", version=0,
+            sent_to_kitchen_at=datetime(2026, 1, 1, 10, 0),
+            customer_name=customer_name, delivery_address=delivery_address,
+        )
+        db.commit()
+        return db, order
+
+    def test_dine_in_serializa_origin_mesa_con_table_number(self):
+        db, _ = self._seed_order_type(order_type="DINE_IN")
+
+        card = kitchen.get_kitchen_board(db)["SIN_PREPARAR"][0]
+
+        self.assertEqual(card["origin"], "mesa")
+        self.assertIsNotNone(card["table_number"])
+        self.assertIsNone(card["customer_name"])
+        self.assertIsNone(card["delivery_address"])
+
+    def test_delivery_serializa_origin_domicilio_con_cliente_y_direccion(self):
+        db, _ = self._seed_order_type(
+            order_type="DELIVERY", customer_name="Ana", delivery_address="Calle 1",
+        )
+
+        card = kitchen.get_kitchen_board(db)["SIN_PREPARAR"][0]
+
+        self.assertEqual(card["origin"], "domicilio")
+        self.assertIsNone(card["table_number"])
+        self.assertEqual(card["customer_name"], "Ana")
+        self.assertEqual(card["delivery_address"], "Calle 1")
+
+    def test_takeaway_sin_cliente_serializa_origin_caja_sin_nombre_ni_error(self):
+        """Edge case (`spec.md`): pedido TAKEAWAY sin cliente -- sin nombre
+        inventado, sin error."""
+        db, _ = self._seed_order_type(order_type="TAKEAWAY")
+
+        card = kitchen.get_kitchen_board(db)["SIN_PREPARAR"][0]
+
+        self.assertEqual(card["origin"], "caja")
+        self.assertIsNone(card["table_number"])
+        self.assertIsNone(card["customer_name"])
+        self.assertIsNone(card["delivery_address"])
+
+    def test_items_con_adiciones_y_notas_se_incluyen_completos(self):
+        from app.models.order_item import OrderItemOption
+
+        db, order = self._seed_order_type(order_type="DINE_IN")
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        group = fx.make_option_group(
+            db, selection_mode="conteo", pricing_type="incluido", min_select=0, max_select=1,
+        )
+        fx.link_variant_group(db, variant, group, min_select=0, max_select=1)
+        opcion = fx.make_option(db, group=group)
+        item = fx.make_order_item(db, order, variant, quantity=2, notes="Sin cebolla")
+        db.add(OrderItemOption(order_item_id=item.id, option_id=opcion.id, quantity=1))
+        db.commit()
+
+        card = kitchen.get_kitchen_board(db)["SIN_PREPARAR"][0]
+
+        self.assertEqual(len(card["items"]), 1)
+        linea = card["items"][0]
+        self.assertEqual(linea["product_name"], product.name)
+        self.assertEqual(linea["quantity"], 2)
+        self.assertEqual(linea["notes"], "Sin cebolla")
+        self.assertEqual(linea["addons"], [{"name": opcion.name, "quantity": 1}])
+
+
+class TestChangeKitchenStatus(unittest.TestCase):
+    """Spec 151, Historia 2 (FR-005 a FR-010): `kitchen.change_kitchen_status`."""
+
+    def _seed_kitchen_order(
+        self, *, order_status="pendiente", payment_status="PAID", kitchen_status="SIN_PREPARAR",
+        version=0, sent_to_kitchen_at=None,
+    ):
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, status=order_status, payment_status=payment_status, channel="POS",
+            order_type="DINE_IN", kitchen_status=kitchen_status, version=version,
+            sent_to_kitchen_at=sent_to_kitchen_at or datetime(2026, 1, 1, 10, 0),
+        )
+        db.commit()
+        return db, order
+
+    def test_exito_cambia_kitchen_status_incrementa_version_sin_tocar_otros_campos(self):
+        db, order = self._seed_kitchen_order(kitchen_status="SIN_PREPARAR", version=0)
+        momento_original = order.sent_to_kitchen_at
+
+        with mock.patch("app.core.events.order_kitchen_status_changed") as publicar:
+            kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+            publicar.assert_called_once()
+
+        db.refresh(order)
+        self.assertEqual(order.kitchen_status, "EN_PROGRESO")
+        self.assertEqual(order.version, 1)
+        self.assertEqual(order.status, "pendiente")
+        self.assertEqual(order.payment_status, "PAID")
+        self.assertEqual(order.sent_to_kitchen_at, momento_original)
+
+    def test_retroceso_de_listo_a_en_progreso_es_aceptado(self):
+        """FR-005: cualquier destino del conjunto es válido, incluyendo
+        retrocesos -- no hay máquina de estados direccional."""
+        db, order = self._seed_kitchen_order(kitchen_status="LISTO", version=3)
+
+        resultado = kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 3, tenant_id=1)
+
+        self.assertEqual(resultado["kitchen_status"], "EN_PROGRESO")
+        self.assertEqual(resultado["version"], 4)
+
+    def test_404_si_el_pedido_no_existe(self):
+        db, _ = self._seed_kitchen_order()
+        import uuid
+        with self.assertRaises(HTTPException) as ctx:
+            kitchen.change_kitchen_status(db, uuid.uuid4(), "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_409_not_in_kitchen_si_kitchen_status_es_nulo(self):
+        db, order = self._seed_kitchen_order(kitchen_status=None, version=0)
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "NOT_IN_KITCHEN")
+
+    def test_409_kitchen_status_conflict_si_version_no_coincide(self):
+        """FR-008: el payload del error incluye el `kitchen_status` vigente."""
+        db, order = self._seed_kitchen_order(kitchen_status="SIN_PREPARAR", version=5)
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "KITCHEN_STATUS_CONFLICT")
+        self.assertEqual(ctx.exception.details, {"kitchen_status": "SIN_PREPARAR"})
+        db.refresh(order)
+        self.assertEqual(order.kitchen_status, "SIN_PREPARAR")
+        self.assertEqual(order.version, 5)
+
+    def test_409_payment_not_paid_si_no_esta_pagado(self):
+        db, order = self._seed_kitchen_order(payment_status="UNPAID", version=0)
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "PAYMENT_NOT_PAID")
+
+    def test_409_order_not_active_si_cancelada(self):
+        db, order = self._seed_kitchen_order(order_status="cancelada", version=0)
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_ACTIVE")
+
+    def test_409_order_not_active_si_entregada(self):
+        db, order = self._seed_kitchen_order(order_status="entregada", version=0)
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_ACTIVE")
+
+    def test_dos_movimientos_concurrentes_solo_uno_aplica_el_otro_409(self):
+        """FR-008 (research.md Decisión 9): el `SELECT ... FOR UPDATE` sirve
+        al segundo movimiento el `version` ya incrementado por el primero --
+        mismo idioma que `test_send_to_kitchen_409_already_in_kitchen_en_segundo_intento`."""
+        db, order = self._seed_kitchen_order(kitchen_status="SIN_PREPARAR", version=0)
+
+        primero = kitchen.change_kitchen_status(db, order.id, "EN_PROGRESO", 0, tenant_id=1)
+        self.assertEqual(primero["version"], 1)
+
+        with self.assertRaises(ConflictError) as ctx:
+            kitchen.change_kitchen_status(db, order.id, "LISTO", 0, tenant_id=1)
+        self.assertEqual(ctx.exception.code, "KITCHEN_STATUS_CONFLICT")
+
+        db.refresh(order)
+        self.assertEqual(order.kitchen_status, "EN_PROGRESO")
+        self.assertEqual(order.version, 1)
+
+
+class TestKitchenBoardRoutesWiring(unittest.TestCase):
+    """Mismo idioma que `TestSendToKitchenRouteWiring`: inspecciona
+    `route.dependant.dependencies` de la app real en vez de levantar un
+    servidor HTTP."""
+
+    @classmethod
+    def setUpClass(cls):
+        from unittest import mock as _mock
+        from fastapi.routing import APIRoute
+        with _mock.patch("app.core.db.initialize_database", lambda *a, **k: None):
+            from app.main import app
+        cls.board_route = next(
+            r for r in app.routes
+            if isinstance(r, APIRoute) and r.path == "/api/v1/orders/kitchen-board"
+        )
+        cls.move_route = next(
+            r for r in app.routes
+            if isinstance(r, APIRoute) and r.path == "/api/v1/orders/{order_id}/kitchen-status"
+        )
+
+    def test_la_ruta_de_lectura_exige_require_kitchen_board_view(self):
+        from app.core.dependencies import require_kitchen_board_view
+        llamadas = {d.call for d in self.board_route.dependant.dependencies}
+        self.assertIn(require_kitchen_board_view, llamadas)
+
+    def test_la_ruta_de_movimiento_exige_require_kitchen_role(self):
+        from app.core.dependencies import require_kitchen_role
+        llamadas = {d.call for d in self.move_route.dependant.dependencies}
+        self.assertIn(require_kitchen_role, llamadas)
+
+    def test_la_ruta_de_movimiento_exige_el_modulo_cocina_del_plan(self):
+        module_keys = {
+            getattr(d.call, "module_key", None) for d in self.move_route.dependant.dependencies
+        }
+        self.assertIn("cocina", module_keys)
 
 
 class TestVoidItemRevertsDiscounts118(unittest.TestCase):

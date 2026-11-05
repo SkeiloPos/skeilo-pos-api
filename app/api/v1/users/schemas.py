@@ -10,12 +10,13 @@ class RoleName(str, Enum):
     ADMIN = "ADMIN"
     CASHIER = "CASHIER"
     MESERO = "MESERO"
+    KITCHEN = "KITCHEN"
 
 
 class UserRoleUpdate(BaseModel):
     role: RoleName = Field(
         ...,
-        description="Nuevo rol del usuario: ADMIN, CASHIER o MESERO.",
+        description="Nuevo rol del usuario: ADMIN, CASHIER, MESERO o KITCHEN.",
         examples=["ADMIN"],
     )
 

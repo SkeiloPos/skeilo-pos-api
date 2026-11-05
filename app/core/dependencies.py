@@ -386,6 +386,30 @@ def require_tenant_admin_or_cashier(user: User = Depends(get_current_user)) -> U
     return user
 
 
+def require_kitchen_board_view(user: User = Depends(get_current_user)) -> User:
+    """Exige que el usuario autenticado tenga rol ADMIN, CASHIER o KITCHEN
+    (spec 151, research.md Decisión 2): el tablero de cocina es de solo
+    lectura para ADMIN/CASHIER y de lectura+escritura para KITCHEN."""
+    if not user.role or user.role.name not in {"ADMIN", "CASHIER", "KITCHEN"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acceso al tablero de cocina requerido",
+        )
+    return user
+
+
+def require_kitchen_role(user: User = Depends(get_current_user)) -> User:
+    """Exige que el usuario autenticado tenga rol KITCHEN (spec 151,
+    research.md Decisión 2, FR-014): solo KITCHEN puede mover tarjetas entre
+    columnas -- ADMIN/CASHIER solo pueden ver el tablero."""
+    if not user.role or user.role.name != "KITCHEN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acceso de cocina requerido",
+        )
+    return user
+
+
 def forbid_cashier(user: User = Depends(get_current_user)) -> User:
     """Bloquea solo a CASHIER (spec 093, FR-025/escenario 12, research.md D8): la
     receta (BOM) de una variante expone `inventory_item_id`, dato de inventario sin

@@ -579,3 +579,58 @@ class DraftPreviewIn(BaseModel):
     #: Igual que `OrderCreate.delivery_fee` — el frontend lo manda solo si el
     #: borrador es de tipo domicilio (FR-003).
     delivery_fee: Decimal | None = Field(None, ge=0)
+
+
+# ===================== Tablero de cocina (spec 151) =========================
+
+class KitchenCardAddonOut(BaseModel):
+    """Una adición (opción o topping) de una línea de la tarjeta de cocina
+    (contracts/kitchen-board.md §CardResponse) — ambas fuentes (`OrderItemOption`/
+    `OrderItemToppingResponse`) se aplanan a la misma forma, cocina no necesita
+    distinguirlas."""
+    name: str | None = None
+    quantity: int
+
+
+class KitchenCardItemOut(BaseModel):
+    product_name: str
+    quantity: int
+    addons: list[KitchenCardAddonOut] = Field(default_factory=list)
+    notes: str | None = None
+
+
+class KitchenCardOut(BaseModel):
+    """Tarjeta del tablero de cocina (contracts/kitchen-board.md §CardResponse,
+    FR-012). Forma común de `GET /orders/kitchen-board` y de la respuesta
+    exitosa de `POST /orders/{order_id}/kitchen-status`."""
+    order_id: UUID
+    table_order_number: int | None = None
+    kitchen_status: Literal["SIN_PREPARAR", "EN_PROGRESO", "LISTO"]
+    version: int
+    sent_to_kitchen_at: UtcDatetime
+    origin: Literal["mesa", "caja", "domicilio"]
+    table_number: int | None = None
+    customer_name: str | None = None
+    delivery_address: str | None = None
+    notes: str | None = None
+    items: list[KitchenCardItemOut] = Field(default_factory=list)
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KitchenBoardResponse(BaseModel):
+    """Respuesta de `GET /orders/kitchen-board` (contracts/kitchen-board.md):
+    las tres columnas fijas, cada una ordenada ascendente por
+    `sent_to_kitchen_at` (desempate por `id`, FR-003)."""
+    sin_preparar: list[KitchenCardOut] = Field(default_factory=list)
+    en_progreso: list[KitchenCardOut] = Field(default_factory=list)
+    listo: list[KitchenCardOut] = Field(default_factory=list)
+
+
+class ChangeKitchenStatusIn(BaseModel):
+    """Cuerpo de `POST /orders/{order_id}/kitchen-status`
+    (contracts/move-kitchen-status.md). `version` es obligatorio: el cliente
+    debe reenviar el último que observó, para que el backend detecte un
+    movimiento concurrente (FR-008)."""
+    kitchen_status: Literal["SIN_PREPARAR", "EN_PROGRESO", "LISTO"]
+    version: int
