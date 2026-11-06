@@ -238,7 +238,13 @@ class TestTableSessionsRouter(unittest.TestCase):
         # `notify_payment_completed` (spec 077) consulta `shared.tenants`,
         # tabla que este fixture no incluye (fuera de su alcance) — se
         # parchea para no interferir con lo que esta prueba congela.
-        with mock.patch.object(service, "notify_payment_completed"):
+        # `has_module_access` (spec 153) consulta `shared.plans` vía
+        # `tenant.plan_id` -- `fx.make_tenant_double()` es un doble liviano
+        # sin ese atributo (tampoco incluido en este fixture, ajeno a lo que
+        # esta prueba congela); se parchea a `False` para conservar el
+        # comportamiento de siempre (sin módulo de Cocina).
+        with mock.patch.object(service, "notify_payment_completed"), \
+                mock.patch.object(service, "has_module_access", return_value=False):
             resp = ts_router.close_session(
                 s["ts"].id, data, db=s["db"], user=s["user"], tenant=s["tenant"],
             )

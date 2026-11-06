@@ -174,6 +174,60 @@ class TestKitchen(unittest.TestCase):
         self.assertEqual(actualizado.status, "entregada")
         self.assertTrue(all(it.estado_cocina == "entregado" for it in actualizado.items))
 
+    # --------------------------- deliver_order: guard de cocina (spec 153) --
+
+    def test_deliver_order_409_order_not_ready_con_cocina_activa_y_no_listo(self):
+        """Comportamiento NUEVO (spec 153, FR-004): con el módulo de Cocina
+        activo, un pedido de mesa con `kitchen_status` distinto de `'LISTO'`
+        (p. ej. `'SIN_PREPARAR'`) responde 409 `ORDER_NOT_READY` al intentar
+        entregarlo -- hoy este caso falla porque la entrega se permite sin
+        esa validación."""
+        s = self._seed_item(
+            order_status="confirmado", estado_cocina="pendiente",
+            payment_status="PAID", kitchen_status="SIN_PREPARAR",
+        )
+        db, order = s["db"], s["order"]
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(kitchen, "has_module_access", return_value=True):
+            with self.assertRaises(ConflictError) as ctx:
+                kitchen.deliver_order(db, order.id, tenant_id=1, tenant=tenant)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_READY")
+        db.refresh(order)
+        self.assertEqual(order.status, "confirmado")
+
+    def test_deliver_order_permite_entregar_con_cocina_activa_y_listo(self):
+        """Camino feliz (spec 153, FR-004): con el módulo de Cocina activo,
+        `kitchen_status=='LISTO'` sí permite entregar -- no debe cambiar."""
+        s = self._seed_item(
+            order_status="confirmado", estado_cocina="pendiente",
+            payment_status="PAID", kitchen_status="LISTO",
+        )
+        db, order = s["db"], s["order"]
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(kitchen, "has_module_access", return_value=True):
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1, tenant=tenant)
+
+        self.assertEqual(actualizado.status, "entregada")
+
+    def test_deliver_order_sin_cocina_activa_no_exige_kitchen_status(self):
+        """No-regresión (spec 153, US3, FR-006/FR-009): sin el módulo de
+        Cocina activo, `deliver_order` sigue rechazando únicamente
+        `status=='cancelada'`, sin exigir `kitchen_status` -- igual que
+        antes de esta spec."""
+        s = self._seed_item(
+            order_status="confirmado", estado_cocina="pendiente",
+            payment_status="PAID", kitchen_status=None,
+        )
+        db, order = s["db"], s["order"]
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(kitchen, "has_module_access", return_value=False):
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1, tenant=tenant)
+
+        self.assertEqual(actualizado.status, "entregada")
+
     # ----------------------------------------- send_to_kitchen (spec 150)
 
     def _seed_order_sin_items(self, *, order_status="pendiente", payment_status="PAID", channel="POS", order_type="DINE_IN"):

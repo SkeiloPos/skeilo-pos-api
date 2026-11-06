@@ -15,8 +15,9 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.crud import get_or_404
 from app.core.domain_errors import ConflictError
-from app.core.models import User
+from app.core.models import Tenant, User
 from app.core import events
+from app.core.plan_limits import has_module_access
 from app.core.timezone import utc_now_naive
 from app.catalog_engine import ChosenOption, compute_addons_total, compute_unit_price, mark_per_line
 from app.models.customer_order import CustomerOrder
@@ -87,7 +88,9 @@ def receive_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     return order
 
 
-def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
+def deliver_order(
+    db: Session, order_id: UUID, tenant_id: int | None = None, *, tenant: Tenant | None = None,
+) -> CustomerOrder:
     """Entregar un pedido completo con una sola acción, idempotente (spec 147,
     FR-001/FR-002a/FR-011, research.md R3).
 
@@ -96,6 +99,11 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     responden éxito, un único cambio de estado efectivo (FR-011/SC-006).
 
     - `status == 'cancelada'` → rechazo, transición inválida (FR-010).
+    - Spec 153 (FR-004/FR-006/FR-009): si el tenant tiene el módulo de Cocina
+      activo y el pedido es de mesa (`dining_table_id` no nulo), exige
+      `kitchen_status == 'LISTO'` → 409 `ORDER_NOT_READY` si no lo está. Sin
+      módulo activo, o sin mesa, no se añade ninguna validación nueva --
+      mismo comportamiento que antes de esta spec.
     - `status == 'entregada'` → no es error: promueve cualquier ítem
       `'pendiente'` (nacido después de la primera entrega, FR-002a) a
       `'entregado'`; si no había ninguno, no-op exitoso sin emitir evento.
@@ -115,6 +123,15 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     if order.status == "cancelada":
         raise HTTPException(
             status.HTTP_409_CONFLICT, f"Transición inválida (status={order.status})"
+        )
+    if (
+        tenant is not None
+        and order.dining_table_id is not None
+        and order.kitchen_status != "LISTO"
+        and has_module_access(db, tenant, "cocina")
+    ):
+        raise ConflictError(
+            "El pedido aún no está listo en cocina.", code="ORDER_NOT_READY",
         )
 
     cambiados = [it for it in order.items if it.estado_cocina == "pendiente"]
@@ -140,6 +157,26 @@ def deliver_order(db: Session, order_id: UUID, tenant_id: int | None = None) -> 
     events.order_delivered(tenant_id, order_id=order.id, table_session_id=order.table_session_id)
 
     return order
+
+
+def _apply_kitchen_send(order: CustomerOrder) -> bool:
+    """Transición compartida por `send_to_kitchen` (acción manual) y el envío
+    automático tras cobro de sesión de mesa (spec 153, FR-001/FR-002,
+    `table_sessions/service._charge_session`): `kitchen_status: NULL →
+    'SIN_PREPARAR'` + `sent_to_kitchen_at`, solo si `status != 'cancelada'`,
+    `kitchen_status IS NULL` (idempotencia) y `payment_status == 'PAID'` --
+    las mismas tres condiciones que ya valida `send_to_kitchen` una por una
+    para devolver el código de error correspondiente. No hace commit ni
+    emite evento: responsabilidad del caller. Devuelve `True` si transicionó."""
+    if (
+        order.status == "cancelada"
+        or order.kitchen_status is not None
+        or order.payment_status != "PAID"
+    ):
+        return False
+    order.kitchen_status = "SIN_PREPARAR"
+    order.sent_to_kitchen_at = utc_now_naive()
+    return True
 
 
 def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
@@ -177,8 +214,7 @@ def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -
     if order.payment_status != "PAID":
         raise ConflictError("El pedido no está pagado.", code="ORDER_NOT_PAID")
 
-    order.kitchen_status = "SIN_PREPARAR"
-    order.sent_to_kitchen_at = utc_now_naive()
+    _apply_kitchen_send(order)
     try:
         db.commit()
     except Exception:
