@@ -25,6 +25,7 @@ from app.core.qr_context import (
 from app.core.rate_limit import enforce as rate_limit
 from app.models.dining_table import DiningTable
 from app.api.v1.cart import service
+from app.api.v1.plan import service as plan_service
 from app.api.v1.orders.schemas import OrderResponse
 from app.api.v1.cart.schemas import (
     SessionOpenIn, SessionOpenResponse,
@@ -169,6 +170,10 @@ async def submit_cart(
     )
     # Después del COMMIT del servicio, nunca dentro: si la transacción fallara no
     # puede haber salido un evento anunciando un pedido que no existe.
+    # spec 154 (FR-005/FR-014): computado en cada respuesta desde el plan
+    # vigente del tenant, nunca persistido — mismo patrón que `paid`/
+    # `pending_balance` en `orders/router.py:_load_order`.
+    order.qr_payment_instruction_mode = plan_service.get_qr_payment_instruction_mode(ctx.db, ctx.tenant)
     # spec 089: `line_total` = unit_price × quantity + addons_total (los adicionales una vez).
     _total = sum((i.line_total for i in order.items), start=Decimal(0))
     events.order_created(
@@ -204,9 +209,12 @@ async def submit_cart(
 def my_orders(request: Request, ctx: SessionContext = Depends(get_session_context)):
     """El endpoint más sondeado del sistema, así que responde con `ETag`: el
     comensal recibe un 304 mientras cocina no mueva nada."""
-    return json_or_304(
-        request, _ORDERS_ADAPTER, service.list_my_orders(ctx.db, ctx.participant.id)
-    )
+    orders = service.list_my_orders(ctx.db, ctx.participant.id)
+    # spec 154: mismo cómputo que `submit_cart`, sobre cada pedido devuelto.
+    mode = plan_service.get_qr_payment_instruction_mode(ctx.db, ctx.tenant)
+    for order in orders:
+        order.qr_payment_instruction_mode = mode
+    return json_or_304(request, _ORDERS_ADAPTER, orders)
 
 
 @router.post(

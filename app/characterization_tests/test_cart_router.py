@@ -62,10 +62,10 @@ class TestCartRouter(unittest.TestCase):
         kw.setdefault("price", Decimal("8000"))
         return cart_fixtures.make_variant(db, product=product, **kw)
 
-    def _ctx(self, db, table, table_session, participant, tenant_id: int = 1):
+    def _ctx(self, db, table, table_session, participant, tenant_id: int = 1, plan=None):
         return cart_fixtures.build_session_context(
             db, tenant_id=tenant_id, table=table, table_session=table_session,
-            participant=participant,
+            participant=participant, plan=plan,
         )
 
     # ---------------------------------------------------- POST /cart/sessions (T024)
@@ -369,6 +369,120 @@ class TestCartRouter(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx_err:
             cart_router.cancel_my_order(order2.id, MyOrderCancelIn(motivo="tarde"), ctx=ctx)
         self.assertEqual(ctx_err.exception.status_code, 409)
+
+    # ---------------------------------------------------- spec 154: qr_payment_instruction_mode
+
+    def test_submit_cart_refleja_la_modalidad_del_plan_del_tenant(self):
+        """FR-006/FR-013: `POST /cart/submit` devuelve
+        `qr_payment_instruction_mode` igual al `modalidad_pago_qr` del plan
+        vigente del tenant, para ambos valores del catálogo."""
+        for modalidad in ("PAY_AFTER_RECEIVING", "PAY_BEFORE_RECEIVING"):
+            with self.subTest(modalidad=modalidad):
+                db, table, ts, participant = self._seed_session()
+                variant = self._seed_variant(db)
+                efectivo = cart_fixtures.make_payment_method(db, name="Efectivo", is_cash=True)
+                plan = cart_fixtures.make_plan(db, modalidad_pago_qr=modalidad)
+                ctx = self._ctx(db, table, ts, participant, plan=plan)
+                service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+                body = SubmitCartIn(payment_method_id=efectivo.id)
+
+                with mock.patch.object(cart_router, "notify_order_created"), \
+                     mock.patch.object(settings, "RATE_LIMIT_ENABLED", False):
+                    result = asyncio.run(cart_router.submit_cart(body, _FakeRequest(), ctx))
+
+                self.assertEqual(result.qr_payment_instruction_mode, modalidad)
+
+    def test_my_orders_refleja_la_modalidad_del_plan_del_tenant(self):
+        db, table, ts, participant = self._seed_session()
+        variant = self._seed_variant(db)
+        efectivo = cart_fixtures.make_payment_method(db, name="Efectivo", is_cash=True)
+        plan = cart_fixtures.make_plan(db, modalidad_pago_qr="PAY_BEFORE_RECEIVING")
+        ctx = self._ctx(db, table, ts, participant, plan=plan)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        service.submit_cart(db, participant, efectivo.id)
+
+        resp = cart_router.my_orders(_FakeRequest(), ctx=ctx)
+        import json
+        body = json.loads(resp.body)
+        self.assertEqual(body[0]["qr_payment_instruction_mode"], "PAY_BEFORE_RECEIVING")
+
+    def test_endpoint_de_staff_nunca_asigna_qr_payment_instruction_mode(self):
+        """FR-013: `service.submit_cart` (capa compartida con los endpoints de
+        staff) nunca asigna el atributo — solo lo hace `cart/router.py`
+        encima de él. `OrderResponse.qr_payment_instruction_mode` por default
+        es `None`, así que cualquier router que no lo asigne explícitamente
+        (POS/caja/cocina/terminal de mesas) lo sirve en `null`."""
+        db, table, ts, participant = self._seed_session()
+        variant = self._seed_variant(db)
+        efectivo = cart_fixtures.make_payment_method(db, name="Efectivo", is_cash=True)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        order = service.submit_cart(db, participant, efectivo.id)
+
+        self.assertIsNone(getattr(order, "qr_payment_instruction_mode", None))
+
+    # ---------------------------------------------------- spec 154, US3: propagación inmediata
+
+    def test_cambio_de_modalidad_del_plan_se_propaga_a_todos_sus_tenants_de_inmediato(self):
+        """US3, Acceptance Scenarios 1-2: dos tenants (dos mesas/sesiones
+        distintas) suscritos al mismo plan, en la misma base, ven el valor
+        nuevo en su siguiente `POST /cart/submit` tras un único cambio en el
+        plan, sin tocar ningún tenant; un tercer tenant de un plan DISTINTO
+        no cambia."""
+        db = cart_fixtures.new_session()
+        plan_compartido = cart_fixtures.make_plan(db, modalidad_pago_qr="PAY_AFTER_RECEIVING")
+        otro_plan = cart_fixtures.make_plan(db, modalidad_pago_qr="PAY_AFTER_RECEIVING")
+        efectivo = cart_fixtures.make_payment_method(db, name="Efectivo", is_cash=True)
+
+        def _enviar_pedido(tenant_id: int, plan):
+            table = cart_fixtures.make_dining_table(db)
+            ts = cart_fixtures.make_table_session(db, table=table)
+            participant = cart_fixtures.make_participant(db, table_session=ts)
+            variant = self._seed_variant(db)
+            ctx = self._ctx(db, table, ts, participant, tenant_id=tenant_id, plan=plan)
+            service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+            body = SubmitCartIn(payment_method_id=efectivo.id)
+            with mock.patch.object(cart_router, "notify_order_created"), \
+                 mock.patch.object(settings, "RATE_LIMIT_ENABLED", False):
+                return asyncio.run(cart_router.submit_cart(body, _FakeRequest(), ctx))
+
+        before_t1 = _enviar_pedido(1, plan_compartido)
+        before_t2 = _enviar_pedido(2, plan_compartido)
+        self.assertEqual(before_t1.qr_payment_instruction_mode, "PAY_AFTER_RECEIVING")
+        self.assertEqual(before_t2.qr_payment_instruction_mode, "PAY_AFTER_RECEIVING")
+
+        # Super Admin cambia el plan una sola vez (mismo PATCH que usa US1).
+        plan_compartido.modalidad_pago_qr = "PAY_BEFORE_RECEIVING"
+        db.commit()
+
+        after_t1 = _enviar_pedido(1, plan_compartido)
+        after_t2 = _enviar_pedido(2, plan_compartido)
+        self.assertEqual(after_t1.qr_payment_instruction_mode, "PAY_BEFORE_RECEIVING")
+        self.assertEqual(after_t2.qr_payment_instruction_mode, "PAY_BEFORE_RECEIVING")
+
+        # Un tercer tenant de un plan DISTINTO no cambia.
+        result3 = _enviar_pedido(3, otro_plan)
+        self.assertEqual(result3.qr_payment_instruction_mode, "PAY_AFTER_RECEIVING")
+
+    def test_orden_creada_antes_del_cambio_refleja_la_modalidad_nueva_al_releer(self):
+        """US3, Acceptance Scenario 3: el campo se recalcula en cada lectura
+        (nunca se persiste) — una orden ya enviada, al volver a consultarse
+        vía `GET /cart/orders` después del cambio de plan, trae el valor
+        nuevo, no el que tenía al momento de crearse."""
+        db, table, ts, participant = self._seed_session()
+        variant = self._seed_variant(db)
+        efectivo = cart_fixtures.make_payment_method(db, name="Efectivo", is_cash=True)
+        plan = cart_fixtures.make_plan(db, modalidad_pago_qr="PAY_AFTER_RECEIVING")
+        ctx = self._ctx(db, table, ts, participant, plan=plan)
+        service.add_item(db, participant.id, CartItemIn(product_variant_id=variant.id, quantity=1))
+        service.submit_cart(db, participant, efectivo.id)
+
+        plan.modalidad_pago_qr = "PAY_BEFORE_RECEIVING"
+        db.commit()
+
+        import json
+        resp = cart_router.my_orders(_FakeRequest(), ctx=ctx)
+        body = json.loads(resp.body)
+        self.assertEqual(body[0]["qr_payment_instruction_mode"], "PAY_BEFORE_RECEIVING")
 
 
 if __name__ == "__main__":

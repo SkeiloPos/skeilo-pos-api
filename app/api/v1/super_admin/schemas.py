@@ -143,6 +143,8 @@ class PlanCreate(BaseModel):
     promociones_access: bool = False
     cocina_access: bool = False
 
+    modalidad_pago_qr: Literal["PAY_AFTER_RECEIVING", "PAY_BEFORE_RECEIVING"] = "PAY_AFTER_RECEIVING"
+
     precio_mensual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
     precio_anual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
 
@@ -166,6 +168,8 @@ class PlanUpdate(BaseModel):
     promociones_access: Optional[bool] = None
     cocina_access: Optional[bool] = None
 
+    modalidad_pago_qr: Optional[Literal["PAY_AFTER_RECEIVING", "PAY_BEFORE_RECEIVING"]] = None
+
     precio_mensual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
     precio_anual: Optional[Decimal] = Field(None, ge=0, max_digits=12, decimal_places=2)
 
@@ -184,6 +188,8 @@ class PlanResponse(BaseModel):
     inventario_access: bool
     promociones_access: bool
     cocina_access: bool
+
+    modalidad_pago_qr: Literal["PAY_AFTER_RECEIVING", "PAY_BEFORE_RECEIVING"]
 
     precio_mensual: Optional[Decimal] = None
     precio_anual: Optional[Decimal] = None

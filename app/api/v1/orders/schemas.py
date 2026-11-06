@@ -336,6 +336,12 @@ class OrderResponse(BaseModel):
     # `Sale` emitida. 0 cuando el pedido no tiene saldo pendiente (incluido
     # todo pedido anterior a esta spec).
     pending_balance: Decimal = Decimal("0")
+    # spec 154 (FR-005/FR-013/FR-014): modalidad de pago del menú QR del plan
+    # vigente del tenant, computada y asignada solo por `cart/router.py`
+    # (mismo patrón de atributo transitorio que `paid`/`pending_balance`).
+    # `None` en toda respuesta que no pase por ahí (POS, caja, cocina,
+    # terminal de mesas) — nunca persistida.
+    qr_payment_instruction_mode: Literal["PAY_AFTER_RECEIVING", "PAY_BEFORE_RECEIVING"] | None = None
     # Spec 076, Historia 4: nombre para mostrar del usuario de staff (Cajero o
     # Mesero, sin distinción de rol) que creó este pedido — computado, no una
     # columna nueva: resuelve `CustomerOrder.user_id` (ya existente) contra

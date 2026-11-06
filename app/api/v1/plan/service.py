@@ -35,3 +35,11 @@ def build_plan_summary(db: Session, tenant: Tenant) -> dict:
             "cocina": plan.cocina_access,
         },
     }
+
+
+def get_qr_payment_instruction_mode(db: Session, tenant: Tenant) -> str:
+    """Modalidad de pago del menú QR del plan vigente del tenant (spec 154,
+    FR-005). Sin caché: se recalcula en cada llamada desde `tenant.plan_id`,
+    nunca persistida en la orden (FR-014) — ver `cart/router.py`."""
+    plan = db.get(Plan, tenant.plan_id)
+    return plan.modalidad_pago_qr
