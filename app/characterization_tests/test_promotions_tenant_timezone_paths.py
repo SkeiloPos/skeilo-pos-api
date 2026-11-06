@@ -21,6 +21,7 @@ pago mixto. Los pedidos llevan su instante congelado (`promotion_evaluated_at`, 
 import unittest
 from datetime import datetime, time, timezone
 from decimal import Decimal
+from unittest import mock
 
 from sqlalchemy import select
 
@@ -117,7 +118,11 @@ def _cobro_de_mesa_unificado(zona, instante) -> Decimal:
     data = CloseSessionIn.model_validate({
         "cash_shift_id": str(shift.id), "billing_mode": "unified", "payments": [_pago(efectivo.id)],
     })
-    ts_service.close_session(db, ts.id, data, fx.make_user_double(), tenant=tenant_en(zona))
+    # `has_module_access` (spec 153) consulta `shared.plans` vía `tenant.plan_id` --
+    # `tenant_en`/`make_tenant_stub` es un doble liviano sin ese atributo (ajeno a lo
+    # que esta spec evalúa, que es solo la zona horaria); se parchea a `False`.
+    with mock.patch.object(ts_service, "has_module_access", return_value=False):
+        ts_service.close_session(db, ts.id, data, fx.make_user_double(), tenant=tenant_en(zona))
     return db.execute(select(Sale).where(Sale.table_session_id == ts.id)).scalar_one().discount
 
 
@@ -128,7 +133,8 @@ def _cobro_de_mesa_dividido(zona, instante) -> Decimal:
         "cash_shift_id": str(shift.id), "billing_mode": "split",
         "splits": [{"participant_id": str(ana.id), "payments": [_pago(efectivo.id)]}],
     })
-    ts_service.close_session(db, ts.id, data, fx.make_user_double(), tenant=tenant_en(zona))
+    with mock.patch.object(ts_service, "has_module_access", return_value=False):
+        ts_service.close_session(db, ts.id, data, fx.make_user_double(), tenant=tenant_en(zona))
     venta = db.execute(select(Sale).where(Sale.table_session_id == ts.id)).scalar_one()
     # En `split` el descuento por promoción NO se suma a `Sale.discount` (lo trae el bloque de cada comensal,
     # `bloque.discount`); el motor deja su efecto en el snapshot `applied_promotions`.
@@ -248,7 +254,8 @@ class TestVistaPreviaMenuPublicoYCobroCoinciden(unittest.TestCase):
                 data = CloseSessionIn.model_validate({
                     "cash_shift_id": str(shift.id), "billing_mode": "unified", "payments": [_pago(efectivo.id)],
                 })
-                ts_service.close_session(db, ts.id, data, fx.make_user_double(), tenant=tenant)
+                with mock.patch.object(ts_service, "has_module_access", return_value=False):
+                    ts_service.close_session(db, ts.id, data, fx.make_user_double(), tenant=tenant)
                 en_el_cobro = db.execute(select(Sale).where(Sale.table_session_id == ts.id)).scalar_one().discount == DESCUENTO
 
                 self.assertEqual((en_el_menu, en_la_vista_previa, en_el_cobro), (aplica, aplica, aplica))

@@ -109,6 +109,24 @@ class TestPlanSummary(unittest.TestCase):
         summary = plan_router.get_plan_summary(db=db, tenant=tenant, _=cashier)
         self.assertIsNotNone(summary)
 
+    # ---------------------------------------------------------- spec 154: FR-004
+
+    def test_resumen_no_expone_modalidad_pago_qr_en_ningun_nivel(self):
+        """FR-004: ningún rol de administración del tenant puede consultar
+        `modalidad_pago_qr` — no viaja en `GET /plan`, a diferencia de
+        `inventario_access`/`promociones_access`/`cocina_access`."""
+        import json
+
+        db = fx.new_session()
+        plan = fx.make_plan(db, modalidad_pago_qr="PAY_BEFORE_RECEIVING")
+        tenant = fx.make_tenant(db, plan=plan)
+        user = fx.make_user(db, tenant)
+        db.commit()
+
+        summary = plan_router.get_plan_summary(db=db, tenant=tenant, _=user)
+
+        self.assertNotIn("modalidad_pago_qr", json.dumps(summary, default=str))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
 from app.core.models import Base, Tenant
+from app.models.plan import Plan
 import app.models  # noqa: F401  - registra todas las tablas de negocio en Base.metadata
 
 from app.models.category import Category
@@ -112,6 +113,11 @@ def attach_shared_tenants(conn) -> None:
     (solo `tenant` se remapea), así que `shared.tenants` se resuelve a la base adjunta."""
     conn.execute(text("ATTACH DATABASE ':memory:' AS shared"))
     Tenant.__table__.create(bind=conn)
+    # spec 154: `get_qr_payment_instruction_mode` (plan/service.py) hace
+    # `db.get(Plan, tenant.plan_id)` — sin esta tabla, cualquier test que
+    # ejercite `cart/router.py` (submit_cart/my_orders) fallaría con "no such
+    # table: shared.plans", aunque no le interese la modalidad de pago.
+    Plan.__table__.create(bind=conn)
 
 
 def new_session() -> Session:

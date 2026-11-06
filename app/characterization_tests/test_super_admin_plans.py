@@ -18,6 +18,7 @@ montadas bajo ese mismo router (mismo criterio que 032).
 import unittest
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app.characterization_tests import plan_fixtures as fx
 from app.api.v1.super_admin import plans_router as router
@@ -172,6 +173,34 @@ class TestSuperAdminPlans(unittest.TestCase):
 
         summary = plan_router.get_plan_summary(db=db, tenant=tenant, _=user)
         self.assertTrue(summary["modules"]["cocina"])
+
+    # ---------------------------------------------------------- spec 154: modalidad_pago_qr
+
+    def test_crear_plan_con_modalidad_pay_before_receiving_queda_persistido(self):
+        db = fx.new_session()
+        created = router.create_plan(
+            PlanCreate(name="Con modalidad", modalidad_pago_qr="PAY_BEFORE_RECEIVING"), db,
+        )
+        self.assertEqual(created.modalidad_pago_qr, "PAY_BEFORE_RECEIVING")
+
+    def test_crear_plan_sin_enviar_modalidad_pago_qr_queda_en_pay_after_receiving(self):
+        """FR-002: comportamiento actual por default — ningún plan existente
+        cambia de comportamiento hasta que el Super Admin lo edite."""
+        db = fx.new_session()
+        created = router.create_plan(PlanCreate(name="Sin modalidad"), db)
+        self.assertEqual(created.modalidad_pago_qr, "PAY_AFTER_RECEIVING")
+
+    def test_crear_plan_con_modalidad_pago_qr_fuera_de_catalogo_es_rechazado(self):
+        with self.assertRaises(ValidationError):
+            PlanCreate(name="Inválido", modalidad_pago_qr="OTRO")
+
+    def test_editar_modalidad_pago_qr_reemplaza_el_valor_anterior(self):
+        db = fx.new_session()
+        plan = fx.make_plan(db, modalidad_pago_qr="PAY_BEFORE_RECEIVING")
+        db.commit()
+
+        updated = router.update_plan(plan.id, PlanUpdate(modalidad_pago_qr="PAY_AFTER_RECEIVING"), db)
+        self.assertEqual(updated.modalidad_pago_qr, "PAY_AFTER_RECEIVING")
 
 
 if __name__ == "__main__":

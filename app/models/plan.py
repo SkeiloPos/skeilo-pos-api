@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Boolean, Integer, Numeric, String
+from sqlalchemy import Boolean, CheckConstraint, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.models import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -48,4 +48,18 @@ class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     precio_mensual: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
     precio_anual: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
 
-    __table_args__ = ({"schema": "shared"},)
+    # Modalidad de pago del menú QR (spec 154): no es un *gate* de módulo, es
+    # una selección excluyente de dos valores. No editable ni consultable por
+    # ningún rol de administración del tenant (FR-004) — solo viaja en los
+    # endpoints de Super Admin, nunca en GET /plan.
+    modalidad_pago_qr: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="PAY_AFTER_RECEIVING", server_default="PAY_AFTER_RECEIVING"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "modalidad_pago_qr IN ('PAY_AFTER_RECEIVING', 'PAY_BEFORE_RECEIVING')",
+            name="ck_plans_modalidad_pago_qr",
+        ),
+        {"schema": "shared"},
+    )

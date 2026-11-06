@@ -456,6 +456,120 @@ class TestTableSessionsService(unittest.TestCase):
         self.assertEqual(s["ts"].status, "closed")
         self.assertEqual(s["table"].status, "libre")
 
+    # -------------------------- spec 153: cobro previo a cocina (US1/US3) --------
+
+    def test_charge_session_con_cocina_activa_envia_a_cocina_tras_cobrar(self):
+        """Comportamiento NUEVO (spec 153, FR-001/FR-002): con el módulo de
+        Cocina activo, cobrar la sesión deja el pedido `kitchen_status==
+        'SIN_PREPARAR'` y `sent_to_kitchen_at` poblado, en la misma
+        operación -- hoy este caso falla porque `kitchen_status` permanece
+        `NULL` tras el cobro."""
+        s = self._seed_billable_session()
+        tenant = fx.make_tenant_double()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        with mock.patch.object(service, "has_module_access", return_value=True):
+            service.charge_session(s["db"], s["ts"].id, data, s["cashier"], tenant=tenant)
+
+        s["db"].refresh(s["order"])
+        self.assertEqual(s["order"].payment_status, "PAID")
+        self.assertEqual(s["order"].kitchen_status, "SIN_PREPARAR")
+        self.assertIsNotNone(s["order"].sent_to_kitchen_at)
+
+    def test_assert_closable_con_cocina_activa_no_exige_entrega_previa(self):
+        """Comportamiento NUEVO (spec 153, FR-001/FR-003): para un tenant con
+        el módulo de Cocina activo, `_assert_closable` ya NO rechaza el
+        cobro de una sesión con ítems `estado_cocina=='pendiente'` -- hoy
+        este caso falla porque el cobro se rechaza con 409."""
+        s = self._seed_billable_session()
+        s["item"].estado_cocina = "pendiente"
+        s["db"].commit()
+        tenant = fx.make_tenant_double()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        with mock.patch.object(service, "has_module_access", return_value=True):
+            resp = service.charge_session(s["db"], s["ts"].id, data, s["cashier"], tenant=tenant)
+
+        self.assertEqual(len(resp.sale_ids), 1)
+        s["db"].refresh(s["order"])
+        self.assertEqual(s["order"].payment_status, "PAID")
+
+    def test_charge_session_cuenta_dividida_solo_envia_lo_que_cobra_en_esta_llamada(self):
+        """Comportamiento NUEVO (spec 153, FR-002, clarification 2): un
+        pedido que ya estaba `payment_status=='PAID'` ANTES de esta llamada
+        (p. ej. cobrado por separado, vía `OrderPaymentAttempt`, antes de
+        completarse el 100% de la sesión) no está en `_billable_orders` y
+        por lo tanto esta operación no lo toca -- su envío a cocina, si no
+        ocurrió antes, no ocurre retroactivamente aquí. Solo el pedido que
+        esta llamada sí cobra (y deja en `PAID`) se envía a cocina."""
+        s = self._seed_billable_session()
+        db, ts = s["db"], s["ts"]
+        otro_variant = s["variant"]
+        ya_pagado = fx.make_customer_order(
+            db, ts, status="entregada", payment_status="PAID", channel="POS",
+        )
+        fx.make_order_item(db, ya_pagado, otro_variant, estado_cocina="entregado")
+        db.commit()
+        tenant = fx.make_tenant_double()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        with mock.patch.object(service, "has_module_access", return_value=True):
+            service.charge_session(db, ts.id, data, s["cashier"], tenant=tenant)
+
+        db.refresh(s["order"])
+        db.refresh(ya_pagado)
+        self.assertEqual(s["order"].kitchen_status, "SIN_PREPARAR")
+        self.assertIsNone(ya_pagado.kitchen_status)
+
+    def test_charge_session_sin_cocina_no_envia_a_cocina_ni_cambia_assert_closable(self):
+        """No-regresión (spec 153, US3, FR-006): sin el módulo de Cocina
+        activo (o sin pasar `tenant`, como ya hacían todos los callers
+        existentes), cobrar sigue dejando `kitchen_status` en `NULL` -- el
+        envío a cocina nunca se dispara."""
+        s = self._seed_billable_session()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        service.close_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        s["db"].refresh(s["order"])
+        self.assertEqual(s["order"].payment_status, "PAID")
+        self.assertIsNone(s["order"].kitchen_status)
+
+    def test_assert_closable_sin_cocina_sigue_exigiendo_entrega_previa(self):
+        """No-regresión (spec 153, US3, FR-006): sin el módulo de Cocina
+        activo, `_assert_closable` sigue rechazando el cobro de una sesión
+        con ítems `estado_cocina=='pendiente'`, exactamente como hoy."""
+        s = self._seed_billable_session()
+        s["item"].estado_cocina = "pendiente"
+        s["db"].commit()
+        tenant = fx.make_tenant_double()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id)],
+        })
+
+        with mock.patch.object(service, "has_module_access", return_value=False):
+            with self.assertRaises(HTTPException) as ctx:
+                service.charge_session(s["db"], s["ts"].id, data, s["cashier"], tenant=tenant)
+        self.assertEqual(ctx.exception.status_code, 409)
+
     def test_charge_session_descuenta_inventario_de_un_pedido_qr_que_nunca_paso_por_confirm(self):
         """Spec 147 ciclo 2 (a pedido del usuario): "Entregar" es independiente
         del pago -- un pedido QR puede llegar aquí `'entregada'` sin que el

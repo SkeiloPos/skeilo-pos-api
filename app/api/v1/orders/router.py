@@ -419,8 +419,11 @@ def deliver_order(
     """Spec 147 (FR-001/FR-002/FR-002a/FR-011): única acción de entrega, sin
     paso por ítem individual. Reemplaza semánticamente a `PATCH
     /items/{id}/kitchen`, `POST /{id}/start-preparation` y `POST /{id}/ready`
-    (retirados, FR-002/research.md R4)."""
-    kitchen.deliver_order(db, order_id, tenant_id=tenant.id)
+    (retirados, FR-002/research.md R4). Spec 153 (FR-004): con el módulo de
+    Cocina activo, un pedido de mesa además exige `kitchen_status=='LISTO'`
+    (defensa en profundidad -- el frontend ya aplica la misma regla,
+    `canDeliverOrder`)."""
+    kitchen.deliver_order(db, order_id, tenant_id=tenant.id, tenant=tenant)
     return _load_order(db, order_id)
 
 

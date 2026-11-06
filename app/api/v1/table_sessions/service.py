@@ -18,6 +18,7 @@ from app.core import events
 from app.core.crud import get_or_404
 from app.core.models import Tenant, User
 from app.core.notifications.dispatch import notify_payment_completed
+from app.core.plan_limits import has_module_access
 from app.core.timezone import utc_now
 from app.models.customer_order import CustomerOrder
 from app.models.dining_table import DiningTable
@@ -26,6 +27,7 @@ from app.models.sale import Sale
 from app.models.session_participant import SessionParticipant
 from app.models.table_session import TableSession
 from app.api.v1.orders import checkout
+from app.api.v1.orders.kitchen import _apply_kitchen_send
 from app.api.v1.orders.service import order_pending_balance
 from app.api.v1.sales.builder import build_sale, ensure_open_shift
 from app.api.v1.table_sessions.schemas import (
@@ -297,8 +299,19 @@ def compute_bill(
     )
 
 
-def _assert_closable(db: Session, orders: list[CustomerOrder]) -> None:
-    """Una sesión no se cierra con pedidos sin confirmar ni con comida en curso."""
+def _assert_closable(
+    db: Session, orders: list[CustomerOrder], *, tenant: Tenant | None = None,
+) -> None:
+    """Una sesión no se cierra con pedidos sin confirmar ni con comida en curso.
+
+    Spec 153 (FR-001/FR-003/FR-006): el chequeo de "comida en curso" (ningún
+    ítem `estado_cocina=='pendiente'`) se omite cuando el tenant tiene el
+    módulo de Cocina activo -- cobrar ya no exige entregar antes, FR-001 deja
+    que el pedido llegue a cocina recién al cobrarse. El chequeo de "pedidos
+    sin confirmar" se mantiene siempre, con o sin módulo activo: es un
+    requisito de flujo ajeno a cocina. `tenant=None` (valor por defecto, usado
+    por `release_paid_session`, que nunca lo pasa) conserva el comportamiento
+    de siempre -- esta omisión solo aplica al cobro (`_charge_session`)."""
     sin_confirmar = [o for o in orders if o.status == "pendiente"]
     if sin_confirmar:
         raise HTTPException(
@@ -308,6 +321,9 @@ def _assert_closable(db: Session, orders: list[CustomerOrder]) -> None:
                 "order_ids": [str(o.id) for o in sin_confirmar],
             },
         )
+
+    if tenant is not None and has_module_access(db, tenant, "cocina"):
+        return
 
     en_cocina = [
         {"order_id": str(o.id), "order_item_id": str(it.id),
@@ -353,7 +369,7 @@ def _charge_session(
         raise HTTPException(
             status.HTTP_409_CONFLICT, "La sesión no tiene pedidos que cobrar"
         )
-    _assert_closable(db, orders)
+    _assert_closable(db, orders, tenant=tenant)
 
     # A pedido del usuario (spec 147 ciclo 2): un pedido QR puede llegar
     # aquí sin haber pasado nunca por la revisión de pago (aprobar
@@ -378,6 +394,21 @@ def _charge_session(
     # `EN_CURSO`) — todos están ya `'entregada'` aquí. Solo falta el pago.
     for order in orders:
         order.payment_status = "PAID"
+
+    # Spec 153 (FR-001/FR-002, contracts/table-session-charge.md): con el
+    # módulo de Cocina activo, cobrar y enviar a cocina son un solo paso --
+    # cada pedido de mesa que esta operación deja en `payment_status='PAID'`
+    # se envía de inmediato, reusando la misma transición idempotente de
+    # `send_to_kitchen` (`_apply_kitchen_send`, no-op si ya tiene
+    # `kitchen_status`). Acotado a `orders` (lo que esta llamada acaba de
+    # cobrar): un pedido ya `PAID` antes de esta operación -- p. ej. cuenta
+    # dividida vía `OrderPaymentAttempt` que todavía no complete el 100% de
+    # la sesión -- no está en `orders` (`_billable_orders` lo excluye) y no
+    # se toca aquí; se evaluará en el próximo cobro que sí lo incluya.
+    if tenant is not None and has_module_access(db, tenant, "cocina"):
+        for order in orders:
+            if order.dining_table_id is not None:
+                _apply_kitchen_send(order)
 
     ts.billing_mode = data.billing_mode.value
     return ts, sales

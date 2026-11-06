@@ -50,7 +50,7 @@ __all__ = [
     "make_dining_table", "make_table_session", "make_participant",
     "make_cart", "make_cart_item", "make_customer_order",
     "make_promotion", "add_rule_to_promotion",
-    "make_payment_method", "make_payment_attempt",
+    "make_payment_method", "make_payment_attempt", "make_plan",
     "frozen_now",
     "build_session_context", "patched_qr_context", "patched_session_context",
     "FakeRedisBucket",
@@ -72,6 +72,7 @@ from app.models.payment import PaymentMethod
 from app.models.order_payment_attempt import OrderPaymentAttempt
 from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
+from app.models.plan import Plan
 
 
 # --------------------------------------------------------------- Esquema SQLite
@@ -432,6 +433,19 @@ def make_payment_attempt(
     return obj
 
 
+def make_plan(db: Session, **kw) -> Plan:
+    """spec 154: plan mínimo en `shared.plans` (tabla creada por
+    `attach_shared_tenants`) para `get_qr_payment_instruction_mode`. Por
+    defecto `PAY_AFTER_RECEIVING` — el comportamiento actual."""
+    kw.setdefault("id", _uid())
+    kw.setdefault("name", f"plan-{kw['id']}")
+    kw.setdefault("modalidad_pago_qr", "PAY_AFTER_RECEIVING")
+    plan = Plan(**kw)
+    db.add(plan)
+    db.flush()
+    return plan
+
+
 # --------------------------------------------------------------- Reloj fijado (A-08)
 
 class frozen_now:
@@ -493,6 +507,7 @@ def build_session_context(
     table: DiningTable,
     table_session: TableSession,
     participant: SessionParticipant,
+    plan: Plan | None = None,
 ) -> SessionContext:
     """`SessionContext` real (mismo dataclass de producción) poblado a mano.
     Se pasa como `ctx=` directamente a las funciones de endpoint que hoy lo
@@ -504,7 +519,12 @@ def build_session_context(
     # motor de promociones (`resolve_timezone`), que lee este atributo -- sin
     # él, cualquier test que ejercite una promoción vigente via este harness
     # levanta `AttributeError`.
-    tenant = SimpleNamespace(id=tenant_id, schema=tenant_schema, timezone="America/Bogota")
+    # spec 154: `tenant.plan_id` lo lee `get_qr_payment_instruction_mode` desde
+    # `submit_cart`/`my_orders` — un plan `PAY_AFTER_RECEIVING` por defecto si
+    # el test no pasa uno explícito, para no alterar ningún test existente.
+    if plan is None:
+        plan = make_plan(db)
+    tenant = SimpleNamespace(id=tenant_id, schema=tenant_schema, timezone="America/Bogota", plan_id=plan.id)
     return SessionContext(
         db=db,
         tenant=tenant,
