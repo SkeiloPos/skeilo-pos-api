@@ -20,11 +20,12 @@ class PreparationType(str, Enum):
     PACKAGED = "packaged"
 
 
-# ---------- Plantilla única de export/import de la carta (spec 143, research.md D8) ----------
+# ---------- Plantilla única de export/import de la carta (spec 143, research.md D8;
+# fusión de hojas Productos/Presentaciones, spec 155 research.md D1) ----------
 # Una sola definición de cabeceras por hoja, en orden -- `export.py` e `import_.py` las
 # importan en vez de repetirlas cada uno por su lado (FR-001). Ver data-model.md para el
 # origen/destino y tipo esperado de cada columna.
-PRODUCT_TEMPLATE_HEADERS = [
+PRODUCT_AND_VARIANT_TEMPLATE_HEADERS = [
     "Código",
     "Nombre",
     "Categoría",
@@ -35,16 +36,12 @@ PRODUCT_TEMPLATE_HEADERS = [
     "Rastrea inventario",
     "Es adición",
     "Visible en menú QR",
-]
-
-VARIANT_TEMPLATE_HEADERS = [
-    "Código de producto",
     "Presentación",
     "SKU",
     "Nombre comercial",
     "Precio",
     "Orden",
-    "Activo",
+    "Activo de la presentación",
 ]
 
 RECIPE_TEMPLATE_HEADERS = [
@@ -61,8 +58,7 @@ TOPPING_TEMPLATE_HEADERS = [
 
 # Nombre de hoja -> cabeceras esperadas, en el orden de procesamiento FR-007.
 PRODUCT_IMPORT_SHEETS = {
-    "Productos": PRODUCT_TEMPLATE_HEADERS,
-    "Presentaciones y precios": VARIANT_TEMPLATE_HEADERS,
+    "Productos y precios": PRODUCT_AND_VARIANT_TEMPLATE_HEADERS,
     "Receta": RECIPE_TEMPLATE_HEADERS,
     "Adiciones": TOPPING_TEMPLATE_HEADERS,
 }
