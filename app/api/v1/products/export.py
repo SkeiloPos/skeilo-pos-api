@@ -1,8 +1,9 @@
-"""Generación del `.xlsx` de la carta (spec 143, research.md D8): 4 hojas
-relacionadas (Productos, Presentaciones y precios, Receta, Adiciones) en un solo
-workbook, armado completo en memoria antes de responder -- mismo criterio que
-`inventory/export.py` (spec 086/109): un error a mitad de la generación nunca deja
-un archivo corrupto/incompleto en la respuesta."""
+"""Generación del `.xlsx` de la carta (spec 143, research.md D8; fusión de hojas
+Productos/Presentaciones, spec 155 research.md D1): 3 hojas relacionadas
+(Productos y precios, Receta, Adiciones) en un solo workbook, armado completo en
+memoria antes de responder -- mismo criterio que `inventory/export.py` (spec
+086/109): un error a mitad de la generación nunca deja un archivo
+corrupto/incompleto en la respuesta."""
 import io
 
 from openpyxl import Workbook
@@ -13,8 +14,7 @@ from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.models.product_topping import ProductTopping
 from app.api.v1.products.schemas import (
-    PRODUCT_TEMPLATE_HEADERS,
-    VARIANT_TEMPLATE_HEADERS,
+    PRODUCT_AND_VARIANT_TEMPLATE_HEADERS,
     RECIPE_TEMPLATE_HEADERS,
     TOPPING_TEMPLATE_HEADERS,
 )
@@ -29,11 +29,13 @@ def _bool_label(value: bool) -> str:
 
 
 def build_products_excel(db: Session) -> io.BytesIO:
-    """Arma el workbook completo en memoria, en el orden Productos → Presentaciones
-    y precios → Receta → Adiciones (FR-007). Incluye todos los productos del tenant,
-    activos e inactivos (Historia 1). Un producto sin receta ni adiciones solo
-    genera filas en las dos primeras hojas; una carta vacía entrega las 4 hojas con
-    encabezados sin filas de datos."""
+    """Arma el workbook completo en memoria, en el orden Productos y precios →
+    Receta → Adiciones (FR-007). Incluye todos los productos del tenant, activos e
+    inactivos (Historia 1); cada presentación de un producto genera su propia fila
+    en "Productos y precios", con los datos de producto repetidos en cada una
+    (FR-002, data-model.md). Un producto sin receta ni adiciones solo genera filas
+    en la primera hoja; una carta vacía entrega las 3 hojas con encabezados sin
+    filas de datos."""
     products = db.execute(
         select(Product)
         .options(
@@ -46,12 +48,9 @@ def build_products_excel(db: Session) -> io.BytesIO:
     ).unique().scalars().all()
 
     wb = Workbook()
-    ws_products = wb.active
-    ws_products.title = "Productos"
-    ws_products.append(PRODUCT_TEMPLATE_HEADERS)
-
-    ws_variants = wb.create_sheet("Presentaciones y precios")
-    ws_variants.append(VARIANT_TEMPLATE_HEADERS)
+    ws_products_variants = wb.active
+    ws_products_variants.title = "Productos y precios"
+    ws_products_variants.append(PRODUCT_AND_VARIANT_TEMPLATE_HEADERS)
 
     ws_recipe = wb.create_sheet("Receta")
     ws_recipe.append(RECIPE_TEMPLATE_HEADERS)
@@ -60,7 +59,7 @@ def build_products_excel(db: Session) -> io.BytesIO:
     ws_toppings.append(TOPPING_TEMPLATE_HEADERS)
 
     for product in products:
-        ws_products.append([
+        product_columns = [
             product.code,
             product.name,
             product.category.name if product.category else "",
@@ -71,11 +70,10 @@ def build_products_excel(db: Session) -> io.BytesIO:
             _bool_label(product.tracks_inventory),
             _bool_label(product.is_topping),
             _bool_label(product.visible_en_qr),
-        ])
+        ]
 
         for variant in product.variants:
-            ws_variants.append([
-                product.code,
+            ws_products_variants.append(product_columns + [
                 variant.presentation_name,
                 variant.sku or "",
                 variant.name or "",

@@ -1,9 +1,9 @@
-"""Importación masiva de la carta (spec 143). Un archivo propio, separado de
-`export.py` -- ambos comparten la definición de columnas
-(`schemas.PRODUCT_IMPORT_SHEETS`) pero tienen validación y dependencias
-distintas (plan.md, Structure Decision): el import depende de la tabla de jobs
-y, en producción, de la tarea Celery que lo invoca; el export no depende de
-ninguno de los dos.
+"""Importación masiva de la carta (spec 143; fusión de hojas Productos/
+Presentaciones, spec 155). Un archivo propio, separado de `export.py` -- ambos
+comparten la definición de columnas (`schemas.PRODUCT_IMPORT_SHEETS`) pero
+tienen validación y dependencias distintas (plan.md, Structure Decision): el
+import depende de la tabla de jobs y, en producción, de la tarea Celery que lo
+invoca; el export no depende de ninguno de los dos.
 
 Cada fila se valida y se aplica de forma independiente, con su propio commit --
 nunca una transacción de todo el archivo (FR-005a/FR-015, data-model.md): así,
@@ -13,12 +13,17 @@ emparejamiento es por código). El import NO reutiliza `ProductService`
 (research.md D1): opera directamente sobre `Product`/`ProductVariant`/
 `RecipeItem`/`ProductTopping`.
 
-Las hojas se procesan completas, una por una, en el orden Productos →
-Presentaciones y precios → Receta → Adiciones (FR-007, research.md D4) -- una
-fila de una hoja posterior puede referenciar una fila creada (y ya committeada)
-por una fila anterior de una hoja previa del mismo archivo, sin necesidad de un
-registro en memoria: para cuando se procesa "Presentaciones y precios", todo lo
-que "Productos" logró aplicar ya está en la base de datos."""
+Las hojas se procesan completas, una por una, en el orden Productos y precios →
+Receta → Adiciones (FR-007, research.md D4) -- una fila de una hoja posterior
+puede referenciar una fila creada (y ya committeada) por una fila anterior de
+una hoja previa del mismo archivo, sin necesidad de un registro en memoria:
+para cuando se procesa "Receta", todo lo que "Productos y precios" logró
+aplicar ya está en la base de datos.
+
+"Productos y precios" fusiona producto y presentación en una sola fila (spec
+155, research.md D1); antes de aplicar cualquiera de sus filas se pre-escanea
+la hoja completa para detectar inconsistencias entre filas del mismo código de
+producto (FR-005, research.md D2) -- ver `_detectar_inconsistencias`."""
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -43,17 +48,20 @@ _BOOL_FALSE = {"no", "falso", "false", "0"}
 # Orden de procesamiento fijo (FR-007, research.md D4) -- independiente del
 # orden físico de las hojas en el archivo subido.
 _ORDEN_HOJAS = (
-    "Productos", "Presentaciones y precios", "Receta", "Adiciones",
+    "Productos y precios", "Receta", "Adiciones",
 )
 
 
 def validar_estructura(hojas_headers: dict[str, list[Any]]) -> list[str] | None:
     """FR-010: compara las cabeceras de cada hoja presente contra la plantilla
     correspondiente (nombre y orden exactos). Un archivo con solo algunas de
-    las 4 hojas es válido (edge case del spec); una hoja con un nombre que no
-    corresponde a ninguna de las 4 esperadas se trata como una hoja renombrada
+    las 3 hojas es válido (edge case del spec); una hoja con un nombre que no
+    corresponde a ninguna de las 3 esperadas se trata como una hoja renombrada
     -- no como una hoja simplemente ausente -- y es un problema de estructura.
-    Devuelve la lista de problemas, o `None` si el archivo es válido."""
+    Un archivo con el formato anterior de la spec 143 (hojas "Productos" y/o
+    "Presentaciones y precios") cae, sin código dedicado, en este mismo caso
+    (FR-008, research.md D5). Devuelve la lista de problemas, o `None` si el
+    archivo es válido."""
     problemas: list[str] = []
     encontro_alguna = False
     for nombre_hoja, headers in hojas_headers.items():
@@ -79,8 +87,8 @@ def validar_estructura(hojas_headers: dict[str, list[Any]]) -> list[str] | None:
                 )
     if not encontro_alguna:
         problemas.append(
-            "el archivo no contiene ninguna de las hojas esperadas (Productos, "
-            "Presentaciones y precios, Receta, Adiciones)"
+            "el archivo no contiene ninguna de las hojas esperadas (Productos y "
+            "precios, Receta, Adiciones)"
         )
     return problemas or None
 
@@ -223,12 +231,19 @@ def _assign_variant_display_order(db: Session, variant: ProductVariant, desired_
     db.flush()
 
 
-def validar_y_aplicar_fila_producto(db: Session, fila: list[Any]) -> dict:
-    """Hoja Productos: Código (col. 1) resuelve actualización o creación; Nombre
-    y Categoría son obligatorios; Tipo de preparación debe ser 'Preparado' o
-    'Empacado'; las 5 columnas booleanas conservan el valor existente si vienen
-    vacías en una actualización (nunca se infiere `false`, FR-005a), y usan el
-    default de creación si vienen vacías al crear."""
+def validar_y_aplicar_fila_producto_y_presentacion(db: Session, fila: list[Any]) -> dict:
+    """Hoja Productos y precios (spec 155, fusión de las antiguas hojas
+    Productos + Presentaciones y precios, research.md D1-D2): Código (col. 1)
+    resuelve actualización o creación de producto con las columnas 1-10 (mismo
+    criterio que la antigua hoja Productos -- las 5 columnas booleanas
+    conservan el valor existente si vienen vacías en una actualización, nunca
+    se infiere `false`, FR-005a); Presentación (col. 11) y Precio (col. 14) son
+    obligatorios en toda fila (FR-004); la combinación producto+presentación
+    identifica una variante existente o crea una nueva, con las columnas 11-16
+    (SKU, Nombre comercial, Precio, Orden, Activo de la presentación). Toda la
+    validación ocurre antes de cualquier mutación, para que una fila inválida
+    nunca cree un producto sin su presentación; un único `try/except
+    ValueError` con un solo `commit`/`rollback` por fila (FR-009)."""
     code = str(fila[0]).strip() if fila[0] else None
     try:
         nombre = fila[1]
@@ -258,6 +273,18 @@ def validar_y_aplicar_fila_producto(db: Session, fila: list[Any]) -> dict:
         es_adicion = _parse_bool(fila[8], "Es adición")
         visible_qr = _parse_bool(fila[9], "Visible en menú QR")
 
+        nombre_presentacion = fila[10]
+        if not nombre_presentacion or not str(nombre_presentacion).strip():
+            raise ValueError("Presentación es obligatoria")
+
+        precio = _parse_decimal(fila[13], "Precio")
+        orden = _parse_int(fila[14], "Orden")
+        sku_valor = fila[11]
+        sku = str(sku_valor).strip() if sku_valor not in (None, "") else None
+        nombre_comercial_valor = fila[12]
+        nombre_comercial = str(nombre_comercial_valor).strip() if nombre_comercial_valor not in (None, "") else ""
+        activo_variante = _parse_bool(fila[15], "Activo de la presentación")
+
         existente = None
         if code:
             existente = db.execute(
@@ -267,76 +294,44 @@ def validar_y_aplicar_fila_producto(db: Session, fila: list[Any]) -> dict:
         categoria = resolve_or_create_category(db, categoria_valor)
 
         if existente is not None:
-            existente.name = nombre
-            existente.category_id = categoria.id
-            existente.preparation_type = preparation_type
-            existente.description = descripcion
+            producto = existente
+            producto.name = nombre
+            producto.category_id = categoria.id
+            producto.preparation_type = preparation_type
+            producto.description = descripcion
             if activo is not None:
-                existente.active = activo
+                producto.active = activo
             if disponible is not None:
-                existente.available = disponible
+                producto.available = disponible
             if rastrea is not None:
-                existente.tracks_inventory = rastrea
+                producto.tracks_inventory = rastrea
             if es_adicion is not None:
-                existente.is_topping = es_adicion
+                producto.is_topping = es_adicion
             if visible_qr is not None:
-                existente.visible_en_qr = visible_qr
+                producto.visible_en_qr = visible_qr
             db.flush()
-            db.commit()
-            return {"ok": True, "accion": "actualizado", "motivo": None}
+            accion_producto = "actualizado"
+        else:
+            producto = Product(
+                code=code or service.generate_next_product_code(db),
+                name=nombre,
+                category_id=categoria.id,
+                preparation_type=preparation_type,
+                description=descripcion,
+                active=activo if activo is not None else True,
+                available=disponible if disponible is not None else True,
+                tracks_inventory=rastrea if rastrea is not None else False,
+                is_topping=es_adicion if es_adicion is not None else False,
+                visible_en_qr=(
+                    visible_qr if visible_qr is not None
+                    else not (es_adicion if es_adicion is not None else False)
+                ),
+            )
+            db.add(producto)
+            db.flush()
+            accion_producto = "creado"
 
-        producto = Product(
-            code=code or service.generate_next_product_code(db),
-            name=nombre,
-            category_id=categoria.id,
-            preparation_type=preparation_type,
-            description=descripcion,
-            active=activo if activo is not None else True,
-            available=disponible if disponible is not None else True,
-            tracks_inventory=rastrea if rastrea is not None else False,
-            is_topping=es_adicion if es_adicion is not None else False,
-            visible_en_qr=(
-                visible_qr if visible_qr is not None
-                else not (es_adicion if es_adicion is not None else False)
-            ),
-        )
-        db.add(producto)
-        db.flush()
-        db.commit()
-        return {"ok": True, "accion": "creado", "motivo": None}
-    except ValueError as exc:
-        db.rollback()
-        return {"ok": False, "accion": None, "motivo": str(exc)}
-
-
-def validar_y_aplicar_fila_presentacion(db: Session, fila: list[Any]) -> dict:
-    """Hoja Presentaciones y precios: Código de producto debe existir (ya en el
-    sistema o creado por una fila anterior de Productos, ya committeada);
-    Presentación se busca/crea; la combinación producto+presentación identifica
-    una variante existente o crea una nueva; Precio ≥ 0 obligatorio; Orden
-    entero ≥ 0 obligatorio, con reasignación determinística en colisión."""
-    try:
-        code_producto = str(fila[0]).strip() if fila[0] else None
-        if not code_producto:
-            raise ValueError("Código de producto es obligatorio")
-        producto = db.execute(
-            select(Product).where(Product.code == code_producto)
-        ).scalar_one_or_none()
-        if producto is None:
-            raise ValueError(f"no existe ningún producto con código '{code_producto}'")
-
-        nombre_presentacion = fila[1]
-        if not nombre_presentacion or not str(nombre_presentacion).strip():
-            raise ValueError("Presentación es obligatoria")
         presentacion = resolve_or_create_presentation(db, nombre_presentacion)
-
-        precio = _parse_decimal(fila[4], "Precio")
-        orden = _parse_int(fila[5], "Orden")
-        sku_valor = fila[2]
-        sku = str(sku_valor).strip() if sku_valor not in (None, "") else None
-        nombre_comercial_valor = fila[3]
-        nombre_comercial = str(nombre_comercial_valor).strip() if nombre_comercial_valor not in (None, "") else ""
-        activo = _parse_bool(fila[6], "Activo")
 
         variante = db.execute(
             select(ProductVariant).where(
@@ -351,31 +346,33 @@ def validar_y_aplicar_fila_presentacion(db: Session, fila: list[Any]) -> dict:
                 variante.sku = sku
             variante.name = nombre_comercial
             variante.price = precio
-            if activo is not None:
-                variante.active = activo
+            if activo_variante is not None:
+                variante.active = activo_variante
             db.flush()
             _assign_variant_display_order(db, variante, orden)
-            db.commit()
-            return {"ok": True, "accion": "actualizado", "motivo": None}
-
-        if sku is not None:
-            _ensure_sku_unique(db, sku)
-        max_order = db.execute(
-            select(func.max(ProductVariant.display_order)).where(
-                ProductVariant.product_id == producto.id
+            accion_variante = "actualizado"
+        else:
+            if sku is not None:
+                _ensure_sku_unique(db, sku)
+            max_order = db.execute(
+                select(func.max(ProductVariant.display_order)).where(
+                    ProductVariant.product_id == producto.id
+                )
+            ).scalar() or 0
+            variante = ProductVariant(
+                product_id=producto.id, presentation_id=presentacion.id,
+                sku=sku, name=nombre_comercial, price=precio,
+                active=activo_variante if activo_variante is not None else True,
+                display_order=max_order + 1,
             )
-        ).scalar() or 0
-        variante = ProductVariant(
-            product_id=producto.id, presentation_id=presentacion.id,
-            sku=sku, name=nombre_comercial, price=precio,
-            active=activo if activo is not None else True,
-            display_order=max_order + 1,
-        )
-        db.add(variante)
-        db.flush()
-        _assign_variant_display_order(db, variante, orden)
+            db.add(variante)
+            db.flush()
+            _assign_variant_display_order(db, variante, orden)
+            accion_variante = "creado"
+
         db.commit()
-        return {"ok": True, "accion": "creado", "motivo": None}
+        accion = "creado" if "creado" in (accion_producto, accion_variante) else "actualizado"
+        return {"ok": True, "accion": accion, "motivo": None}
     except ValueError as exc:
         db.rollback()
         return {"ok": False, "accion": None, "motivo": str(exc)}
@@ -503,21 +500,63 @@ def validar_y_aplicar_fila_adicion(db: Session, fila: list[Any]) -> dict:
 
 
 _VALIDADORES = {
-    "Productos": validar_y_aplicar_fila_producto,
-    "Presentaciones y precios": validar_y_aplicar_fila_presentacion,
+    "Productos y precios": validar_y_aplicar_fila_producto_y_presentacion,
     "Receta": validar_y_aplicar_fila_receta,
     "Adiciones": validar_y_aplicar_fila_adicion,
 }
 
 
+def _detectar_inconsistencias(filas: list[list[Any]]) -> dict[str, str]:
+    """Pasada 1 de "Productos y precios" (FR-005, research.md D2/D3): agrupa
+    las filas por código (columna 1), ignorando código vacío -- cada fila sin
+    código es un producto nuevo independiente, nunca participa de un grupo.
+    Para cada grupo con más de una fila, compara los valores normalizados
+    (mismo trim/lower que ya usan `_parse_bool` y el resto de parsers de
+    columna) de las columnas de producto (2-10) entre todas sus filas. Devuelve
+    un `dict` código -> motivo para cada grupo cuyas filas difieren en alguna de
+    esas columnas; se llama antes de aplicar cualquier fila de la hoja, para
+    que ninguna fila de un grupo inconsistente llegue a aplicarse."""
+    grupos: dict[str, list[list[Any]]] = {}
+    for fila in filas:
+        code = str(fila[0]).strip() if fila[0] else None
+        if not code:
+            continue
+        grupos.setdefault(code, []).append(fila)
+
+    columnas_producto = [
+        (1, "Nombre"), (2, "Categoría"), (3, "Tipo de preparación"),
+        (4, "Descripción"), (5, "Activo"), (6, "Disponible"),
+        (7, "Rastrea inventario"), (8, "Es adición"), (9, "Visible en menú QR"),
+    ]
+
+    def _normalizar(valor: Any) -> str:
+        return str(valor).strip().lower() if valor not in (None, "") else ""
+
+    inconsistencias: dict[str, str] = {}
+    for code, filas_grupo in grupos.items():
+        if len(filas_grupo) < 2:
+            continue
+        columnas_distintas = [
+            nombre_columna
+            for idx, nombre_columna in columnas_producto
+            if len({_normalizar(fila[idx]) for fila in filas_grupo}) > 1
+        ]
+        if columnas_distintas:
+            inconsistencias[code] = (
+                f"el código '{code}' aparece en {len(filas_grupo)} filas con datos de "
+                f"producto distintos en: {', '.join(columnas_distintas)}"
+            )
+    return inconsistencias
+
+
 def procesar_archivo_importacion(db: Session, job, hojas: dict[str, list[list[Any]]]) -> None:
     """Recorre las hojas presentes en el orden fijo de FR-007, aplica cada fila
     de forma independiente y deja el `job` (`ProductImportJob`) en `finalizado`
-    con los conteos y errores acumulados. Solo la hoja Productos pre-escanea
-    códigos duplicados *dentro del mismo archivo* (edge case del spec: ambas
-    filas fallan, ninguna se aplica) -- una vez committeada la primera,
-    `validar_y_aplicar_fila_producto` ya no vería un duplicado como tal, sino
-    como una actualización legítima.
+    con los conteos y errores acumulados. "Productos y precios" pre-escanea
+    la hoja completa con `_detectar_inconsistencias` antes de aplicar cualquier
+    fila (FR-005, research.md D2): las filas de un grupo (mismo código)
+    inconsistente se marcan como fallidas sin invocar el validador, sin que
+    ninguna de ellas llegue a aplicarse.
 
     Cancelación cooperativa: cada fila hace su propio commit, lo que expira
     `job` en la sesión -- si otra sesión marca el job como ya no `procesando`,
@@ -529,24 +568,16 @@ def procesar_archivo_importacion(db: Session, job, hojas: dict[str, list[list[An
             continue
         validar_fn = _VALIDADORES[hoja]
 
-        duplicados: set[str] = set()
-        if hoja == "Productos":
-            codigos_vistos: dict[str, int] = {}
-            for fila in filas:
-                code = str(fila[0]).strip() if fila[0] else None
-                if code:
-                    codigos_vistos[code] = codigos_vistos.get(code, 0) + 1
-            duplicados = {code for code, veces in codigos_vistos.items() if veces > 1}
+        inconsistencias: dict[str, str] = {}
+        if hoja == "Productos y precios":
+            inconsistencias = _detectar_inconsistencias(filas)
 
         for numero, fila in enumerate(filas, start=1):
             if job.status != "procesando":
                 return
             code = str(fila[0]).strip() if fila[0] else None
-            if hoja == "Productos" and code and code in duplicados:
-                resultado = {
-                    "ok": False,
-                    "motivo": f"el código '{code}' aparece más de una vez en este archivo",
-                }
+            if code and code in inconsistencias:
+                resultado = {"ok": False, "motivo": inconsistencias[code]}
             else:
                 resultado = validar_fn(db, fila)
 
