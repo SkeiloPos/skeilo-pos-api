@@ -93,14 +93,27 @@ DEFAULT_CUSTOMER_NAME = "Consumidor final"
 
 
 def order_has_sale(db: Session, order_id: UUID) -> bool:
-    """¿Ya existe una `Sale` para este pedido? (spec 029, D2/D3 de research.md)
+    """¿Ya está pagado este pedido? (spec 029, D2/D3 de research.md; bugfix
+    spec 156)
 
-    Es la señal correcta de "ya está pagado" — a diferencia de
-    `CustomerOrder.status`, que nunca llega a `"pagada"` en los caminos QR y
-    de mostrador vigentes (`checkout_and_send`/`_confirm_order_impl` dejan la
-    orden en `"abierta"` a propósito, con la venta ya emitida). Mismo patrón
-    de subconsulta ya probado en `has_billable_orders`
-    (`table_sessions/service.py`), sin tocar esa función."""
+    Señal PRIMARIA: `CustomerOrder.payment_status == 'PAID'` -- toda ruta de
+    cobro (unificado de 1 pedido, unificado de varios, split, mostrador
+    `checkout_and_send`, QR) la marca sin excepción
+    (`table_sessions/service.py::_charge_session`; `orders/checkout.py`).
+    Señal de respaldo (OR, defensa en profundidad): existe una `Sale` con
+    `customer_order_id == order_id` -- la señal ORIGINAL de esta función, que
+    por sí sola queda corta: `_close_unified` solo pone `customer_order_id`
+    cuando la Sale cubre a UN único pedido (`orders[0].id if len(orders) == 1
+    else None`) y `_close_split` nunca lo pone -- cualquier pedido cobrado
+    junto con otro(s) quedaba con `paid=False` aunque `payment_status` ya
+    fuera `'PAID'` (bug reportado: pastilla "Pendiente" en pedidos ya
+    cobrados). No se encontró ningún camino que cree una `Sale` sin dejar
+    `payment_status` en `'PAID'`; se conserva el chequeo de `Sale` solo por
+    si alguna ruta futura rompe esa invariante sin que esta función se
+    actualice."""
+    order = db.get(CustomerOrder, order_id)
+    if order is not None and order.payment_status == "PAID":
+        return True
     return db.execute(
         select(Sale.id).where(Sale.customer_order_id == order_id).limit(1)
     ).scalar() is not None
@@ -378,13 +391,28 @@ def _entrada_publicable(entrada: dict) -> dict:
 
 def paid_order_ids(db: Session, order_ids: list[UUID]) -> set[UUID]:
     """Versión en bloque de `order_has_sale`, para no hacer N consultas al
-    serializar un listado de pedidos (spec 029, D2 de research.md)."""
+    serializar un listado de pedidos (spec 029, D2 de research.md; bugfix
+    spec 156 -- mismo criterio primario que `order_has_sale`: `payment_status`
+    por encima de la existencia de `Sale`, ver docstring de esa función).
+
+    Sigue en como máximo 2 consultas para todo el lote -- nunca una por
+    fila: una siempre (por `payment_status`), y una segunda solo para los ids
+    que no resultaron pagados por esa vía."""
     if not order_ids:
         return set()
-    rows = db.execute(
-        select(Sale.customer_order_id).where(Sale.customer_order_id.in_(order_ids))
-    ).scalars().all()
-    return set(rows)
+    pagados = set(db.execute(
+        select(CustomerOrder.id).where(
+            CustomerOrder.id.in_(order_ids),
+            CustomerOrder.payment_status == "PAID",
+        )
+    ).scalars().all())
+    faltan = [oid for oid in order_ids if oid not in pagados]
+    if not faltan:
+        return pagados
+    con_venta = set(db.execute(
+        select(Sale.customer_order_id).where(Sale.customer_order_id.in_(faltan))
+    ).scalars().all())
+    return pagados | con_venta
 
 
 def order_totals(db: Session, orders: list[CustomerOrder]) -> dict[UUID, Decimal]:
@@ -490,7 +518,24 @@ def list_orders(
         q = q.where(CustomerOrder.status == status_filter)
     if active_sessions_only:
         inactive_sessions = select(TableSession.id).where(TableSession.status != "active")
-        pedidos_pagados = select(Sale.customer_order_id).where(Sale.customer_order_id.isnot(None))
+        # Bugfix spec 156 (A-156/A-157): "ya pagado" se detectaba solo por
+        # `Sale.customer_order_id`, el mismo vínculo que `_close_unified`
+        # deja en `NULL` cuando una venta unificada cubre 2+ pedidos (y que
+        # `_close_split` nunca rellena) -- un pedido cobrado junto con otro(s)
+        # nunca entraba en `pedidos_pagados`, así que seguía "activo" para
+        # siempre aunque su sesión ya estuviera `'closed'` y la mesa
+        # `'libre'` (bug reportado: mesa liberada que sigue mostrando sus
+        # pedidos ya pagados). Señal primaria ahora: `payment_status ==
+        # 'PAID'` (mismo criterio ya usado por `order_has_sale`/
+        # `paid_order_ids`), con el vínculo de `Sale` como respaldo OR.
+        pedidos_pagados = select(CustomerOrder.id).where(
+            or_(
+                CustomerOrder.payment_status == "PAID",
+                CustomerOrder.id.in_(
+                    select(Sale.customer_order_id).where(Sale.customer_order_id.isnot(None))
+                ),
+            )
+        )
         q = q.where(
             or_(
                 CustomerOrder.table_session_id.is_(None),

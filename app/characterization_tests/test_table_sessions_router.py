@@ -215,7 +215,7 @@ class TestTableSessionsRouter(unittest.TestCase):
         congelada en `test_table_sessions_service.py`."""
         s = self._seed_billable_session()
 
-        via_router = ts_router.session_bill(s["ts"].id, db=s["db"], _=s["user"])
+        via_router = ts_router.session_bill(s["ts"].id, db=s["db"], _=s["user"], order_ids=None)
         via_service = service.compute_bill(s["db"], s["ts"].id)
 
         self.assertEqual(via_router, via_service)

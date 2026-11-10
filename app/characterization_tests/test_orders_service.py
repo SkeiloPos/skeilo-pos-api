@@ -32,6 +32,9 @@ from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.orders import service
 from app.api.v1.orders.schemas import OrderChannel, OrderCreate, OrderItemIn, OrderType
 from app.api.v1.catalog.schemas import OptionSelectionIn
+from app.api.v1.table_sessions import service as ts_service
+from app.api.v1.table_sessions.schemas import CloseSessionIn, SplitPaymentIn
+from app.api.v1.sales.schemas import PaymentIn
 from app.models.inventory_movement import InventoryMovement
 from app.models.order_item import OrderItem
 from app.models.sale import Sale
@@ -805,6 +808,114 @@ class TestOrderHasSale(unittest.TestCase):
         db = fx.new_session()
         self.assertEqual(service.paid_order_ids(db, []), set())
 
+    # ------------------------------------------- Bugfix spec 156 (A-156)
+
+    def _pago(self, method_id, amount):
+        return PaymentIn(payment_method_id=method_id, amount=amount).model_dump(mode="json")
+
+    def _seed_sesion_dos_pedidos(self):
+        """Mesa + sesión activa con dos pedidos `'entregada'` cobrables, cada
+        uno con un ítem ya `'entregado'` (para no bloquear `_assert_closable`)
+        -- caja abierta."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+
+        pedido_1 = fx.make_customer_order(db, ts, status="entregada")
+        fx.make_order_item(db, pedido_1, variant, estado_cocina="entregado")
+        pedido_2 = fx.make_customer_order(db, ts, status="entregada")
+        fx.make_order_item(db, pedido_2, variant, estado_cocina="entregado")
+
+        shift = fx.make_cash_shift(db)
+        method = fx.make_payment_method(db)
+        cashier = fx.make_user_double()
+
+        db.commit()
+        return dict(
+            db=db, ts=ts, pedido_1=pedido_1, pedido_2=pedido_2,
+            shift=shift, method=method, cashier=cashier,
+        )
+
+    def test_paid_true_para_ambos_pedidos_tras_cobro_unificado_de_dos_ordenes(self):
+        """Bugfix spec 156 (A-156): cobrar 2 pedidos juntos en una sola
+        llamada `billing_mode='unified'` debe dejar `paid=True` (vía
+        `order_has_sale`/`paid_order_ids`) para AMBOS -- antes del fix,
+        ninguno lo tenía, porque `_close_unified` solo deja
+        `Sale.customer_order_id` no nulo cuando la venta cubre a un único
+        pedido."""
+        s = self._seed_sesion_dos_pedidos()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "unified",
+            "payments": [self._pago(s["method"].id, PRECIO * 2)],
+        })
+
+        ts_service.charge_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        self.assertTrue(service.order_has_sale(s["db"], s["pedido_1"].id))
+        self.assertTrue(service.order_has_sale(s["db"], s["pedido_2"].id))
+        self.assertEqual(
+            service.paid_order_ids(s["db"], [s["pedido_1"].id, s["pedido_2"].id]),
+            {s["pedido_1"].id, s["pedido_2"].id},
+        )
+
+    def test_paid_true_para_ambos_pedidos_tras_cobro_split(self):
+        """Bugfix spec 156 (A-156): mismo caso, `billing_mode='split'` --
+        `_close_split` nunca pone `Sale.customer_order_id`, así que antes del
+        fix ambos pedidos quedaban `paid=False` pese a `payment_status=
+        'PAID'`."""
+        s = self._seed_sesion_dos_pedidos()
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(s["shift"].id),
+            "billing_mode": "split",
+            "splits": [
+                SplitPaymentIn(
+                    participant_id=None,
+                    payments=[PaymentIn(payment_method_id=s["method"].id, amount=PRECIO * 2)],
+                ).model_dump(mode="json"),
+            ],
+        })
+
+        ts_service.charge_session(s["db"], s["ts"].id, data, s["cashier"])
+
+        self.assertTrue(service.order_has_sale(s["db"], s["pedido_1"].id))
+        self.assertTrue(service.order_has_sale(s["db"], s["pedido_2"].id))
+
+    def test_paid_sigue_true_para_un_solo_pedido_cobrado_solo(self):
+        """No-regresión: sesión de un único pedido (caso que ya funcionaba
+        antes del fix, porque `_close_unified` deja
+        `customer_order_id=orders[0].id` cuando `len(orders) == 1`)."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        pedido = fx.make_customer_order(db, ts, status="entregada")
+        fx.make_order_item(db, pedido, variant, estado_cocina="entregado")
+        shift = fx.make_cash_shift(db)
+        method = fx.make_payment_method(db)
+        cashier = fx.make_user_double()
+        db.commit()
+
+        data = CloseSessionIn.model_validate({
+            "cash_shift_id": str(shift.id),
+            "billing_mode": "unified",
+            "payments": [self._pago(method.id, PRECIO)],
+        })
+        ts_service.charge_session(db, ts.id, data, cashier)
+
+        self.assertTrue(service.order_has_sale(db, pedido.id))
+
+    def test_paid_sigue_false_para_pedido_no_cobrado(self):
+        """No-falso-positivo: un pedido `payment_status='UNPAID'` sin `Sale`
+        sigue devolviendo `False` tras el fix (el OR no inventa pagos)."""
+        s = self._seed_sesion_dos_pedidos()
+
+        self.assertFalse(service.order_has_sale(s["db"], s["pedido_1"].id))
+        self.assertEqual(service.paid_order_ids(s["db"], [s["pedido_1"].id]), set())
+
 
 class TestListOrdersActiveSessionsOnly(unittest.TestCase):
     """Spec 029, hotfix: `list_orders(active_sessions_only=True)` — un pedido
@@ -868,6 +979,35 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         resultado = service.list_orders(db)
 
         self.assertIn(order.id, [o.id for o in resultado])
+
+    def test_excluye_pedidos_pagados_juntos_en_venta_unificada_de_sesion_ya_cerrada(self):
+        """Bugfix spec 156 (A-157): dos pedidos cobrados JUNTOS en una sola
+        `Sale` unificada (`customer_order_id=None`, ver `_close_unified`) de
+        una sesión ya `'closed'` deben excluirse igual que el caso de un solo
+        pedido -- antes del fix, `pedidos_pagados` solo miraba
+        `Sale.customer_order_id` y ninguno de los dos aparecía ahí, así que
+        la mesa liberada seguía mostrándolos como si tuviera consumo vivo."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db, status="closed")
+        pedido_1 = fx.make_customer_order(
+            db, ts, status="entregada", channel="POS", payment_status="PAID",
+        )
+        pedido_2 = fx.make_customer_order(
+            db, ts, status="entregada", channel="POS", payment_status="PAID",
+        )
+        shift = fx.make_cash_shift(db)
+        cashier = fx.make_user_double()
+        db.add(Sale(
+            cash_shift_id=shift.id, customer_order_id=None,
+            table_session_id=ts.id, user_id=cashier.id, status="paid",
+        ))
+        db.commit()
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        ids = [o.id for o in resultado]
+        self.assertNotIn(pedido_1.id, ids)
+        self.assertNotIn(pedido_2.id, ids)
 
 
 class TestOrderLinesWithAddonsPerLine(unittest.TestCase):

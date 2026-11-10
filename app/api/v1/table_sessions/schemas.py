@@ -157,6 +157,15 @@ class CloseSessionIn(BaseModel):
     # ventas emitidas por este cierre (unificado o una por comensal en dividido).
     origin_client_id: str | None = Field(None, max_length=64)
 
+    # spec 156: acota el cobro a este subconjunto de pedidos de la sesión en vez
+    # de a todos los facturables. Sin valor = comportamiento actual (cobra todo).
+    order_ids: list[UUID] | None = Field(
+        None,
+        description="Subconjunto de pedidos (CustomerOrder.id) a cobrar en esta "
+                    "transacción. Si se omite, se cobran todos los pedidos "
+                    "facturables de la sesión (comportamiento actual).",
+    )
+
 
 class CloseSessionResponse(BaseModel):
     table_session: TableSessionResponse
