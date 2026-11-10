@@ -218,14 +218,47 @@ def _billable_orders(db: Session, table_session_id: UUID) -> list[CustomerOrder]
     ).scalars().all()
 
 
+def _resolve_orders_to_charge(
+    db: Session, table_session_id: UUID, order_ids: list[UUID] | None = None,
+) -> list[CustomerOrder]:
+    """Acota `_billable_orders` a un subconjunto explícito (spec 156). Sin
+    `order_ids` (`None`), comportamiento actual sin cambios: todos los
+    facturables de la sesión (Principio II). Con `order_ids`, cualquier id
+    solicitado que no aparezca entre los facturables (no existe, es de otra
+    sesión, ya está `PAID`, cancelado, o ya tiene una `Sale`) hace fallar la
+    petición completa con 409 -- mismo patrón de error que
+    `release_paid_session` para órdenes abiertas."""
+    orders = _billable_orders(db, table_session_id)
+    if order_ids is None:
+        return orders
+
+    wanted = set(order_ids)
+    filtered = [o for o in orders if o.id in wanted]
+    found = {o.id for o in filtered}
+    missing = [oid for oid in order_ids if oid not in found]
+    if missing:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "error": "Algunos pedidos seleccionados no se pueden cobrar.",
+                "order_ids": [str(oid) for oid in missing],
+            },
+        )
+    return filtered
+
+
 def compute_bill(
     db: Session, table_session_id: UUID, tenant: Tenant | None = None,
+    order_ids: list[UUID] | None = None,
 ) -> SessionBillResponse:
     """Cuenta de la sesión, ya con descuentos automáticos (promociones/combos)
     aplicados — mismo cálculo por comensal que usa `_close_split` al cobrar, para
-    que este preview coincida con lo que realmente se cobrará."""
+    que este preview coincida con lo que realmente se cobrará.
+
+    `order_ids` (spec 156) acota la cuenta a ese subconjunto de pedidos en vez
+    de a todos los facturables de la sesión; sin él, comportamiento actual."""
     ts = _load(db, table_session_id)
-    orders = _billable_orders(db, ts.id)
+    orders = _resolve_orders_to_charge(db, ts.id, order_ids)
 
     labels = {p.id: (p.display_label or p.display_name) for p in ts.participants}
 
@@ -344,6 +377,7 @@ def _assert_closable(
 def _charge_session(
     db: Session, table_session_id: UUID, data: CloseSessionIn, cashier: User,
     *, invoice_prefix: str = "", tenant: Tenant | None = None,
+    order_ids: list[UUID] | None = None,
 ) -> tuple[TableSession, list[Sale]]:
     """Cobra los pedidos facturables de la sesión -- crea la(s) `Sale` y marca
     `payment_status='PAID'` -- sin tocar `TableSession.status` ni la mesa.
@@ -352,6 +386,11 @@ def _charge_session(
     que el cliente se vaya de inmediato, la mesa sigue ocupada hasta que el
     cajero la libere con `POST /release` (mismo mecanismo que ya usa el modo
     híbrido de spec 028 cobrado pedido por pedido).
+
+    `order_ids` (spec 156) acota el cobro a ese subconjunto -- recibido como
+    parámetro explícito, no leído de `data`, para que `close_session` (D2 de
+    research.md: `/close` jamás admite cobro parcial) pueda omitirlo siempre
+    sin importar qué traiga el body.
 
     No hace commit: cada caller decide qué más entra en su transacción.
     """
@@ -364,7 +403,7 @@ def _charge_session(
         )
 
     shift = ensure_open_shift(db, data.cash_shift_id)
-    orders = _billable_orders(db, ts.id)
+    orders = _resolve_orders_to_charge(db, ts.id, order_ids)
     if not orders:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "La sesión no tiene pedidos que cobrar"
@@ -430,6 +469,9 @@ def close_session(
     """
     table = None
     try:
+        # Sin order_ids a propósito (D2 de research.md): /close siempre cobra y
+        # libera TODO lo facturable, ignorando cualquier `data.order_ids` que
+        # traiga el body -- el cobro parcial solo existe vía /charge.
         ts, sales = _charge_session(db, table_session_id, data, cashier, invoice_prefix=invoice_prefix, tenant=tenant)
         sessions = checkout.close_table_sessions(db, ts.dining_table_id, closed_by=cashier)
 
@@ -507,7 +549,10 @@ def charge_session(
     "abierta" para ese chequeo, sin tocarlo.
     """
     try:
-        ts, sales = _charge_session(db, table_session_id, data, cashier, invoice_prefix=invoice_prefix, tenant=tenant)
+        ts, sales = _charge_session(
+            db, table_session_id, data, cashier, invoice_prefix=invoice_prefix,
+            tenant=tenant, order_ids=data.order_ids,
+        )
         db.commit()
     except HTTPException:
         db.rollback()

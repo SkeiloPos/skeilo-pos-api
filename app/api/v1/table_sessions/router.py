@@ -116,10 +116,15 @@ def session_bill(
     # `Annotated` + `None` (no `= Depends(...)`): `test_session_bill_endpoint_delega_en_compute_bill`
     # (CONGELA) invoca esta función directo, sin `tenant`; por HTTP FastAPI resuelve la dependencia.
     tenant: Annotated[Tenant, Depends(get_tenant)] = None,
+    order_ids: list[UUID] | None = Query(
+        None,
+        description="Spec 156: acota la cuenta a este subconjunto de pedidos. "
+                    "Sin valor, comportamiento actual (todos los facturables).",
+    ),
 ):
     """El desglose sale de `order_items.participant_id`, que es asignación por
     ítem: el reparto es exacto aunque un pedido mezcle comensales."""
-    return service.compute_bill(db, table_session_id, tenant)
+    return service.compute_bill(db, table_session_id, tenant, order_ids=order_ids)
 
 
 @router.post(
