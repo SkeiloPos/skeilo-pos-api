@@ -447,7 +447,7 @@ def _charge_session(
     if tenant is not None and has_module_access(db, tenant, "cocina"):
         for order in orders:
             if order.dining_table_id is not None:
-                _apply_kitchen_send(order)
+                _apply_kitchen_send(order, requires_prior_payment=True)
 
     ts.billing_mode = data.billing_mode.value
     return ts, sales

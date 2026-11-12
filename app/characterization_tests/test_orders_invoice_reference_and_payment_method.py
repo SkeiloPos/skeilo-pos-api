@@ -15,6 +15,7 @@ Ejecutar solo este módulo:
 """
 import unittest
 from decimal import Decimal
+from unittest import mock
 
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.orders import router as orders_router
@@ -23,7 +24,16 @@ from app.models.payment import Payment
 
 
 def _get_order(db, order_id):
-    return orders_router.get_order(order_id=order_id, db=db, _=fx.make_user_double())
+    # Spec 157 (A-160): `get_order` ahora calcula `qr_payment_instruction_mode`
+    # vía `tenant` -- mockeado porque `fx.make_tenant_double()` no trae un
+    # `Plan` real detrás (mismo patrón que `test_orders_pagination.py`).
+    with mock.patch.object(
+        orders_router.plan_service, "get_qr_payment_instruction_mode",
+        return_value="PAY_AFTER_RECEIVING",
+    ):
+        return orders_router.get_order(
+            order_id=order_id, db=db, _=fx.make_user_double(), tenant=fx.make_tenant_double(),
+        )
 
 
 class _Base(unittest.TestCase):

@@ -30,6 +30,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 import unittest
+from unittest import mock
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -371,6 +372,83 @@ class TestCheckout(unittest.TestCase):
         sale = checkout.pay_order(db, order.id, data, cashier)
 
         self.assertEqual(sale.total, PRECIO)
+
+    # ---------- spec 157 (A-160): envío a cocina según modalidad de cobro del plan ----------
+
+    def _seed_order_mostrador(
+        self, *, order_type="TAKEAWAY", payment_status="UNPAID", kitchen_status=None,
+    ):
+        """TAKEAWAY/DELIVERY sin mesa/sesión real (mismo patrón de
+        `test_cash_close_active_orders.py::_seed_active_order`)."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            order_type=order_type, status="confirmado", payment_status=payment_status,
+            channel="POS", kitchen_status=kitchen_status,
+        )
+        fx.make_order_item(db, order, variant, quantity=1)
+        register = fx.make_cash_register(db)
+        shift = fx.make_cash_shift(db, register=register)
+        method = fx.make_payment_method(db)
+        db.commit()
+        return dict(db=db, order=order, variant=variant, shift=shift, method=method)
+
+    def _pay(self, s, *, tenant):
+        data = PayIn(cash_shift_id=s["shift"].id, payments=[self._pago(s["method"].id, PRECIO)])
+        return checkout.pay_order(s["db"], s["order"].id, data, self._user(), tenant)
+
+    def test_pay_order_nunca_auto_envia_a_cocina_pedidos_sin_mesa(self):
+        """Ajuste 2026-11-12 (pedido por el usuario sobre spec 157, A-160):
+        `pay_order` NO auto-envía a cocina un TAKEAWAY/DELIVERY, ni siquiera
+        con el módulo de Cocina activo y el plan en `PAY_BEFORE_RECEIVING`
+        -- cobrar solo fija `payment_status='PAID'`. El envío a cocina sigue
+        el mismo flujo manual que usan las mesas (botón "Enviar a cocina",
+        `kitchen.send_to_kitchen`), que queda habilitado justo después de
+        este cobro pero requiere esa acción aparte."""
+        for order_type in ("TAKEAWAY", "DELIVERY"):
+            for cocina_activa, modalidad in (
+                (True, "PAY_BEFORE_RECEIVING"), (True, "PAY_AFTER_RECEIVING"),
+                (False, "PAY_BEFORE_RECEIVING"), (False, "PAY_AFTER_RECEIVING"),
+            ):
+                with self.subTest(order_type=order_type, cocina_activa=cocina_activa, modalidad=modalidad):
+                    s = self._seed_order_mostrador(order_type=order_type)
+                    tenant = fx.make_tenant_double()
+
+                    with mock.patch.object(
+                                checkout, "has_module_access", return_value=cocina_activa,
+                            ), \
+                            mock.patch("app.core.events.order_sent_to_kitchen") as publicar:
+                        sale = self._pay(s, tenant=tenant)
+                        publicar.assert_not_called()
+
+                    self.assertEqual(sale.total, PRECIO)
+                    db, order = s["db"], s["order"]
+                    db.refresh(order)
+                    self.assertEqual(order.payment_status, "PAID")
+                    self.assertIsNone(order.kitchen_status)
+                    self.assertIsNone(order.sent_to_kitchen_at)
+
+    def test_pay_order_no_altera_kitchen_status_ya_alcanzado_sin_pago_previo(self):
+        """FR-006: un TAKEAWAY ya enviado a cocina (vía envío manual sin
+        pagar, bajo `PAY_AFTER_RECEIVING`) conserva su `kitchen_status` al
+        cobrarse después -- `pay_order` nunca toca `kitchen_status`."""
+        s = self._seed_order_mostrador(
+            order_type="TAKEAWAY", payment_status="UNPAID", kitchen_status="SIN_PREPARAR",
+        )
+        tenant = fx.make_tenant_double()
+
+        with mock.patch("app.core.events.order_sent_to_kitchen") as publicar:
+            self._pay(s, tenant=tenant)
+            publicar.assert_not_called()
+
+        db, order = s["db"], s["order"]
+        db.refresh(order)
+        self.assertEqual(order.payment_status, "PAID")
+        self.assertEqual(order.kitchen_status, "SIN_PREPARAR")
 
     # ------------------------------------ spec 073: compute_checkout_preview (US1)
 
@@ -1081,6 +1159,104 @@ class TestCheckout(unittest.TestCase):
 
         self.assertEqual(sale.delivery_fee, Decimal("6000"))
         self.assertEqual(sale.total, esperado_total)
+
+    # ---- spec 157 (A-160, hallazgo post-implementación): checkout_and_send con cocina activa ----
+
+    def _seed_hold_order_sin_mesa(self, *, order_type="TAKEAWAY"):
+        """TAKEAWAY/DELIVERY real (sin mesa), nacido con `hold_for_payment=True`
+        (status 'pendiente'), listo para `checkout_and_send` -- camino real
+        de cobro de mostrador/domicilio (no `pay_order`, ver T010-T012)."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        category = fx.make_category(db)
+        product = fx.make_product(db, category=category)
+        variant = fx.make_variant(db, product=product, price=PRECIO)
+        insumo = fx.make_inventory_item(db, current_stock=Decimal("1000"))
+        fx.make_recipe_item(db, variant, insumo, quantity=Decimal("1"))
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            order_type=order_type, status="pendiente", channel="POS",
+        )
+        fx.make_order_item(db, order, variant, quantity=1, estado_cocina="pendiente")
+        register = fx.make_cash_register(db)
+        shift = fx.make_cash_shift(db, register=register)
+        method = fx.make_payment_method(db)
+        db.commit()
+        return dict(db=db, order=order, variant=variant, shift=shift, method=method)
+
+    def _checkout_and_send(self, s, *, tenant):
+        data = CheckoutAndSendIn(
+            version=s["order"].version, cash_shift_id=s["shift"].id,
+            payments=[self._pago(s["method"].id, PRECIO)],
+        )
+        return checkout.checkout_and_send(s["db"], s["order"].id, data, self._user(), tenant=tenant)
+
+    def test_checkout_and_send_no_auto_envia_a_cocina_pero_ya_no_bypasea_el_tablero(self):
+        """Hallazgo post-implementación (spec 157, A-160) + ajuste
+        2026-11-12 (pedido por el usuario): `checkout_and_send` -- no
+        `pay_order` -- es el camino real de cobro de mostrador/domicilio
+        (`pos-terminal.store.ts::checkoutAndSend`). Con el módulo de Cocina
+        activo, cobrar un TAKEAWAY/DELIVERY ya NO lo despacha directamente a
+        `'entregada'` (eso bypaseaba el tablero de cocina) -- pero tampoco
+        lo auto-envía a cocina, ni siquiera en `PAY_BEFORE_RECEIVING`: el
+        pedido queda pagado y `kitchen_status` sin tocar, a la espera del
+        mismo envío manual que usan las mesas (botón "Enviar a cocina")."""
+        for order_type in ("TAKEAWAY", "DELIVERY"):
+            for modalidad in ("PAY_BEFORE_RECEIVING", "PAY_AFTER_RECEIVING"):
+                with self.subTest(order_type=order_type, modalidad=modalidad):
+                    s = self._seed_hold_order_sin_mesa(order_type=order_type)
+                    tenant = fx.make_tenant_double()
+
+                    with mock.patch.object(checkout, "has_module_access", return_value=True), \
+                            mock.patch("app.core.events.order_sent_to_kitchen") as publicar:
+                        self._checkout_and_send(s, tenant=tenant)
+                        publicar.assert_not_called()
+
+                    db, order = s["db"], s["order"]
+                    db.refresh(order)
+                    self.assertEqual(order.payment_status, "PAID")
+                    self.assertIsNone(order.kitchen_status)
+                    self.assertIsNone(order.sent_to_kitchen_at)
+                    # Ya no se bypasea el tablero de cocina con el despacho
+                    # automático de spec 147 -- el pedido sigue su propio
+                    # ciclo de cocina (envío manual, luego tablero).
+                    self.assertEqual(order.status, "pendiente")
+                    self.assertTrue(all(it.estado_cocina == "pendiente" for it in order.items))
+
+    def test_checkout_and_send_sin_modulo_cocina_mantiene_el_despacho_automatico_de_siempre(self):
+        """No-regresión (FR-007): sin el módulo de Cocina activo,
+        `checkout_and_send` conserva exactamente el comportamiento de spec
+        147 ciclo 2 -- despacha automáticamente a `'entregada'` con los
+        ítems `'entregado'`, sin importar la modalidad del plan."""
+        s = self._seed_hold_order_sin_mesa(order_type="TAKEAWAY")
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(checkout, "has_module_access", return_value=False):
+            self._checkout_and_send(s, tenant=tenant)
+
+        db, order = s["db"], s["order"]
+        db.refresh(order)
+        self.assertEqual(order.payment_status, "PAID")
+        self.assertIsNone(order.kitchen_status)
+        self.assertEqual(order.status, "entregada")
+        self.assertTrue(all(it.estado_cocina == "entregado" for it in order.items))
+
+    def test_checkout_and_send_sin_tenant_mantiene_el_despacho_automatico_de_siempre(self):
+        """No-regresión: un llamador que no resuelve `tenant` (p. ej. código
+        legado) conserva el comportamiento de spec 147 ciclo 2 -- no se
+        asume `cocina_activa_sin_mesa` sin tenant resuelto."""
+        s = self._seed_hold_order_sin_mesa(order_type="TAKEAWAY")
+
+        data = CheckoutAndSendIn(
+            version=s["order"].version, cash_shift_id=s["shift"].id,
+            payments=[self._pago(s["method"].id, PRECIO)],
+        )
+        checkout.checkout_and_send(s["db"], s["order"].id, data, self._user())
+
+        db, order = s["db"], s["order"]
+        db.refresh(order)
+        self.assertEqual(order.status, "entregada")
+        self.assertTrue(all(it.estado_cocina == "entregado" for it in order.items))
 
     def test_checkout_and_send_version_desactualizada_409_sin_doble_venta(self):
         """Idempotencia / doble clic (spec 028, T016): una segunda llamada con
