@@ -24,6 +24,7 @@ Ejecutar solo este módulo:
 import unittest
 from datetime import date, datetime
 from types import SimpleNamespace
+from unittest import mock
 
 from app.characterization_tests import orders_fixtures as fx
 from app.api.v1.orders import router as orders_router
@@ -37,26 +38,33 @@ class _FakeRequest:
 
 
 def _ids(db, *, date_from=None, date_to=None, q=None, status=None, order_type=None):
-    result = orders_router.list_orders(
-        _FakeRequest(),
-        status_filter=status,
-        order_type=order_type,
-        active_sessions_only=False,
-        page=1,
-        size=50,
-        date_from=date_from,
-        date_to=date_to,
-        q=q,
-        # Spec 147: `entregadas_sin_cobrar` tiene default `Query(False, ...)`
-        # -- al llamar el endpoint directo como función (sin pasar por
-        # FastAPI), un kwarg omitido llega como el objeto `Query` crudo, no
-        # como `False` (mismo gotcha ya documentado para otros params Query
-        # de este router). Hay que pasarlo explícito.
-        entregadas_sin_cobrar=False,
-        db=db,
-        tenant=fx.make_tenant_double(),
-        _=fx.make_user_double(),
-    )
+    # Spec 157 (A-160): mockea `get_qr_payment_instruction_mode` -- la
+    # `tenant` doble de este módulo (`fx.make_tenant_double()`) no trae un
+    # `Plan` real detrás, mismo patrón que `test_orders_pagination.py`.
+    with mock.patch.object(
+        orders_router.plan_service, "get_qr_payment_instruction_mode",
+        return_value="PAY_AFTER_RECEIVING",
+    ):
+        result = orders_router.list_orders(
+            _FakeRequest(),
+            status_filter=status,
+            order_type=order_type,
+            active_sessions_only=False,
+            page=1,
+            size=50,
+            date_from=date_from,
+            date_to=date_to,
+            q=q,
+            # Spec 147: `entregadas_sin_cobrar` tiene default `Query(False, ...)`
+            # -- al llamar el endpoint directo como función (sin pasar por
+            # FastAPI), un kwarg omitido llega como el objeto `Query` crudo, no
+            # como `False` (mismo gotcha ya documentado para otros params Query
+            # de este router). Hay que pasarlo explícito.
+            entregadas_sin_cobrar=False,
+            db=db,
+            tenant=fx.make_tenant_double(),
+            _=fx.make_user_double(),
+        )
     return {o.id for o in result["items"]}
 
 

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.audit import record_audit
 from app.core.crud import get_or_404
 from app.core.models import Tenant, User
+from app.core.plan_limits import has_module_access
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -601,6 +602,17 @@ def pay_order(
         order.applied_promotions = applied
         # NO se descuenta inventario aquí: ya se hizo al confirmar el pedido.
 
+        # Spec 157 (decisión `A-160`, ajuste 2026-11-12 pedido por el usuario):
+        # `pay_order` NO auto-envía a cocina para TAKEAWAY/DELIVERY, ni
+        # siquiera en `PAY_BEFORE_RECEIVING` -- cobrar solo fija
+        # `payment_status='PAID'`. El envío a cocina sigue el mismo flujo
+        # manual que ya usan las mesas desde este mismo panel de mostrador
+        # (botón "Enviar a cocina", `kitchen.send_to_kitchen`): con
+        # `PAY_BEFORE_RECEIVING`, `kitchen_requires_prior_payment` exige el
+        # pago que esta llamada ya dejó fijo, así que el botón queda
+        # habilitado justo después de cobrar, pero el envío en sí requiere
+        # esa acción manual aparte, no ocurre automáticamente aquí.
+
         db.commit()
     except HTTPException:
         db.rollback()
@@ -905,12 +917,36 @@ def checkout_and_send(
         # se despacha al cobrarlo. Mismo efecto que `deliver_order`
         # (`kitchen.py`) -- status a `'entregada'` y los ítems `'pendiente'`
         # a `'entregado'` -- pero dentro de esta misma transacción.
+        #
+        # Spec 157 (A-160, hallazgo post-implementación): esa simplificación
+        # de spec 147 asume que un pedido sin mesa no tiene ningún paso de
+        # cocina que valga la pena mostrar -- falso para un tenant con el
+        # módulo de Cocina activo, para el que `checkout_and_send` (no
+        # `pay_order`) es el camino real de cobro de mostrador/domicilio.
+        # Con el módulo activo, el despacho pasa a gobernarse por
+        # `kitchen_status` igual que una mesa (A-155): no se auto-despacha a
+        # `'entregada'` aquí -- el pedido sigue su propio ciclo de cocina
+        # (`send_to_kitchen`/tablero/`deliver_order`).
+        #
+        # Ajuste 2026-11-12 (pedido por el usuario): tampoco se auto-envía a
+        # cocina aquí en `PAY_BEFORE_RECEIVING` -- cobrar solo fija
+        # `payment_status='PAID'`; el envío sigue el mismo flujo manual que
+        # ya usan las mesas desde este panel (botón "Enviar a cocina"), que
+        # queda habilitado justo después de este cobro porque
+        # `kitchen_requires_prior_payment` ya ve el pago fijo.
         order.payment_status = "PAID"
-        if order.dining_table_id is None:
+        cocina_activa_sin_mesa = (
+            tenant is not None
+            and order.dining_table_id is None
+            and has_module_access(db, tenant, "cocina")
+        )
+        order.auto_dispatched_now = False
+        if not cocina_activa_sin_mesa and order.dining_table_id is None:
             for it in order.items:
                 if it.estado_cocina == "pendiente":
                     it.estado_cocina = "entregado"
             order.status = "entregada"
+            order.auto_dispatched_now = True
 
         # spec 074: copiado antes del `commit` (ver `approve_payment_attempt`).
         order_id_for_audit = order.id

@@ -28,6 +28,7 @@ import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest import mock
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -54,22 +55,32 @@ class _FakeRequest:
 
 def _call_list_orders(db, *, status=None, order_type=None, active_sessions_only=False,
                       page=None, size=None, request=None):
-    return orders_router.list_orders(
-        request or _FakeRequest(),
-        status_filter=status,
-        order_type=order_type,
-        active_sessions_only=active_sessions_only,
-        page=page,
-        size=size,
-        date_from=None,
-        date_to=None,
-        q=None,
-        # Spec 147: default `Query(False, ...)` -- llamado directo necesita
-        # el valor explícito (mismo gotcha de los otros params Query).
-        entregadas_sin_cobrar=False,
-        db=db,
-        _=fx.make_user_double(),
-    )
+    # Spec 157 (A-160): `list_orders` ahora calcula `qr_payment_instruction_mode`
+    # en bloque vía `plan_service.get_qr_payment_instruction_mode(db, tenant)`
+    # -- `tenant` explícito (ya no el sentinel `Depends(...)` del llamado
+    # directo) y la función mockeada, igual que en `test_orders_kitchen.py`,
+    # porque `fx.make_tenant_double()` no trae un `Plan` real detrás.
+    with mock.patch.object(
+        orders_router.plan_service, "get_qr_payment_instruction_mode",
+        return_value="PAY_AFTER_RECEIVING",
+    ):
+        return orders_router.list_orders(
+            request or _FakeRequest(),
+            status_filter=status,
+            order_type=order_type,
+            active_sessions_only=active_sessions_only,
+            page=page,
+            size=size,
+            date_from=None,
+            date_to=None,
+            q=None,
+            # Spec 147: default `Query(False, ...)` -- llamado directo necesita
+            # el valor explícito (mismo gotcha de los otros params Query).
+            entregadas_sin_cobrar=False,
+            db=db,
+            tenant=fx.make_tenant_double(),
+            _=fx.make_user_double(),
+        )
 
 
 def _call_list_tables(db, *, page=None, size=None):

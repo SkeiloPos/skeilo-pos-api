@@ -331,6 +331,152 @@ class TestKitchen(unittest.TestCase):
         self.assertEqual(order.kitchen_status, "SIN_PREPARAR")
         self.assertEqual(order.sent_to_kitchen_at, momento_original)
 
+    # --- send_to_kitchen: modalidad de cobro del plan para TAKEAWAY/DELIVERY (spec 157, A-160)
+
+    def _seed_order_mostrador_sin_items(
+        self, *, order_type="TAKEAWAY", payment_status="UNPAID",
+    ):
+        """TAKEAWAY/DELIVERY sin mesa/sesión real -- variante de
+        `_seed_order_sin_items` con `dining_table_id=None` explícito, para
+        que `kitchen_requires_prior_payment` entre por la rama que lee la
+        modalidad del plan en vez de la rama de mesa."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            status="confirmado", payment_status=payment_status,
+            channel="POS", order_type=order_type,
+        )
+        db.commit()
+        return db, order
+
+    def test_send_to_kitchen_rechaza_takeaway_sin_pagar_con_pay_before_receiving(self):
+        """FR-004 (sin cambios para esta combinación): con el plan en
+        `PAY_BEFORE_RECEIVING`, el envío manual de un TAKEAWAY sin pagar
+        sigue rechazándose con `ORDER_NOT_PAID` -- la única vía para esta
+        combinación es el auto-envío al cobrar (US1, `checkout.pay_order`)."""
+        db, order = self._seed_order_mostrador_sin_items(order_type="TAKEAWAY")
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(
+            kitchen.plan_service, "get_qr_payment_instruction_mode",
+            return_value="PAY_BEFORE_RECEIVING",
+        ):
+            with self.assertRaises(ConflictError) as ctx:
+                kitchen.send_to_kitchen(db, order.id, tenant_id=1, tenant=tenant)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_PAID")
+        db.refresh(order)
+        self.assertIsNone(order.kitchen_status)
+
+    def test_send_to_kitchen_permite_takeaway_sin_pagar_con_pay_after_receiving(self):
+        """Comportamiento NUEVO (spec 157, FR-003, A-160): con el plan en
+        `PAY_AFTER_RECEIVING` (o sin configurar, FR-008), el envío manual de
+        un TAKEAWAY sin pagar tiene éxito -- `payment_status` sigue
+        `'UNPAID'`."""
+        db, order = self._seed_order_mostrador_sin_items(order_type="TAKEAWAY")
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(
+            kitchen.plan_service, "get_qr_payment_instruction_mode",
+            return_value="PAY_AFTER_RECEIVING",
+        ):
+            actualizado = kitchen.send_to_kitchen(db, order.id, tenant_id=1, tenant=tenant)
+
+        self.assertEqual(actualizado.kitchen_status, "SIN_PREPARAR")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+
+    def test_send_to_kitchen_permite_delivery_sin_pagar_con_pay_after_receiving(self):
+        """Mismo comportamiento que el test anterior, para DELIVERY
+        (equivalencia TAKEAWAY/DELIVERY confirmada en Clarifications)."""
+        db, order = self._seed_order_mostrador_sin_items(order_type="DELIVERY")
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(
+            kitchen.plan_service, "get_qr_payment_instruction_mode",
+            return_value="PAY_AFTER_RECEIVING",
+        ):
+            actualizado = kitchen.send_to_kitchen(db, order.id, tenant_id=1, tenant=tenant)
+
+        self.assertEqual(actualizado.kitchen_status, "SIN_PREPARAR")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+
+    def test_send_to_kitchen_takeaway_sin_pagar_sin_tenant_se_asume_sin_exigir_pago(self):
+        """`kitchen_requires_prior_payment` (research.md Decisión 1): sin
+        `tenant` resuelto (p. ej. llamador legado que no lo pasa), un
+        TAKEAWAY/DELIVERY no exige pago previo -- no debe romper llamadores
+        existentes que invocan `send_to_kitchen` sin el nuevo kwarg."""
+        db, order = self._seed_order_mostrador_sin_items(order_type="TAKEAWAY")
+
+        actualizado = kitchen.send_to_kitchen(db, order.id, tenant_id=1)
+
+        self.assertEqual(actualizado.kitchen_status, "SIN_PREPARAR")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+
+    def test_deliver_order_exige_listo_tambien_para_takeaway_con_cocina_activa(self):
+        """Hallazgo post-implementación (spec 157, A-160): ahora que
+        `checkout.checkout_and_send` ya no auto-despacha un TAKEAWAY/DELIVERY
+        a `'entregada'` con el módulo de Cocina activo (sigue su propio ciclo
+        de cocina en vez de bypasearlo), `deliver_order` debe exigir
+        `kitchen_status == 'LISTO'` para CUALQUIER pedido con el módulo
+        activo, no solo los de mesa -- el guard `ORDER_NOT_READY` (spec 153)
+        deja de estar condicionado a `dining_table_id is not None`.
+        `payment_status` no interviene en el guard, igual que antes."""
+        s = self._seed_item(
+            order_status="confirmado", estado_cocina="pendiente",
+            payment_status="UNPAID", kitchen_status="SIN_PREPARAR",
+        )
+        s["order"].dining_table_id = None
+        s["order"].order_type = "TAKEAWAY"
+        s["db"].commit()
+        db, order = s["db"], s["order"]
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(kitchen, "has_module_access", return_value=True):
+            with self.assertRaises(ConflictError) as ctx:
+                kitchen.deliver_order(db, order.id, tenant_id=1, tenant=tenant)
+        self.assertEqual(ctx.exception.code, "ORDER_NOT_READY")
+        db.refresh(order)
+        self.assertEqual(order.status, "confirmado")
+
+    def test_deliver_order_permite_entregar_takeaway_listo_con_cocina_activa(self):
+        """Camino feliz del hallazgo anterior: con `kitchen_status == 'LISTO'`,
+        un TAKEAWAY/DELIVERY sí puede entregarse, igual que una mesa."""
+        s = self._seed_item(
+            order_status="confirmado", estado_cocina="pendiente",
+            payment_status="UNPAID", kitchen_status="LISTO",
+        )
+        s["order"].dining_table_id = None
+        s["order"].order_type = "TAKEAWAY"
+        s["db"].commit()
+        db, order = s["db"], s["order"]
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(kitchen, "has_module_access", return_value=True):
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1, tenant=tenant)
+
+        self.assertEqual(actualizado.status, "entregada")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+
+    def test_deliver_order_sin_cocina_activa_takeaway_no_exige_kitchen_status(self):
+        """No-regresión (FR-007): sin el módulo de Cocina activo, un
+        TAKEAWAY/DELIVERY sigue entregándose sin exigir `kitchen_status`,
+        igual que antes de esta spec."""
+        s = self._seed_item(
+            order_status="confirmado", estado_cocina="pendiente",
+            payment_status="UNPAID", kitchen_status=None,
+        )
+        s["order"].dining_table_id = None
+        s["order"].order_type = "TAKEAWAY"
+        s["db"].commit()
+        db, order = s["db"], s["order"]
+        tenant = fx.make_tenant_double()
+
+        with mock.patch.object(kitchen, "has_module_access", return_value=False):
+            actualizado = kitchen.deliver_order(db, order.id, tenant_id=1, tenant=tenant)
+
+        self.assertEqual(actualizado.status, "entregada")
+        self.assertEqual(actualizado.payment_status, "UNPAID")
+
     # ------------------------ void_item ya no anula un pedido pagado (spec 029/147)
 
     def test_void_item_409_si_payment_status_paid_spec_029_147(self):
