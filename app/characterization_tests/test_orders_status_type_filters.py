@@ -22,6 +22,7 @@ import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest import mock
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -39,23 +40,31 @@ class _FakeRequest:
 
 
 def _ids(db, *, status=None, order_type=None):
-    result = orders_router.list_orders(
-        _FakeRequest(),
-        status_filter=status,
-        order_type=order_type,
-        active_sessions_only=False,
-        page=1,
-        size=50,
-        date_from=None,
-        date_to=None,
-        q=None,
-        # Spec 147: default `Query(False, ...)` -- llamado directo sin pasar
-        # por FastAPI necesita el valor explícito (mismo gotcha ya conocido
-        # para los otros params Query de este router).
-        entregadas_sin_cobrar=False,
-        db=db,
-        _=fx.make_user_double(),
-    )
+    # Spec 157 (A-160): mockea `get_qr_payment_instruction_mode` -- la
+    # `tenant` doble de este módulo no trae un `Plan` real detrás (mismo
+    # patrón que `test_orders_pagination.py`).
+    with mock.patch.object(
+        orders_router.plan_service, "get_qr_payment_instruction_mode",
+        return_value="PAY_AFTER_RECEIVING",
+    ):
+        result = orders_router.list_orders(
+            _FakeRequest(),
+            status_filter=status,
+            order_type=order_type,
+            active_sessions_only=False,
+            page=1,
+            size=50,
+            date_from=None,
+            date_to=None,
+            q=None,
+            # Spec 147: default `Query(False, ...)` -- llamado directo sin pasar
+            # por FastAPI necesita el valor explícito (mismo gotcha ya conocido
+            # para los otros params Query de este router).
+            entregadas_sin_cobrar=False,
+            db=db,
+            tenant=fx.make_tenant_double(),
+            _=fx.make_user_double(),
+        )
     return {o.id for o in result["items"]}
 
 

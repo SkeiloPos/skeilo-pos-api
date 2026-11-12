@@ -19,6 +19,7 @@ import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest import mock
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -39,28 +40,42 @@ class _FakeRequest:
 
 
 def _get_order(db, order_id):
-    return orders_router.get_order(order_id=order_id, db=db, _=fx.make_user_double())
+    # Spec 157 (A-160): `get_order` ahora calcula `qr_payment_instruction_mode`
+    # vía `tenant` -- mockeado porque `fx.make_tenant_double()` no trae un
+    # `Plan` real detrás (mismo patrón que `test_orders_pagination.py`).
+    with mock.patch.object(
+        orders_router.plan_service, "get_qr_payment_instruction_mode",
+        return_value="PAY_AFTER_RECEIVING",
+    ):
+        return orders_router.get_order(
+            order_id=order_id, db=db, _=fx.make_user_double(), tenant=fx.make_tenant_double(),
+        )
 
 
 def _list_orders(db, **kw):
     kw.setdefault("page", 1)
     kw.setdefault("size", 20)
-    return orders_router.list_orders(
-        _FakeRequest(),
-        status_filter=None,
-        order_type=None,
-        active_sessions_only=False,
-        page=kw["page"],
-        size=kw["size"],
-        date_from=None,
-        date_to=None,
-        q=None,
-        # Spec 147: default `Query(False, ...)` -- llamado directo necesita
-        # el valor explícito (mismo gotcha de los otros params Query).
-        entregadas_sin_cobrar=False,
-        db=db,
-        _=fx.make_user_double(),
-    )
+    with mock.patch.object(
+        orders_router.plan_service, "get_qr_payment_instruction_mode",
+        return_value="PAY_AFTER_RECEIVING",
+    ):
+        return orders_router.list_orders(
+            _FakeRequest(),
+            status_filter=None,
+            order_type=None,
+            active_sessions_only=False,
+            page=kw["page"],
+            size=kw["size"],
+            date_from=None,
+            date_to=None,
+            q=None,
+            # Spec 147: default `Query(False, ...)` -- llamado directo necesita
+            # el valor explícito (mismo gotcha de los otros params Query).
+            entregadas_sin_cobrar=False,
+            db=db,
+            tenant=fx.make_tenant_double(),
+            _=fx.make_user_double(),
+        )
 
 
 def _seed(db=None, *, items=1, precio=PRECIO, cantidad=1, **order_kw):
@@ -657,6 +672,57 @@ class TestTotalDelDetalleIgualABilling(unittest.TestCase):
         self.assertEqual(response.billing.state, "sin_factura")
         self.assertEqual(response.total, Decimal("16000"))
         self.assertEqual(response.total, response.billing.total)
+
+
+class TestQrPaymentInstructionModeEnEndpointsDeStaff(unittest.TestCase):
+    """Comportamiento NUEVO (spec 157, contracts/kitchen-payment-modality.md
+    §3, A-160): antes de esta spec, `OrderResponse.qr_payment_instruction_mode`
+    quedaba siempre `None` fuera del contexto QR_MENU (`cart/router.py`) --
+    ningún endpoint de staff lo calculaba. `GET /orders/{id}` y `GET /orders`
+    (ambas ramas) ahora sí lo calculan, con el mismo criterio que el menú QR
+    (`plan_service.get_qr_payment_instruction_mode(db, tenant)`), para que el
+    frontend decida si mostrar el botón manual "Enviar a cocina"."""
+
+    def test_get_order_refleja_la_modalidad_real_del_tenant(self):
+        db, order, _ = _seed(items=1)
+
+        with mock.patch.object(
+            orders_router.plan_service, "get_qr_payment_instruction_mode",
+            return_value="PAY_BEFORE_RECEIVING",
+        ):
+            response = orders_router.get_order(
+                order_id=order.id, db=db, _=fx.make_user_double(), tenant=fx.make_tenant_double(),
+            )
+
+        self.assertEqual(response.qr_payment_instruction_mode, "PAY_BEFORE_RECEIVING")
+
+    def test_list_orders_rama_sin_paginar_refleja_la_modalidad_real_del_tenant(self):
+        import json
+
+        db, order, _ = _seed(items=1)
+
+        with mock.patch.object(
+            orders_router.plan_service, "get_qr_payment_instruction_mode",
+            return_value="PAY_BEFORE_RECEIVING",
+        ):
+            response = orders_router.list_orders(
+                _FakeRequest(), status_filter=None, order_type=None,
+                active_sessions_only=False, page=None, size=None,
+                date_from=None, date_to=None, q=None, entregadas_sin_cobrar=False,
+                db=db, tenant=fx.make_tenant_double(), _=fx.make_user_double(),
+            )
+
+        body = json.loads(response.body)
+        encontrado = next(o for o in body if o["id"] == str(order.id))
+        self.assertEqual(encontrado["qr_payment_instruction_mode"], "PAY_BEFORE_RECEIVING")
+
+    def test_list_orders_rama_paginada_refleja_la_modalidad_real_del_tenant(self):
+        db, order, _ = _seed(items=1)
+
+        response = _list_orders(db)  # mockea PAY_AFTER_RECEIVING (helper del módulo)
+
+        encontrado = next(o for o in response["items"] if o.id == order.id)
+        self.assertEqual(encontrado.qr_payment_instruction_mode, "PAY_AFTER_RECEIVING")
 
 
 if __name__ == "__main__":

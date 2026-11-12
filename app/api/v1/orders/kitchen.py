@@ -29,6 +29,7 @@ from app.api.v1.orders.consumption import (
     chosen_from_rows, deduct_order_items_naming_product, reverse_order_items,
 )
 from app.api.v1.catalog.line_pricing import load_valid_options
+from app.api.v1.plan import service as plan_service
 from app.api.v1.orders.schemas import VoidItemIn
 from app.models.dining_table import DiningTable
 from app.models.product import Product
@@ -99,11 +100,17 @@ def deliver_order(
     responden éxito, un único cambio de estado efectivo (FR-011/SC-006).
 
     - `status == 'cancelada'` → rechazo, transición inválida (FR-010).
-    - Spec 153 (FR-004/FR-006/FR-009): si el tenant tiene el módulo de Cocina
-      activo y el pedido es de mesa (`dining_table_id` no nulo), exige
-      `kitchen_status == 'LISTO'` → 409 `ORDER_NOT_READY` si no lo está. Sin
-      módulo activo, o sin mesa, no se añade ninguna validación nueva --
-      mismo comportamiento que antes de esta spec.
+    - Spec 153 (FR-004/FR-006/FR-009), extendido spec 157 (A-160, hallazgo
+      post-implementación): si el tenant tiene el módulo de Cocina activo,
+      exige `kitchen_status == 'LISTO'` → 409 `ORDER_NOT_READY` si no lo está
+      -- para cualquier pedido que pasa por el tablero de cocina, con o sin
+      mesa (`dining_table_id`). Antes de spec 157 esta exigencia era
+      exclusiva de pedidos de mesa porque TAKEAWAY/DELIVERY nunca llegaban
+      aquí con el módulo activo (`checkout_and_send` los despachaba directo
+      a `'entregada'`); ahora que también siguen su propio ciclo de cocina
+      (ver `checkout.checkout_and_send`), deben pasar por el mismo guard.
+      Sin módulo activo, no se añade ninguna validación nueva -- mismo
+      comportamiento que antes de esta spec.
     - `status == 'entregada'` → no es error: promueve cualquier ítem
       `'pendiente'` (nacido después de la primera entrega, FR-002a) a
       `'entregado'`; si no había ninguno, no-op exitoso sin emitir evento.
@@ -126,7 +133,6 @@ def deliver_order(
         )
     if (
         tenant is not None
-        and order.dining_table_id is not None
         and order.kitchen_status != "LISTO"
         and has_module_access(db, tenant, "cocina")
     ):
@@ -159,19 +165,45 @@ def deliver_order(
     return order
 
 
-def _apply_kitchen_send(order: CustomerOrder) -> bool:
-    """Transición compartida por `send_to_kitchen` (acción manual) y el envío
+def kitchen_requires_prior_payment(
+    db: Session, tenant: Tenant | None, order: CustomerOrder
+) -> bool:
+    """Regla central de negocio (spec 157, decisión `A-160`, research.md
+    Decisión 1/data-model.md) que decide si el envío a cocina de `order`
+    exige `payment_status == 'PAID'`. Para pedidos de mesa
+    (`dining_table_id is not None`, DINE_IN en la práctica) siempre exige
+    pago, sin cambios respecto a spec 153. Para TAKEAWAY/DELIVERY
+    (`dining_table_id is None`) depende de la modalidad de cobro del plan
+    (`Plan.modalidad_pago_qr`, spec 154, reutilizada fuera del menú QR):
+    `PAY_BEFORE_RECEIVING` sigue exigiendo pago previo; `PAY_AFTER_RECEIVING`
+    (o `tenant is None`, para no romper llamadores sin tenant resuelto) no lo
+    exige."""
+    if order.dining_table_id is not None:
+        return True
+    if tenant is None:
+        return False
+    return plan_service.get_qr_payment_instruction_mode(db, tenant) == "PAY_BEFORE_RECEIVING"
+
+
+def _apply_kitchen_send(order: CustomerOrder, *, requires_prior_payment: bool = True) -> bool:
+    """Transición compartida por `send_to_kitchen` (acción manual), el envío
     automático tras cobro de sesión de mesa (spec 153, FR-001/FR-002,
-    `table_sessions/service._charge_session`): `kitchen_status: NULL →
-    'SIN_PREPARAR'` + `sent_to_kitchen_at`, solo si `status != 'cancelada'`,
-    `kitchen_status IS NULL` (idempotencia) y `payment_status == 'PAID'` --
-    las mismas tres condiciones que ya valida `send_to_kitchen` una por una
-    para devolver el código de error correspondiente. No hace commit ni
-    emite evento: responsabilidad del caller. Devuelve `True` si transicionó."""
+    `table_sessions/service._charge_session`) y el envío automático tras
+    cobro de mostrador/domicilio (spec 157, `checkout.pay_order`):
+    `kitchen_status: NULL → 'SIN_PREPARAR'` + `sent_to_kitchen_at`, solo si
+    `status != 'cancelada'`, `kitchen_status IS NULL` (idempotencia) y (si
+    `requires_prior_payment` es `True`) `payment_status == 'PAID'` -- las
+    mismas condiciones que ya valida `send_to_kitchen` una por una para
+    devolver el código de error correspondiente. `requires_prior_payment`
+    por defecto es `True` para no alterar el comportamiento de los
+    llamadores existentes (`_charge_session`, DINE_IN); los llamadores de
+    spec 157 lo calculan con `kitchen_requires_prior_payment`. No hace
+    commit ni emite evento: responsabilidad del caller. Devuelve `True` si
+    transicionó."""
     if (
         order.status == "cancelada"
         or order.kitchen_status is not None
-        or order.payment_status != "PAID"
+        or (requires_prior_payment and order.payment_status != "PAID")
     ):
         return False
     order.kitchen_status = "SIN_PREPARAR"
@@ -179,7 +211,13 @@ def _apply_kitchen_send(order: CustomerOrder) -> bool:
     return True
 
 
-def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -> CustomerOrder:
+def send_to_kitchen(
+    db: Session,
+    order_id: UUID,
+    tenant_id: int | None = None,
+    *,
+    tenant: Tenant | None = None,
+) -> CustomerOrder:
     """Envía un pedido confirmado y pagado a la cola de preparación de cocina
     (spec 150, FR-001/FR-003/FR-004). `SELECT ... FOR UPDATE` serializa dos
     envíos casi simultáneos sobre el mismo pedido (doble clic o reintento de
@@ -193,7 +231,13 @@ def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -
     2. `status == 'cancelada'` (research.md Decisión 0: "orden confirmada" es
        cualquier pedido vivo) → 409 `ORDER_NOT_CONFIRMED`.
     3. `kitchen_status IS NOT NULL` → 409 `ALREADY_IN_KITCHEN`.
-    4. `payment_status != 'PAID'` → 409 `ORDER_NOT_PAID`.
+    4. `kitchen_requires_prior_payment(db, tenant, order)` (spec 157, `A-160`)
+       y `payment_status != 'PAID'` → 409 `ORDER_NOT_PAID`. Para pedidos de
+       mesa sigue exigiendo siempre `PAID` (sin cambios); para
+       TAKEAWAY/DELIVERY con el plan en `PAY_AFTER_RECEIVING` permite el
+       envío sin pago previo. `tenant` debe pasarse explícitamente para que
+       esta regla pueda leer la modalidad del plan — sin él, se asume que no
+       exige pago previo salvo pedidos de mesa.
     5. Éxito: `kitchen_status = 'SIN_PREPARAR'`, `sent_to_kitchen_at` con la
        hora del servidor, commit, emite `events.order_sent_to_kitchen`
        post-commit."""
@@ -211,10 +255,11 @@ def send_to_kitchen(db: Session, order_id: UUID, tenant_id: int | None = None) -
         )
     if order.kitchen_status is not None:
         raise ConflictError("El pedido ya está en la cola de cocina.", code="ALREADY_IN_KITCHEN")
-    if order.payment_status != "PAID":
+    requires_prior_payment = kitchen_requires_prior_payment(db, tenant, order)
+    if requires_prior_payment and order.payment_status != "PAID":
         raise ConflictError("El pedido no está pagado.", code="ORDER_NOT_PAID")
 
-    _apply_kitchen_send(order)
+    _apply_kitchen_send(order, requires_prior_payment=requires_prior_payment)
     try:
         db.commit()
     except Exception:

@@ -32,6 +32,7 @@ from app.api.v1.orders.consolidation import consolidate_table, add_item_to_order
 from app.api.v1.orders import kitchen
 from app.api.v1.orders import checkout
 from app.api.v1.orders import tables_advanced
+from app.api.v1.plan import service as plan_service
 from app.api.v1.table_sessions.service import notify_sessions_closed
 from app.api.v1.catalog.schemas import (
     OptionSelectionIn, UpdateAdditionQuantityIn, ToppingSelectionIn, UpdateToppingQuantityIn,
@@ -57,7 +58,7 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 _ORDERS_ADAPTER = TypeAdapter(list[OrderResponse])
 
 
-def _load_order(db: Session, order_id: UUID) -> CustomerOrder:
+def _load_order(db: Session, order_id: UUID, tenant: Tenant | None = None) -> CustomerOrder:
     order = db.execute(
         select(CustomerOrder)
         .options(
@@ -93,6 +94,14 @@ def _load_order(db: Session, order_id: UUID) -> CustomerOrder:
     # spec 121 (FR-001/FR-002): mismo total que `billing.total`, costo cero
     # (ya está calculado) -- disponible también donde `billing` sigue `null`.
     order.total = order.billing.total
+    # Spec 157 (contracts/kitchen-payment-modality.md §3): mismo cómputo que
+    # ya existía solo para el contexto QR_MENU (`cart/router.py`), extendido
+    # a las respuestas de staff para que el frontend decida si mostrar el
+    # botón manual "Enviar a cocina" -- sin persistirlo en la orden.
+    if tenant is not None:
+        order.qr_payment_instruction_mode = plan_service.get_qr_payment_instruction_mode(
+            db, tenant
+        )
     return order
 
 
@@ -446,7 +455,7 @@ def send_to_kitchen(
     módulo de plan `"cocina"` (gating ya existente desde spec 149, sin
     enforcement hasta ahora) -- a diferencia de `/receive` y `/deliver`, que
     solo exigen sesión autenticada."""
-    kitchen.send_to_kitchen(db, order_id, tenant_id=tenant.id)
+    kitchen.send_to_kitchen(db, order_id, tenant_id=tenant.id, tenant=tenant)
     return _load_order(db, order_id)
 
 
@@ -853,7 +862,12 @@ def checkout_and_send(
         # pedido `'entregada'` en la misma transacción (ver su comentario) --
         # avisa en tiempo real igual que `deliver_order` (kitchen.py) para
         # que la grilla de mesas/terminal no necesite un sondeo para verlo.
-        if order.dining_table_id is None:
+        # Spec 157 (A-160): con el módulo de Cocina activo, `checkout.
+        # checkout_and_send` ya NO auto-despacha a `'entregada'` -- deja esa
+        # decisión al ciclo de cocina, así que este evento solo se emite
+        # cuando el flag transitorio `auto_dispatched_now` confirma que el
+        # despacho automático de spec 147 sí ocurrió en esta llamada.
+        if getattr(order, "auto_dispatched_now", False):
             events.order_delivered(
                 tenant.id, order_id=order.id, table_session_id=order.table_session_id
             )
@@ -939,15 +953,23 @@ def create_order(
     return _load_order(db, order.id)
 
 
-def _decorate_orders(db: Session, orders: list[CustomerOrder]) -> None:
+def _decorate_orders(
+    db: Session, orders: list[CustomerOrder], tenant: Tenant | None = None,
+) -> None:
     """Asigna `paid` y `staff_user_name` en bloque sobre `orders` (spec 029 D2,
-    spec 076 Historia 4) — una consulta para todo el lote, no una por pedido."""
+    spec 076 Historia 4) — una consulta para todo el lote, no una por pedido.
+    Spec 157 (contracts §3): `qr_payment_instruction_mode` se calcula una
+    sola vez por tenant (no por pedido) y se replica sobre todo el lote."""
     paid_ids = service.paid_order_ids(db, [o.id for o in orders])
     staff_ids = [o.user_id for o in orders if o.user_id is not None]
     staff_names = service.staff_user_names(db, staff_ids)
+    modalidad = (
+        plan_service.get_qr_payment_instruction_mode(db, tenant) if tenant is not None else None
+    )
     for o in orders:
         o.paid = o.id in paid_ids
         o.staff_user_name = staff_names.get(o.user_id) if o.user_id is not None else None
+        o.qr_payment_instruction_mode = modalidad
 
 
 @router.get(
@@ -990,7 +1012,7 @@ def list_orders(
     solo aplican a esta rama — la rama sin paginar no los recibe."""
     if page is None and size is None:
         orders = service.list_orders(db, status_filter, active_sessions_only)
-        _decorate_orders(db, orders)
+        _decorate_orders(db, orders, tenant=tenant)
         return json_or_304(request, _ORDERS_ADAPTER, orders)
 
     # Rama paginada: `status` se valida contra el enum cerrado de 6 valores
@@ -1012,7 +1034,7 @@ def list_orders(
     effective_size = size or 20
     effective_page = service.clamp_page(db, stmt, page or 1, effective_size)
     result = paginate(db, stmt, effective_page, effective_size)
-    _decorate_orders(db, result["items"])
+    _decorate_orders(db, result["items"], tenant=tenant)
     # spec 121 (FR-001/FR-002): `total` en bloque, solo en esta rama paginada
     # -- la rama sin paginar (arriba, `service.list_orders`) no se toca.
     totales = service.order_totals(db, result["items"])
@@ -1022,8 +1044,11 @@ def list_orders(
 
 
 @router.get("/{order_id}", response_model=OrderResponse, summary="Obtener una comanda")
-def get_order(order_id: UUID, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return _load_order(db, order_id)
+def get_order(
+    order_id: UUID, db: Session = Depends(get_db), _: User = Depends(get_current_user),
+    tenant: Tenant = Depends(get_tenant),
+):
+    return _load_order(db, order_id, tenant=tenant)
 
 
 # `PATCH /{order_id}/status` se eliminó a propósito: asignaba cualquier estado sin
