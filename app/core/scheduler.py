@@ -223,13 +223,19 @@ def sweep_orphan_sessions() -> int:
 def expire_promotions() -> int:
     """Pasa a `finished` las promociones cuyo `ends_at` ya venció, en todos los
     tenants. `ends_at` se guarda en hora **local del tenant** (A-08, igual que
-    `_valid_now`), así que el corte también tiene que calcularse en esa misma
-    zona horaria por tenant -- comparar contra un único `now` en UTC corre el
-    job ~5h (o lo que sea el offset del tenant) antes de tiempo, y SÍ afecta la
-    vigencia real: `active_variant_set_rules` filtra `status == "active"` en
-    SQL antes de llamar a `_valid_now()`, así que una promoción marcada
-    `finished` de más deja de evaluarse aunque su `ends_at` siga vigente.
-    `finished` es terminal: para revivir una promoción se duplica."""
+    `_valid_now`), así que el corte también se calcula en esa misma zona
+    horaria por tenant (`now_local` abajo, vía `ZoneInfo(tz_name)`) -- eso
+    siempre fue correcto. Lo que SÍ tiene que acertar es *cuándo* se dispara
+    este job: `start_scheduler()` lo agenda con un `IntervalTrigger` corto (no
+    un `CronTrigger` de una sola hora fija) precisamente porque esa hora fija
+    se interpretaría en el timezone del servidor (UTC), no en el de cada
+    tenant -- con un disparo diario anclado a UTC, una promoción con
+    `ends_at` a una hora específica del día se marcaba `finished` hasta ~5h
+    antes de tiempo según el offset del tenant (A-128). `active_variant_set_rules`
+    filtra `status == "active"` en SQL antes de llamar a `_valid_now()`, así
+    que una promoción marcada `finished` de más deja de evaluarse aunque su
+    `ends_at` siga vigente. `finished` es terminal: para revivir una
+    promoción se duplica."""
     from sqlalchemy import update
     from app.models.promotion import Promotion
 
@@ -264,9 +270,16 @@ def expire_promotions() -> int:
 
 
 async def _run_expire_promotions_with_lock() -> None:
-    """Igual patrón que `_run_with_lock`: un solo worker corre el job por ciclo."""
+    """Igual patrón que `_run_with_lock`: un solo worker corre el job por ciclo.
+
+    El TTL del lock tiene que ser menor que el intervalo del job (igual que
+    `_run_with_lock`) -- con un TTL fijo más largo que el ciclo (ej. la 1h que
+    tenía cuando este job era un `CronTrigger` diario), el lock sobrevive al
+    siguiente disparo y lo bloquea, dejando el job corriendo en la práctica
+    mucho más espaciado de lo que `PROMOTION_EXPIRE_INTERVAL_MINUTES` promete."""
+    ttl = max(int(settings.PROMOTION_EXPIRE_INTERVAL_MINUTES * 60 / 2), 30)
     try:
-        got = await redis.set(_PROMO_LOCK_KEY, "1", ex=3600, nx=True)
+        got = await redis.set(_PROMO_LOCK_KEY, "1", ex=ttl, nx=True)
     except Exception:
         logger.warning("Redis no disponible; se omite la expiración de promociones", exc_info=True)
         return
@@ -334,7 +347,14 @@ def start_scheduler():
     )
     scheduler.add_job(
         _run_expire_promotions_with_lock,
-        CronTrigger(hour=0, minute=0),
+        # `IntervalTrigger`, no `CronTrigger(hour=0, minute=0)`: una hora fija la
+        # interpreta el timezone del servidor (UTC), no el de cada tenant -- con un
+        # solo disparo diario, el corte llegaba hasta ~5h antes de tiempo según el
+        # offset del tenant (A-128). Con un intervalo corto, `now_local` (ya
+        # calculado por tenant dentro de `expire_promotions`) queda a lo sumo a
+        # `PROMOTION_EXPIRE_INTERVAL_MINUTES` del vencimiento real sin importar el
+        # offset ni si la promoción vence a una hora específica del día.
+        IntervalTrigger(minutes=settings.PROMOTION_EXPIRE_INTERVAL_MINUTES),
         id="expire_promotions",
         replace_existing=True,
         max_instances=1,

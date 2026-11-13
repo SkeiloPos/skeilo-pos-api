@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # Cada cuánto corre ese barrido.
     SESSION_SWEEP_INTERVAL_MINUTES:int = Field(default=15,env="SESSION_SWEEP_INTERVAL_MINUTES")
 
+    # Cada cuánto corre `expire_promotions` (app/core/scheduler.py). Un `CronTrigger`
+    # de una sola hora fija no sirve aquí: cada tenant vence en su propia zona
+    # horaria (A-08), y un disparo diario anclado a la hora del servidor (UTC)
+    # llega tarde o temprano según el offset de cada tenant. Con un intervalo corto
+    # el `now_local` por tenant (ya calculado correctamente con `ZoneInfo`) queda
+    # a lo sumo a este margen del vencimiento real, sin importar el offset ni si
+    # la promoción vence a una hora específica del día.
+    PROMOTION_EXPIRE_INTERVAL_MINUTES:int = Field(default=5,env="PROMOTION_EXPIRE_INTERVAL_MINUTES")
+
     # Rechazar con 422 las selecciones de opciones que violen min/max_select o que
     # usen un grupo no asignado al producto. Arranca en False porque el catálogo
     # histórico nunca se validó (correr `python -m app.scripts.opciones_fuera_de_grupo`

@@ -484,7 +484,7 @@ def compute_checkout_preview(
         discount=promo_discount,
         delivery_fee=delivery_fee,
         total=total,
-        promotion_evaluated_at=instant,
+        promotion_evaluated_at=instant.astimezone(resolve_timezone(tenant)),
     )
 
 
@@ -544,7 +544,7 @@ def compute_draft_preview(
         discount=promo_discount,
         delivery_fee=delivery_fee,
         total=total,
-        promotion_evaluated_at=now,
+        promotion_evaluated_at=now.astimezone(resolve_timezone(tenant)),
     )
 
 

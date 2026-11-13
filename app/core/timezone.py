@@ -38,6 +38,20 @@ def _serialize_utc(dt: datetime) -> str:
 UtcDatetime = Annotated[datetime, PlainSerializer(_serialize_utc, return_type=str)]
 
 
+def _serialize_as_received(dt: datetime) -> str:
+    """A diferencia de `_serialize_utc`, no fuerza UTC: respeta el offset que ya
+    traiga `dt`. Para campos donde el llamador convierte explícitamente a
+    `resolve_timezone(tenant)` antes de construir el modelo de respuesta (hoy
+    solo `promotion_evaluated_at` del preview de cobro, a pedido del usuario:
+    evita la confusión de ver siempre "+00:00" al leer la respuesta cruda)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+TenantLocalDatetime = Annotated[datetime, PlainSerializer(_serialize_as_received, return_type=str)]
+
+
 def local_day_bounds_utc(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
     """Medianoche local de `day` y del día siguiente, ambas en UTC naive —
     mismo tipo que las columnas `DateTime` que compara (FR-004)."""

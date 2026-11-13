@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.v1.catalog.schemas import OptionSelectionIn, ToppingSelectionIn
 from app.api.v1.sales.schemas import PaymentIn
 from app.core.schema_types import AssetRefIn, AssetUrl
-from app.core.timezone import UtcDatetime
+from app.core.timezone import TenantLocalDatetime, UtcDatetime
 from app.models.order_payment_attempt import RejectionReason
 
 
@@ -570,11 +570,13 @@ class CheckoutPreviewResponse(BaseModel):
     #: `max(0, subtotal - discount + delivery_fee)` — misma fórmula que
     #: `build_sale` (research.md D6).
     total: Decimal
-    #: Instante contra el que se evaluó la vigencia temporal de las promociones
-    #: (aware UTC). En `checkout-preview` es el instante congelado del pedido (o
-    #: la hora de la llamada para pedidos anteriores a esta spec); en
-    #: `draft-preview` es siempre la hora de la llamada (FR-008).
-    promotion_evaluated_at: UtcDatetime
+    #: Instante contra el que se evaluó la vigencia temporal de las promociones,
+    #: convertido a la zona horaria del tenant (offset local, no "+00:00") para
+    #: que no se confunda con una evaluación desfasada al leerlo crudo. En
+    #: `checkout-preview` es el instante congelado del pedido (o la hora de la
+    #: llamada para pedidos anteriores a esta spec); en `draft-preview` es
+    #: siempre la hora de la llamada (FR-008).
+    promotion_evaluated_at: TenantLocalDatetime
 
 
 class DraftPreviewIn(BaseModel):
