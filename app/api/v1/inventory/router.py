@@ -33,6 +33,8 @@ from app.api.v1.inventory.schemas import (
     SupplierItemCreate, SupplierItemUpdate, SupplierItemResponse,
     PurchaseCreate, PurchaseOrderCreate, PurchaseResponse, PurchaseReceiveIn,
     LowStockResponse, InventoryImportJobResponse,
+    SuggestedPurchaseLineResponse, GenerateSuggestedPurchasesRequest,
+    GenerateSuggestedPurchasesResponse,
 )
 
 router = APIRouter(
@@ -479,6 +481,38 @@ def update_supplier_item(
 # ============================ Compras ============================
 # Spec 141 (A-150): Compras ya no tiene un gate propio; las gobierna el del router
 # (`inventario`), igual que Proveedores.
+@router.get(
+    "/purchases/suggested", response_model=Page[SuggestedPurchaseLineResponse],
+    summary="Listar compra sugerida (insumos en o bajo su mínimo) — spec 158",
+)
+def list_suggested_purchases(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    return service.generate_suggested_purchase_lines(db, page, size)
+
+
+@router.post(
+    "/purchases/suggested/generate", response_model=GenerateSuggestedPurchasesResponse,
+    summary="Generar órdenes de compra agrupadas por proveedor desde la compra sugerida — spec 158",
+)
+def generate_suggested_purchases(
+    body: GenerateSuggestedPurchasesRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_tenant_admin),
+):
+    purchases, was_created = service.generate_suggested_purchases(
+        db, body.idempotency_key, body.lines,
+    )
+    for p in purchases:
+        supplier_items.attach_conversion_factors(db, p.items)
+    response.status_code = status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
+    return GenerateSuggestedPurchasesResponse(purchases=purchases)
+
+
 @router.get(
     "/purchases", response_model=Page[PurchaseResponse], summary="Listar compras",
 )

@@ -23,16 +23,19 @@ from sqlalchemy.sql import Select
 from app.core.crud import get_or_404
 from app.core.timezone import utc_now_naive
 from app.core import units
+from app.core.pagination import paginate
 from app.models.inventory_item import InventoryItem
 from app.models.inventory_import_job import InventoryImportJob
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
 from app.models.unit_measure import UnitMeasure
 from app.models.purchase import Purchase, PurchaseItem
+from app.models.purchase_generation_request import PurchaseGenerationRequest
 from app.api.v1.inventory import supplier_items
 from app.api.v1.inventory.stock import record_movement
 from app.api.v1.inventory.schemas import (
     PurchaseCreate, PurchaseItemIn, PurchaseOrderCreate, PurchaseOrderItemIn, PurchaseReceiveIn,
+    SuggestedPurchaseLineResponse, SuggestedPurchaseLineIn,
 )
 from app.core import inventory_reasons as reasons
 
@@ -159,6 +162,7 @@ def resolve_or_create_by_code(
 
 def _resolve_purchase_line(
     db: Session, purchase: Purchase, it: PurchaseItemIn, tenant,
+    update_supplier_cost: bool = True,
 ) -> tuple[PurchaseItem, Decimal, InventoryItem]:
     """Resuelve una línea de alta directa u orden: si trae `supplier_item_id`, calcula
     `quantity`/`unit_cost` en unidad base a partir de la presentación (spec 106/107,
@@ -167,7 +171,13 @@ def _resolve_purchase_line(
     conversión hacia la unidad base del insumo (spec 134, FR-008); si no trae ninguno de los
     dos, se comporta exactamente igual que antes de esta spec (FR-007). Devuelve el
     `PurchaseItem` sin persistir todavía, el total de la línea con los valores originales
-    (FR-005), y el `InventoryItem` ya cargado."""
+    (FR-005), y el `InventoryItem` ya cargado.
+
+    `update_supplier_cost` (spec 158, research.md D5): si es `False`, no actualiza
+    `SupplierItem.last_cost` aunque la línea traiga `supplier_item_id` -- usado por la
+    generación de compra sugerida (FR-007), donde el precio editado en pantalla no debe
+    persistir como costo de referencia del proveedor. Default `True` preserva el
+    comportamiento de todo llamador existente."""
     item = get_or_404(db, InventoryItem, it.inventory_item_id, "Inventory item not found")
 
     if it.supplier_item_id is not None:
@@ -218,7 +228,8 @@ def _resolve_purchase_line(
             quantity_base=quantity,
             cost_base=unit_cost,
         )
-        supplier_items.apply_purchase_cost(db, relation, it.presentation_unit_cost)
+        if update_supplier_cost:
+            supplier_items.apply_purchase_cost(db, relation, it.presentation_unit_cost)
     elif it.unit_measure_id is not None:
         chosen_unit = get_or_404(db, UnitMeasure, it.unit_measure_id, "Unit measure not found")
         if not chosen_unit.active:
@@ -411,6 +422,38 @@ def _fill_incomplete_line_defaults(it: PurchaseOrderItemIn) -> PurchaseItemIn | 
     )
 
 
+def _build_purchase_order(
+    db: Session, data: PurchaseOrderCreate, user_id: UUID | None, tenant=None,
+    update_supplier_cost: bool = True,
+) -> Purchase:
+    """Variante no-commiteadora de `create_purchase_order` (spec 158, research.md D5):
+    construye la `Purchase`+`PurchaseItem[]` en `draft` sin llamar a `db.commit()` -- el
+    llamador decide cuándo cerrar la transacción (necesario para generar N órdenes, una por
+    proveedor, dentro de una sola transacción todo-o-nada, FR-009). `create_purchase_order()`
+    sigue comiteando ella misma, pasando `update_supplier_cost=True` (comportamiento idéntico,
+    cero cambios observables)."""
+    if data.supplier_id is not None:
+        get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
+    purchase = Purchase(
+        supplier_id=data.supplier_id, invoice_number=data.invoice_number,
+        user_id=user_id, status="draft", is_incomplete=data.allow_incomplete,
+        total=Decimal("0"),
+    )
+    db.add(purchase)
+    db.flush()
+    total = Decimal("0")
+    for it in data.items:
+        line = _fill_incomplete_line_defaults(it) if data.allow_incomplete else it
+        purchase_item, line_total, _item = _resolve_purchase_line(
+            db, purchase, line, tenant, update_supplier_cost=update_supplier_cost,
+        )
+        purchase_item.received_quantity = Decimal("0")
+        db.add(purchase_item)
+        total += line_total
+    purchase.total = total
+    return purchase
+
+
 def create_purchase_order(
     db: Session, data: PurchaseOrderCreate, user_id: UUID | None, tenant=None,
 ) -> Purchase:
@@ -421,24 +464,8 @@ def create_purchase_order(
     la captura aunque no tenga ninguna línea o traiga líneas sin cantidad/costo/unidad --
     `PurchaseOrderCreate` ya validó que esto solo ocurre cuando se pidió explícitamente
     (`allow_incomplete`); `False`/ausente conserva el comportamiento actual (User Story 2)."""
-    if data.supplier_id is not None:
-        get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
     try:
-        purchase = Purchase(
-            supplier_id=data.supplier_id, invoice_number=data.invoice_number,
-            user_id=user_id, status="draft", is_incomplete=data.allow_incomplete,
-            total=Decimal("0"),
-        )
-        db.add(purchase)
-        db.flush()
-        total = Decimal("0")
-        for it in data.items:
-            line = _fill_incomplete_line_defaults(it) if data.allow_incomplete else it
-            purchase_item, line_total, _item = _resolve_purchase_line(db, purchase, line, tenant)
-            purchase_item.received_quantity = Decimal("0")
-            db.add(purchase_item)
-            total += line_total
-        purchase.total = total
+        purchase = _build_purchase_order(db, data, user_id, tenant, update_supplier_cost=True)
         db.commit()
     except HTTPException:
         db.rollback(); raise
@@ -598,3 +625,199 @@ def void_purchase(db: Session, purchase_id: UUID, user_id: UUID | None) -> Purch
         db.rollback(); logger.exception("Error anulando compra"); raise
     db.refresh(purchase)
     return purchase
+
+
+# ---------- Compra sugerida (spec 158) ----------
+def generate_suggested_purchase_lines(db: Session, page: int, size: int) -> dict:
+    """US1: insumos activos en o bajo su mínimo, paginados y ordenados por déficit
+    descendente (clarificación 3 del spec), con su proveedor preferido precargado
+    (T009/research.md D4). `is_preselected` exige `supplier_item_id`,
+    `purchase_unit_label` y `unit_price > 0` completos (FR-005/FR-006); si falta algo,
+    `missing_supplier_reason` explica qué hace falta."""
+    deficit = InventoryItem.min_stock - InventoryItem.current_stock
+    stmt = (
+        select(InventoryItem)
+        .where(
+            InventoryItem.active.is_(True),
+            InventoryItem.current_stock <= InventoryItem.min_stock,
+        )
+        .order_by(deficit.desc())
+    )
+    result = paginate(db, stmt, page, size)
+    items: list[InventoryItem] = result["items"]
+
+    relations_by_item = supplier_items.suggested_purchase_relations_by_item(
+        db, [item.id for item in items]
+    )
+    unit_measure_ids = {item.unit_measure_id for item in items}
+    base_unit_by_id = (
+        {
+            u.id: u for u in db.execute(
+                select(UnitMeasure).where(UnitMeasure.id.in_(unit_measure_ids))
+            ).scalars().all()
+        }
+        if unit_measure_ids else {}
+    )
+
+    lines: list[SuggestedPurchaseLineResponse] = []
+    for item in items:
+        relation = relations_by_item.get(item.id)
+        supplier_item_id = relation["supplier_item_id"] if relation else None
+        purchase_unit_label = relation["purchase_unit_label"] if relation else None
+        conversion_factor = relation["conversion_factor"] if relation else None
+        unit_price = relation["unit_price"] if relation else None
+        # Muchas relaciones preferidas vienen de import/alta manual sin `last_cost` propio
+        # (nunca se compró por este sistema con ESE proveedor); en ese caso se precarga un
+        # precio de referencia a partir del último costo de compra conocido del insumo
+        # (`InventoryItem.unit_cost`, en unidad base) convertido a la presentación de la
+        # relación -- mejor punto de partida que mostrar 0, igual se puede editar en pantalla.
+        if (
+            (not unit_price or unit_price <= 0)
+            and conversion_factor
+            and item.unit_cost
+            and item.unit_cost > 0
+        ):
+            unit_price = (item.unit_cost * conversion_factor).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP,
+            )
+        is_preselected = bool(
+            supplier_item_id and purchase_unit_label and unit_price and unit_price > 0
+        )
+        if is_preselected:
+            missing_supplier_reason = None
+        elif not supplier_item_id:
+            missing_supplier_reason = "Sin proveedor configurado. Elige uno."
+        else:
+            missing_supplier_reason = "Sin precio de compra registrado. Ingresa uno para incluir este insumo."
+        base_unit = base_unit_by_id.get(item.unit_measure_id)
+        lines.append(SuggestedPurchaseLineResponse(
+            inventory_item_id=item.id,
+            code=item.code,
+            name=item.name,
+            current_stock=item.current_stock,
+            min_stock=item.min_stock,
+            deficit=item.min_stock - item.current_stock,
+            base_unit_abbreviation=base_unit.abbreviation if base_unit else "",
+            supplier_item_id=supplier_item_id,
+            supplier_id=relation["supplier_id"] if relation else None,
+            supplier_name=relation["supplier_name"] if relation else None,
+            purchase_unit_label=purchase_unit_label,
+            conversion_factor=conversion_factor,
+            unit_price=unit_price,
+            suggested_quantity=Decimal("1"),
+            is_preselected=is_preselected,
+            missing_supplier_reason=missing_supplier_reason,
+        ))
+    result["items"] = lines
+    return result
+
+
+def generate_suggested_purchases(
+    db: Session, idempotency_key: str, lines: list[SuggestedPurchaseLineIn],
+) -> tuple[list[Purchase], bool]:
+    """US2 (FR-008/FR-009/FR-010/FR-011/FR-012, research.md D5/D6): genera, en una sola
+    transacción, una `Purchase` en `draft` por cada proveedor distinto entre `lines`.
+
+    Devuelve `(purchases, was_created)`: `was_created=False` cuando `idempotency_key` ya
+    se había procesado (se devuelven las mismas `Purchase`, sin revalidar ni crear nada
+    nuevo, FR-010/SC-005). Si cualquier línea falla la revalidación de servidor, no se crea
+    ninguna `Purchase` y se lanza `HTTPException(422, detail={...})` con el detalle de la
+    línea/motivo (FR-011/FR-012). Ante cualquier excepción durante la creación, revierte la
+    transacción completa sin insertar la fila de idempotencia, para que un reintento con la
+    misma clave sí vuelva a intentarlo (FR-009)."""
+    existing = db.execute(
+        select(PurchaseGenerationRequest).where(
+            PurchaseGenerationRequest.idempotency_key == idempotency_key
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        purchase_ids = [UUID(str(pid)) for pid in existing.purchase_ids]
+        purchases = db.execute(
+            select(Purchase).where(Purchase.id.in_(purchase_ids))
+        ).scalars().all()
+        by_id = {p.id: p for p in purchases}
+        return [by_id[pid] for pid in purchase_ids if pid in by_id], False
+
+    errors: list[dict] = []
+    relations: dict[UUID, SupplierItem] = {}
+    for line in lines:
+        relation = db.execute(
+            select(SupplierItem).where(SupplierItem.id == line.supplier_item_id)
+        ).scalar_one_or_none()
+        if relation is None:
+            errors.append({
+                "inventory_item_id": str(line.inventory_item_id),
+                "reason": "supplier_item_not_found",
+            })
+            continue
+        if not relation.active:
+            errors.append({
+                "inventory_item_id": str(line.inventory_item_id),
+                "reason": "supplier_item_inactive",
+            })
+            continue
+        if relation.effective_conversion_factor is None:
+            errors.append({
+                "inventory_item_id": str(line.inventory_item_id),
+                "reason": "supplier_item_inactive",
+            })
+            continue
+        if line.presentation_quantity < 1:
+            errors.append({
+                "inventory_item_id": str(line.inventory_item_id),
+                "reason": "quantity_below_minimum",
+            })
+            continue
+        if line.presentation_unit_cost <= 0:
+            errors.append({
+                "inventory_item_id": str(line.inventory_item_id),
+                "reason": "unit_price_zero",
+            })
+            continue
+        relations[line.inventory_item_id] = relation
+
+    if errors:
+        raise HTTPException(422, {
+            "message": "No se pudo generar la compra sugerida",
+            "lines": errors,
+        })
+
+    lines_by_supplier: dict[UUID, list[SuggestedPurchaseLineIn]] = {}
+    for line in lines:
+        relation = relations[line.inventory_item_id]
+        lines_by_supplier.setdefault(relation.supplier_id, []).append(line)
+
+    try:
+        purchases: list[Purchase] = []
+        for supplier_id, group_lines in lines_by_supplier.items():
+            order_items = [
+                PurchaseOrderItemIn(
+                    inventory_item_id=line.inventory_item_id,
+                    supplier_item_id=line.supplier_item_id,
+                    presentation_quantity=line.presentation_quantity,
+                    presentation_unit_cost=line.presentation_unit_cost,
+                )
+                for line in group_lines
+            ]
+            order = PurchaseOrderCreate(supplier_id=supplier_id, items=order_items)
+            purchase = _build_purchase_order(db, order, user_id=None, update_supplier_cost=False)
+            purchases.append(purchase)
+
+        db.flush()
+        generation_request = PurchaseGenerationRequest(
+            idempotency_key=idempotency_key,
+            purchase_ids=[str(p.id) for p in purchases],
+        )
+        db.add(generation_request)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("Error generando compra sugerida")
+        raise
+
+    for purchase in purchases:
+        db.refresh(purchase)
+    return purchases, True

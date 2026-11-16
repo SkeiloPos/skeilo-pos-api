@@ -398,6 +398,49 @@ def preferred_relations_by_item(db: Session, item_ids) -> dict[UUID, dict]:
     }
 
 
+def suggested_purchase_relations_by_item(db: Session, item_ids) -> dict[UUID, dict]:
+    """spec 158: extiende `preferred_relations_by_item` con `supplier_item_id`/`supplier_id`
+    (FR-002/FR-004) -- el listado de compra sugerida necesita poder devolver la relación
+    preferida elegida (para agrupar por proveedor al generar), no solo mostrarla. Misma
+    consulta por lote y mismos valores efectivos de presentación/factor, sin duplicar esa
+    lógica."""
+    item_ids = list(item_ids)
+    if not item_ids:
+        return {}
+    rows = db.execute(
+        select(
+            SupplierItem.inventory_item_id,
+            SupplierItem.id,
+            SupplierItem.supplier_id,
+            Supplier.name,
+            func.coalesce(UnitMeasure.name, SupplierItem.presentation),
+            func.coalesce(UnitMeasure.factor_to_base, SupplierItem.conversion_factor),
+            SupplierItem.last_cost,
+        )
+        .join(Supplier, Supplier.id == SupplierItem.supplier_id)
+        .outerjoin(UnitMeasure, UnitMeasure.id == SupplierItem.unit_measure_id)
+        .where(
+            SupplierItem.inventory_item_id.in_(item_ids),
+            SupplierItem.preferred.is_(True),
+            SupplierItem.active.is_(True),
+        )
+    ).all()
+    return {
+        item_id: {
+            "supplier_item_id": supplier_item_id,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "purchase_unit_label": presentation,
+            "conversion_factor": conversion_factor,
+            "unit_price": last_cost,
+        }
+        for (
+            item_id, supplier_item_id, supplier_id, supplier_name,
+            presentation, conversion_factor, last_cost,
+        ) in rows
+    }
+
+
 def attach_conversion_factors(db: Session, purchase_items) -> None:
     """spec 107: fija `item.conversion_factor` (atributo transitorio, no una columna de
     PurchaseItem) en cada línea de compra cuyo `supplier_item_id` no sea NULL -- lo necesita la
