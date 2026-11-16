@@ -28,6 +28,8 @@ from app.api.v1.auth.schemas import (
     ResetPasswordRequest,
 )
 from app.core.redis import add_jti_to_blocklist
+from app.models.user_session import UserSession
+from app.services.admin_audit_log_service import AdminAuditLogService
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,68 @@ def _dispatch_password_changed_email(user: User, when) -> None:
             user.email,
             exc_info=True,
         )
+
+
+def _client_ip(req: Request) -> str | None:
+    """IP de origen del login, para `UserSession.ip_address` (spec 159,
+    research.md Decisión 5) y para la bitácora del bloqueo automático. `req`
+    puede ser un doble de test sin atributo `client` (p. ej.
+    `test_auth_session_name_claim.py`), de ahí el `getattr` defensivo."""
+    client = getattr(req, "client", None)
+    return client.host if client else None
+
+
+def _parse_device_info(user_agent: str | None) -> tuple[str | None, str | None]:
+    """Heurística mínima sobre el `User-Agent` (sin dependencia nueva, spec
+    159/Principio IX): solo lo suficiente para mostrar algo útil como
+    "Chrome en Windows" en la pestaña de Seguridad -- no pretende ser un
+    parser completo de user agents."""
+    if not user_agent:
+        return None, None
+
+    ua = user_agent.lower()
+    if "edg/" in ua:
+        browser = "Edge"
+    elif "chrome/" in ua and "chromium" not in ua:
+        browser = "Chrome"
+    elif "firefox/" in ua:
+        browser = "Firefox"
+    elif "safari/" in ua and "chrome/" not in ua:
+        browser = "Safari"
+    else:
+        browser = None
+
+    if "windows" in ua:
+        os_label = "Windows"
+    elif "mac os" in ua or "macintosh" in ua:
+        os_label = "macOS"
+    elif "android" in ua:
+        os_label = "Android"
+    elif "iphone" in ua or "ipad" in ua:
+        os_label = "iOS"
+    elif "linux" in ua:
+        os_label = "Linux"
+    else:
+        os_label = None
+
+    if browser and os_label:
+        device_label = f"{browser} en {os_label}"
+    else:
+        device_label = browser or os_label
+
+    return device_label, browser
+
+
+def _login_lockout_scope(tenant_id) -> str:
+    """Clave de ámbito del contador de intentos fallidos: `"platform"` para
+    Super Admin (`tenant_id IS NULL`), o el id del tenant -- mismo criterio
+    de ámbito que ya usa `/auth/forgot-password` por tenant (research.md
+    Decisión 4)."""
+    return "platform" if tenant_id is None else str(tenant_id)
+
+
+def _login_lockout_key(tenant_id, email_normalized: str) -> str:
+    return f"rl:login:{_login_lockout_scope(tenant_id)}:{email_normalized}"
 
 
 def _build_reset_url(tenant: Tenant, raw_token: str) -> str:
@@ -208,6 +272,13 @@ async def login(body: LoginRequest, req: Request):
             # Validaciones dentro de la sesión para evitar objetos detached.
             logger.info(f"Usuario encontrado: {user.email if user else 'None'}")
             if not user or not verify_password(body.password, user.password_hash):
+                # spec 159, research.md Decisión 4: contador deslizante por
+                # (ámbito, correo) -- solo aplica cuando SÍ existe una cuenta
+                # con ese correo (no hay nada que bloquear si no existe). El
+                # 401 de esta respuesta no cambia en ningún caso; cruzar el
+                # umbral solo cambia estado interno para el intento siguiente.
+                if user is not None:
+                    await _register_failed_login_attempt(db, user, req)
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
                 )
@@ -216,6 +287,23 @@ async def login(body: LoginRequest, req: Request):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive"
                 )
+
+            # Login exitoso: reinicia el contador de intentos fallidos
+            # (research.md Decisión 4) y registra una sesión activa nueva
+            # (Decisión 5) -- el `sid` resultante se firma en ambos tokens.
+            await _reset_failed_login_counter(user, _login_lockout_key(
+                user.tenant_id, body.email.strip().lower()
+            ))
+
+            session_row = UserSession(user_id=user.id)
+            device_label, browser = _parse_device_info(req.headers.get("user-agent"))
+            session_row.device_label = device_label
+            session_row.browser = browser
+            session_row.ip_address = _client_ip(req)
+            db.add(session_row)
+            db.commit()
+            db.refresh(session_row)
+            session_id = str(session_row.id)
 
             user_data = {
                 "email": user.email,
@@ -239,8 +327,8 @@ async def login(body: LoginRequest, req: Request):
             detail="Database query error"
         )
 
-    access_token = create_access_token(user_data)
-    refresh_token = create_access_token(user_data, refresh=True)
+    access_token = create_access_token(user_data, sid=session_id)
+    refresh_token = create_access_token(user_data, refresh=True, sid=session_id)
 
     return JSONResponse(
         content={
@@ -250,6 +338,55 @@ async def login(body: LoginRequest, req: Request):
             "user": user_data,
         }
     )
+
+
+async def _register_failed_login_attempt(db: Session, user: User, req: Request) -> None:
+    """spec 159, research.md Decisión 4: incrementa el snapshot persistido y,
+    al cruzar el umbral configurado (ventana deslizante en Redis, mismo
+    mecanismo que `/auth/forgot-password`), bloquea la cuenta por seguridad.
+    `enforce_sliding_window` es fail-open: si Redis no responde, nunca se
+    bloquea una cuenta por un intento que no se pudo contar."""
+    if user.status == "anonymized":
+        return
+
+    user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+
+    key = _login_lockout_key(user.tenant_id, user.email.strip().lower())
+    already_over_threshold = await enforce_sliding_window(
+        key, settings.LOGIN_LOCKOUT_MAX_ATTEMPTS, settings.LOGIN_LOCKOUT_WINDOW_SECONDS
+    )
+
+    if already_over_threshold and user.status != "blocked_security":
+        user.status = "blocked_security"
+        user.active = False
+        user.security_blocked_at = utc_now_naive()
+        AdminAuditLogService.record(
+            db,
+            actor_type="system",
+            actor_user=None,
+            affected_user=user,
+            tenant_id=user.tenant_id,
+            action="blocked_security",
+            detail={"intentos_fallidos": user.failed_login_attempts},
+            ip_address=_client_ip(req),
+        )
+
+    db.commit()
+
+
+async def _reset_failed_login_counter(user: User, redis_key: str) -> None:
+    """Reinicia el conteo tras un login exitoso o un cambio de contraseña
+    (research.md Decisión 4). El campo persistido se limpia siempre (no
+    depende de Redis); borrar la clave de Redis es una limpieza best-effort
+    (fail-open, igual criterio que `enforce_sliding_window`)."""
+    if user.failed_login_attempts:
+        user.failed_login_attempts = 0
+    try:
+        from app.core.redis import token_blocklist as _redis
+
+        await _redis.delete(redis_key)
+    except Exception:
+        logger.warning("No se pudo limpiar el contador de intentos fallidos en Redis", exc_info=True)
 
 
 @auth_router.post("/forgot-password")
@@ -368,6 +505,7 @@ def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_shared_
     user.password_hash = generate_passwd_hash(body.new_password)
     user.must_change_password = False  # mismo criterio que RN-AUTH-02
     user.tokens_valid_after = now  # cierra TODAS las sesiones de la cuenta (FR-009)
+    user.failed_login_attempts = 0  # research.md Decisión 4: un cambio de contraseña reinicia el conteo
     row.used_at = now  # consumido — un segundo POST con el mismo enlace ve reason="used"
     db.commit()
 
@@ -402,6 +540,7 @@ def change_password(
     # 200, obteniendo tokens acuñados después de este corte (research.md
     # Decisión 1) — el backend no distingue jtis, solo corta por tiempo.
     user.tokens_valid_after = now
+    user.failed_login_attempts = 0  # research.md Decisión 4: un cambio de contraseña reinicia el conteo
     db.commit()
 
     _dispatch_password_changed_email(user, now)
@@ -441,6 +580,27 @@ async def get_new_access_token(
 
     _reject_if_session_revoked(user, token_details)
 
+    # spec 159, research.md Decisión 5: un refresh token acuñado antes de
+    # este cambio no lleva `sid` -- se trata como vigente (compatibilidad
+    # retroactiva, data-model.md § UserSession). Mismo contrato/código ya
+    # usado para una sesión cerrada por `tokens_valid_after`.
+    sid = token_details.get("sid")
+    session_row = None
+    if sid is not None:
+        try:
+            session_row = db.get(UserSession, uuid.UUID(str(sid)))
+        except (ValueError, TypeError):
+            session_row = None
+        if session_row is not None and session_row.revoked_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+            )
+
+    if session_row is not None:
+        session_row.last_seen_at = utc_now_naive()
+        db.commit()
+
     user_data = {
         "email": user.email,
         "name": user.name,
@@ -451,13 +611,30 @@ async def get_new_access_token(
         "must_change_password": user.must_change_password,
     }
 
-    return JSONResponse(content={"access_token": create_access_token(user_data)})
+    return JSONResponse(content={"access_token": create_access_token(user_data, sid=sid)})
 
 @auth_router.get("/logout")
-async def revoke_token(token_details: dict = Depends(AccessTokenBearer())):
+async def revoke_token(
+    token_details: dict = Depends(AccessTokenBearer()),
+    db: Session = Depends(get_shared_db),
+):
     jti = token_details["jti"]
 
     await add_jti_to_blocklist(jti, token_details.get("exp"))
+
+    # spec 159, research.md Decisión 5: además del blocklist de `jti` (sin
+    # cambios), marca revocada la `UserSession` de este login si el token
+    # lleva `sid` -- tokens acuñados antes de este cambio no lo llevan y
+    # siguen cerrando sesión solo vía blocklist, como antes.
+    sid = token_details.get("sid")
+    if sid is not None:
+        try:
+            session_row = db.get(UserSession, uuid.UUID(str(sid)))
+        except (ValueError, TypeError):
+            session_row = None
+        if session_row is not None and session_row.revoked_at is None:
+            session_row.revoked_at = utc_now_naive()
+            db.commit()
 
     return JSONResponse(
         content={"message": "Logged Out Successfully"}, status_code=status.HTTP_200_OK

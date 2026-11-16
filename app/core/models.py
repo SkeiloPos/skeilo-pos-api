@@ -105,6 +105,11 @@ class Tenant(Base,TimestampMixin):
         "unit_conversion_enabled", Boolean, nullable=False, server_default="true", default=True
     )
 
+    # Estado mínimo de solo lectura (spec 159, research.md Decisión 9) — exclusivamente para
+    # reflejar en la ficha de usuario si uno de sus negocios está suspendido. Sin pantalla de
+    # administración propia en esta spec (fuera de alcance del módulo de Tenants, spec 033).
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="active")
+
     users: Mapped[list["User"]] = relationship(
             back_populates="tenant",
             cascade="all, delete-orphan"
@@ -153,8 +158,26 @@ class User(UUIDPrimaryKeyMixin,TimestampMixin,Base):
     # primer cambio de contraseña bajo esta spec — no afecta cuentas existentes.
     tokens_valid_after:Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, default=None)
 
+    # Estado enriquecido (spec 159, research.md Decisión 2). `active` (arriba)
+    # sigue siendo el único campo que lee `core/dependencies.py` — este módulo
+    # lo escribe siempre en conjunto con `status`, nunca lo reemplaza.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="active")
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    suspended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    suspended_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    security_blocked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    failed_login_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    anonymized_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    memberships: Mapped[List["TenantMembership"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    sessions: Mapped[List["UserSession"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
     role_id: Mapped[UUID] = mapped_column(ForeignKey("shared.roles.id"))
-    
+
     role:Mapped[Optional["Role"]] = relationship(back_populates="users")
     
     tenant_id: Mapped[int] = mapped_column(

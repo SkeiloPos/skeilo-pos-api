@@ -39,7 +39,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
-from app.core.models import Base, Role, Tenant, User
+from app.core.models import Base, PasswordResetToken, Role, Tenant, User, UserInvitation
 from app.core.plan_limits import calculate_plan_vencimiento
 from app.core.timezone import utc_now
 from app.core.utils import generate_passwd_hash
@@ -48,6 +48,9 @@ from app.models.dining_table import DiningTable
 from app.models.payment import PaymentMethod
 from app.models.plan import Plan
 from app.models.product import Product
+from app.models.tenant_membership import TenantMembership
+from app.models.user_session import UserSession
+from app.models.admin_audit_log import AdminAuditLog
 
 _TABLE_NAMES = [
     "tenants",
@@ -60,6 +63,11 @@ _TABLE_NAMES = [
     "products",
     "product_toppings",
     "payment_methods",
+    # spec 159: gestión global de usuarios (Super Admin).
+    "tenant_memberships",
+    "user_sessions",
+    "admin_audit_logs",
+    "password_reset_tokens",
 ]
 
 
@@ -169,6 +177,42 @@ def make_user(db: Session, tenant: Tenant, role: Optional[Role] = None, **kw) ->
     db.add(user)
     db.flush()
     return user
+
+
+def make_user_invitation(db: Session, tenant: Tenant, role: Optional[Role] = None, **kw) -> UserInvitation:
+    """spec 159, research.md Decisión 3: fila mínima de `UserInvitation`
+    pendiente, para los tests del listado unificado de Usuarios."""
+    if role is None:
+        role = make_role(db, kw.pop("role_name", "ADMIN"))
+    kw.setdefault("name", f"invitado-{uuid.uuid4()}")
+    kw.setdefault("email", f"invitado-{uuid.uuid4()}@example.invalid")
+    kw.setdefault("password_hash", generate_passwd_hash("x" * 10))
+    kw.setdefault("status", "pending")
+    invitation = UserInvitation(tenant_id=tenant.id, role_id=role.id, **kw)
+    db.add(invitation)
+    db.flush()
+    return invitation
+
+
+def make_tenant_membership(db: Session, user: User, tenant: Tenant, role: Optional[Role] = None, **kw) -> TenantMembership:
+    """spec 159, research.md Decisión 1."""
+    if role is None:
+        role = make_role(db, kw.pop("role_name", "ADMIN"))
+    membership = TenantMembership(user_id=user.id, tenant_id=tenant.id, role_id=role.id, **kw)
+    db.add(membership)
+    db.flush()
+    return membership
+
+
+def make_user_session(db: Session, user: User, **kw) -> UserSession:
+    """spec 159, research.md Decisión 5."""
+    kw.setdefault("device_label", "Chrome en Windows")
+    kw.setdefault("browser", "Chrome")
+    kw.setdefault("ip_address", "127.0.0.1")
+    session = UserSession(user_id=user.id, **kw)
+    db.add(session)
+    db.flush()
+    return session
 
 
 def make_dining_table(db: Session, **kw) -> DiningTable:
