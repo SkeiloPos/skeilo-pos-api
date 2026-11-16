@@ -358,6 +358,45 @@ class LowStockResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ---------- Compra sugerida (spec 158) ----------
+class SuggestedPurchaseLineResponse(BaseModel):
+    """Una fila de `GET /inventory/purchases/suggested` (ver data-model.md)."""
+    inventory_item_id: UUID
+    code: str
+    name: str
+    current_stock: Decimal
+    min_stock: Decimal
+    deficit: Decimal
+    base_unit_abbreviation: str
+    supplier_item_id: UUID | None = None
+    supplier_id: UUID | None = None
+    supplier_name: str | None = None
+    purchase_unit_label: str | None = None
+    conversion_factor: Decimal | None = None
+    unit_price: Decimal | None = None
+    suggested_quantity: Decimal = Decimal("1")
+    is_preselected: bool
+    missing_supplier_reason: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SuggestedPurchaseLineIn(BaseModel):
+    inventory_item_id: UUID
+    supplier_item_id: UUID
+    presentation_quantity: Decimal = Field(..., ge=1, max_digits=12, decimal_places=3)
+    presentation_unit_cost: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2)
+
+
+class GenerateSuggestedPurchasesRequest(BaseModel):
+    idempotency_key: str = Field(..., min_length=1, max_length=100)
+    lines: list[SuggestedPurchaseLineIn] = Field(..., min_length=1)
+
+
+class GenerateSuggestedPurchasesResponse(BaseModel):
+    purchases: list[PurchaseResponse] = Field(default_factory=list)
+
+
 # ---------- Importación masiva (spec 109) ----------
 class InventoryImportJobResponse(BaseModel):
     id: UUID

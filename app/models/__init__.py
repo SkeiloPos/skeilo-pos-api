@@ -22,6 +22,7 @@ from .inventory_import_job import InventoryImportJob
 from .supplier import Supplier
 from .supplier_item import SupplierItem
 from .purchase import Purchase, PurchaseItem
+from .purchase_generation_request import PurchaseGenerationRequest
 
 # Caja y conciliación
 from .cash_register import CashRegister
