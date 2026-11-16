@@ -26,8 +26,9 @@ API = "/api/v1"
 TABLA = {
     "inventario": (
         (f"{API}/inventory", f"{API}/unit-measures", f"{API}/unit-measure-groups"),
-        # /inventory 29 + /unit-measures 6 + /unit-measure-groups 6 + /reports/inventory 1 + /reports/profitability 1
-        43,
+        # /inventory 31 (spec 158: +2, compra sugerida) + /unit-measures 6 + /unit-measure-groups 6
+        # + /reports/inventory 1 + /reports/profitability 1
+        45,
     ),
     "promociones": ((f"{API}/promotions",), 7),
     # spec 150: primer punto real de enforcement de `cocina_access` (spec 149
@@ -42,7 +43,7 @@ TABLA = {
 REPORTES_DE_INVENTARIO = (f"{API}/reports/inventory", f"{API}/reports/profitability")
 
 #: Conteo por prefijo dentro de `inventario` (columna «Rutas» del contrato).
-CONTEO_INVENTORY = 29
+CONTEO_INVENTORY = 31
 CONTEO_UNIT_MEASURES = 6
 CONTEO_UNIT_MEASURE_GROUPS = 6
 
