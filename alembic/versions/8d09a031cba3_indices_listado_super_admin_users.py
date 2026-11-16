@@ -1,6 +1,6 @@
 """spec 159: índices de shared.users para el listado del Super Admin
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: 8d09a031cba3
 Revises: 948742a050c7
 Create Date: 2026-11-16 00:00:05.000000
 
@@ -23,7 +23,7 @@ import sqlalchemy as sa
 from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
-revision: str = 'a1b2c3d4e5f6'
+revision: str = '8d09a031cba3'
 down_revision: Union[str, Sequence[str], None] = '948742a050c7'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
