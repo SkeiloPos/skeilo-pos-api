@@ -10,6 +10,7 @@ from app.core.db import find_tenant_by_host, get_db, get_tenant, with_db
 from app.core.models import User, Tenant
 from app.core.utils import decode_token
 from app.core.redis import token_in_blocklist
+from app.models.user_session import UserSession
 bearer_scheme = HTTPBearer()
 
 logger = logging.getLogger(__name__)
@@ -102,30 +103,52 @@ async def get_valid_token_data(
     return token_data
 
 
-def _reject_if_session_revoked(user: User, token_data: dict) -> None:
+def _reject_if_session_revoked(user: User, token_data: dict, db: Session = None) -> None:
     """Cierre de sesiones (spec 031, FR-009/FR-017): un JWT acuñado antes del
     último cambio de contraseña exitoso deja de aceptarse. Se evalúa **después**
     de la relectura por id + `active==True` de RN-AUTH-07/A-23, nunca en su
     lugar — el detalle es distinguible de "revocado por logout" y de
     "inactivo" (research.md Decisión 1).
     """
-    if user.tokens_valid_after is None:
+    if user.tokens_valid_after is not None:
+        iat = token_data.get("iat")
+        # `tokens_valid_after` es una columna DateTime naive que guarda un instante
+        # UTC (convención del proyecto, app/core/timezone.py::utc_now); `.timestamp()`
+        # sobre un naive lo interpretaría como hora local del servidor, no UTC.
+        # Se trunca a segundo entero porque PyJWT también trunca `iat` a segundo
+        # entero (`timegm(iat.utctimetuple())`): sin esto, un re-login del propio
+        # Flujo B que cae en el mismo segundo de reloj que el corte (carrera real,
+        # no solo de tests) generaría un `iat` truncado hacia abajo que compararía
+        # como "anterior" a un `tokens_valid_after` con fracción de segundo, y el
+        # backend rechazaría la sesión de origen que FR-017 exige preservar.
+        cutover = int(user.tokens_valid_after.replace(tzinfo=timezone.utc).timestamp())
+        if iat is not None and iat < cutover:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session revoked due to password change",
+            )
+
+    # spec 159, research.md Decisión 5: igual que `GET /auth/refresh-token`,
+    # un access token cuyo `sid` referencia una `UserSession` ya revocada
+    # (logout, o revocación individual/masiva desde el panel Super Admin)
+    # deja de aceptarse de inmediato en cualquier endpoint protegido, no solo
+    # al intentar refrescarlo. Mismo contrato/código que ya usa
+    # `tokens_valid_after` arriba. Un token sin `sid` (acuñado antes de este
+    # cambio) o sin `db` disponible se trata como vigente -- compatibilidad
+    # retroactiva, igual que en el endpoint de refresh.
+    if db is None:
         return
-    iat = token_data.get("iat")
-    # `tokens_valid_after` es una columna DateTime naive que guarda un instante
-    # UTC (convención del proyecto, app/core/timezone.py::utc_now); `.timestamp()`
-    # sobre un naive lo interpretaría como hora local del servidor, no UTC.
-    # Se trunca a segundo entero porque PyJWT también trunca `iat` a segundo
-    # entero (`timegm(iat.utctimetuple())`): sin esto, un re-login del propio
-    # Flujo B que cae en el mismo segundo de reloj que el corte (carrera real,
-    # no solo de tests) generaría un `iat` truncado hacia abajo que compararía
-    # como "anterior" a un `tokens_valid_after` con fracción de segundo, y el
-    # backend rechazaría la sesión de origen que FR-017 exige preservar.
-    cutover = int(user.tokens_valid_after.replace(tzinfo=timezone.utc).timestamp())
-    if iat is not None and iat < cutover:
+    sid = token_data.get("sid")
+    if sid is None:
+        return
+    try:
+        session_row = db.get(UserSession, uuid.UUID(str(sid)))
+    except (ValueError, TypeError):
+        return
+    if session_row is not None and session_row.revoked_at is not None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session revoked due to password change",
+            detail="Token has been revoked",
         )
 
 
@@ -245,7 +268,7 @@ def get_current_user(
             detail="User not found or inactive",
         )
 
-    _reject_if_session_revoked(user, token_data)
+    _reject_if_session_revoked(user, token_data, db)
 
     # spec 074 (research.md § 8): efecto colateral puro para
     # `OperationalLogMiddleware` — el actor ya está resuelto y validado aquí,
@@ -322,7 +345,7 @@ def get_authenticated_user(
             detail="User not found or inactive",
         )
 
-    _reject_if_session_revoked(user, token_data)
+    _reject_if_session_revoked(user, token_data, db)
 
     return user
 
@@ -353,6 +376,8 @@ def get_current_super_admin(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Super admin not found or inactive",
         )
+
+    _reject_if_session_revoked(user, token_data, db)
 
     # Contexto para observabilidad (spec 068): el middleware de errores de
     # super-admin lo usa para etiquetar los eventos de Sentry con quién

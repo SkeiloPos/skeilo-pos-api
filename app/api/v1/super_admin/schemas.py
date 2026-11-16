@@ -1,13 +1,218 @@
 from decimal import Decimal
 from enum import Enum
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import AliasPath, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.api.v1.sales.schemas import PaymentMethodType
+from app.core.pagination import Page
 from app.core.reserved_hosts import is_reserved_subdomain
 from app.core.timezone import UtcDatetime, validate_iana_timezone
+
+
+class UserStatus(str, Enum):
+    """Estados enriquecidos de `shared.users.status` (spec 159, research.md
+    Decisión 2) más `invitation_pending`, que no es un `status` real de
+    `User` sino la proyección de una `UserInvitation` pendiente en el
+    listado unificado (research.md Decisión 3)."""
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    BLOCKED_SECURITY = "blocked_security"
+    PENDING_ACTIVATION = "pending_activation"
+    INVITATION_PENDING = "invitation_pending"
+    ANONYMIZED = "anonymized"
+
+
+class MembershipItem(BaseModel):
+    """Una fila de `GET /super-admin/users/{id}/memberships` (FR-014)."""
+
+    tenant_id: int
+    tenant_name: str
+    tenant_status: Literal["active", "suspended"]
+    plan_name: Optional[str] = None
+    role_name: str
+    member_since: UtcDatetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserListItem(BaseModel):
+    """Una fila de `GET /super-admin/users` (listado unificado, FR-001 a
+    FR-007). Las filas con `status=invitation_pending` provienen de
+    `UserInvitation`, no de `User` (research.md Decisión 3)."""
+
+    id: UUID
+    name: Optional[str] = None
+    email: str
+    role_name: Optional[str] = None
+    status: UserStatus
+    memberships_count: int = 0
+    memberships_preview: Optional[str] = Field(
+        None, description="Nombre del primer negocio asociado; `null` si no tiene ninguno."
+    )
+    plan_name: Optional[str] = None
+    last_login_at: Optional[UtcDatetime] = None
+    is_inactive_recently: bool = False
+    created_at: UtcDatetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RoleOption(BaseModel):
+    """Catálogo de roles para el selector de filtro `role_id` del listado
+    (FR-005) -- roles son un catálogo global fijo (sembrado por migración),
+    no un recurso administrable desde este módulo."""
+
+    id: UUID
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserListPage(Page[UserListItem]):
+    """`Page[UserListItem]` + distinción de estados vacíos (FR-041):
+    `empty_reason="no_data"` cuando `total=0` sin ningún filtro activo,
+    `"no_results"` cuando `total=0` con búsqueda/filtros activos, `None`
+    cuando hay resultados."""
+
+    empty_reason: Optional[Literal["no_data", "no_results"]] = None
+
+
+class UserStats(BaseModel):
+    """`GET /super-admin/users/stats` (FR-008/FR-009). Cuenta filas reales de
+    `User` -- las invitaciones pendientes (research.md Decisión 3) no son un
+    usuario registrado todavía, así que no entran en `total`. `suspended`
+    cuenta únicamente `status='suspended'`; `blocked_security` es un estado
+    distinto (no es, literalmente, "suspendido") y no se mezcla aquí."""
+
+    total: int
+    active: int
+    suspended: int
+    new_this_month: int
+
+
+class UserDetail(BaseModel):
+    """`GET /super-admin/users/{id}` -- pestaña "información general" (FR-011)."""
+
+    id: UUID
+    name: str
+    email: str
+    status: UserStatus
+    created_at: UtcDatetime
+    last_login_at: Optional[UtcDatetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserSessionItem(BaseModel):
+    """Una fila de la pestaña "Seguridad" (FR-013/FR-028)."""
+
+    id: UUID
+    device_label: Optional[str] = None
+    browser: Optional[str] = None
+    ip_address: Optional[str] = None
+    created_at: UtcDatetime
+    last_seen_at: UtcDatetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserSecurity(BaseModel):
+    """`GET /super-admin/users/{id}/security` -- pestaña "seguridad"
+    (FR-013/FR-028/FR-029)."""
+
+    active_sessions: list[UserSessionItem] = Field(default_factory=list)
+    failed_login_attempts: int = 0
+    security_blocked_at: Optional[UtcDatetime] = None
+
+
+class UserUpdate(BaseModel):
+    """Body de `PATCH /super-admin/users/{id}` (FR-016/FR-017). Todos los
+    campos son opcionales -- el router solo aplica los que vinieron en el
+    request. `membership_tenant_id`/`membership_role_id` crean o actualizan
+    (upsert) la fila de `TenantMembership` de ese negocio para este usuario
+    (research.md Decisión 1); si se envía uno de los dos, el otro es
+    obligatorio."""
+
+    name: Optional[str] = Field(None, min_length=1, max_length=150)
+    role_id: Optional[UUID] = None
+    membership_tenant_id: Optional[int] = None
+    membership_role_id: Optional[UUID] = None
+
+    @model_validator(mode="after")
+    def _membership_fields_together(self):
+        if (self.membership_tenant_id is None) != (self.membership_role_id is None):
+            raise ValueError(
+                "`membership_tenant_id` y `membership_role_id` deben enviarse juntos"
+            )
+        return self
+
+
+class SuspendUserRequest(BaseModel):
+    """Body de `POST /super-admin/users/{id}/suspend` (FR-019). `reason` es
+    obligatorio en el contrato, pero se valida como `400` en el router (no
+    como `422` de Pydantic) para que una cadena vacía/solo-espacios caiga en
+    el mismo código que "falta el motivo" -- contrato: "400 si falta `reason`"."""
+
+    reason: str = Field("", max_length=500)
+    revoke_sessions: bool = False
+
+
+class ConfirmEmailRequest(BaseModel):
+    """Body compartido por `POST /users/{id}/anonymize` y `DELETE
+    /users/{id}` (FR-025): `confirm_email` debe coincidir EXACTAMENTE
+    (sensible a mayúsculas) con el correo actual del usuario antes de
+    ejecutar la acción irreversible."""
+
+    confirm_email: str = Field("", max_length=255)
+
+
+class RetentionTenantItem(BaseModel):
+    tenant_id: int
+    tenant_name: str
+
+
+class DeleteBlockedByRetention(BaseModel):
+    """Cuerpo del `409` de `DELETE /users/{id}` cuando existe una obligación
+    de retención vigente (FR-024/Edge case): ofrece anonimizar como
+    alternativa."""
+
+    reason: str
+    retention_tenants: list[RetentionTenantItem]
+
+
+class AdminAuditLogItem(BaseModel):
+    """Una fila de `GET /super-admin/audit-logs` (FR-033 a FR-038) y de
+    `GET /users/{id}/activity`. `tenant_name` solo se resuelve en el primero
+    (join con `Tenant`, FR-034) -- queda `None` cuando se construye
+    directamente desde un `AdminAuditLog` (pestaña de actividad, que ya está
+    acotada a un usuario y no necesita mostrar el negocio)."""
+
+    id: UUID
+    actor_type: Literal["admin", "system"]
+    actor_user_id: Optional[UUID] = None
+    actor_name_snapshot: Optional[str] = None
+    affected_user_id: Optional[UUID] = None
+    affected_user_email_snapshot: Optional[str] = None
+    tenant_id: Optional[int] = None
+    tenant_name: Optional[str] = None
+    action: str
+    detail: Optional[dict[str, Any]] = None
+    ip_address: Optional[str] = None
+    created_at: UtcDatetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AuditLogPage(Page[AdminAuditLogItem]):
+    """`Page[AdminAuditLogItem]` + distinción de estado vacío (FR-041):
+    `empty_reason="no_data"` cuando `total=0` sin ningún filtro activo,
+    `"no_results"` cuando `total=0` con algún filtro activo (User Story 7
+    AS5), `None` cuando hay resultados."""
+
+    empty_reason: Optional[Literal["no_data", "no_results"]] = None
 
 
 class PaymentMethodFieldFormat(str, Enum):
