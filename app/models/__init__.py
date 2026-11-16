@@ -68,3 +68,8 @@ from .plan import Plan
 from .notification_event import NotificationEvent
 from .push_subscription import PushSubscription
 from .notification_channel_pref import NotificationChannelPreference
+
+# Gestión global de usuarios (Super Admin, spec 159)
+from .tenant_membership import TenantMembership
+from .user_session import UserSession
+from .admin_audit_log import AdminAuditLog

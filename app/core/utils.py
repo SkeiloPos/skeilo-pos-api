@@ -26,13 +26,19 @@ def verify_password(password: str, hash: str) -> bool:
 
 
 def create_access_token(
-    user_data: dict, expiry: timedelta = None, refresh: bool = False
+    user_data: dict, expiry: timedelta = None, refresh: bool = False, sid: str | None = None
 ):
     """Acuña un JWT de usuario.
 
     Con `refresh=True` el token vive `REFRESH_TOKEN_EXPIRY_MINUTES` en vez de
     `ACCESS_TOKEN_EXPIRY`: si ambos duraran lo mismo, el refresh caducaría junto
     al access y `/auth/refresh-token` nunca podría renovar nada.
+
+    `sid` (spec 159, research.md Decisión 5) es el id de la fila
+    `shared.user_sessions` asociada a este login -- distinto del `jti` propio
+    de cada token (access y refresh tienen cada uno su propio `jti`, pero
+    comparten el mismo `sid` cuando se acuñan juntos en el mismo login).
+    Opcional para no romper ningún llamador existente que no lo pase.
     """
     if expiry is None:
         minutes = (
@@ -52,6 +58,9 @@ def create_access_token(
     payload["jti"] = str(uuid.uuid4())
 
     payload["refresh"] = refresh
+
+    if sid is not None:
+        payload["sid"] = sid
 
     token = jwt.encode(
         payload=payload, key=settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM

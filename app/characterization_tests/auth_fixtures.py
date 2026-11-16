@@ -36,13 +36,28 @@ for _k, _v in {
     os.environ.setdefault(_k, _v)
 
 from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
 from app.core.models import Base, PasswordResetToken, Role, Tenant, User, UserInvitation
 from app.core.utils import generate_passwd_hash
 from app.models.plan import Plan  # noqa: F401  - registra shared.plans en Base.metadata
+from app.models.user_session import UserSession  # noqa: F401  - spec 159: shared.user_sessions
+from app.models.admin_audit_log import AdminAuditLog  # noqa: F401  - spec 159: shared.admin_audit_logs
+from app.models.tenant_membership import TenantMembership  # noqa: F401  - spec 159: shared.tenant_memberships
 
-_TABLE_NAMES = ["tenants", "roles", "users", "password_reset_tokens", "plans", "user_invitations"]
+_TABLE_NAMES = [
+    "tenants", "roles", "users", "password_reset_tokens", "plans", "user_invitations",
+    "user_sessions", "admin_audit_logs", "tenant_memberships",
+]
+
+
+# AdminAuditLog.detail es postgresql.JSONB — sin este shim create_all() falla
+# con CompileError sobre SQLite (mismo mecanismo que plan_fixtures.py).
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_as_json_on_sqlite(element, compiler, **kw):  # pragma: no cover
+    return "JSON"
 
 
 def new_session() -> Session:

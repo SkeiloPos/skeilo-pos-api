@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # Vigencia del enlace de un solo uso enviado por correo, en minutos.
     PASSWORD_RESET_TOKEN_EXPIRY_MINUTES:int = Field(default=30,env="PASSWORD_RESET_TOKEN_EXPIRY_MINUTES")
 
+    # Bloqueo automático por intentos fallidos de login (spec 159, research.md
+    # Decisión 4): mismo mecanismo de ventana deslizante que PASSWORD_RESET_*.
+    LOGIN_LOCKOUT_MAX_ATTEMPTS:int = Field(default=5,env="LOGIN_LOCKOUT_MAX_ATTEMPTS")
+    LOGIN_LOCKOUT_WINDOW_SECONDS:int = Field(default=900,env="LOGIN_LOCKOUT_WINDOW_SECONDS")
+
     # ---------------- Tiempo real (SSE + Redis Streams) ----------------
     # Interruptor de pánico: en false el publicador es un no-op y el endpoint
     # responde 503, así los clientes caen al sondeo sin desplegar frontend.
