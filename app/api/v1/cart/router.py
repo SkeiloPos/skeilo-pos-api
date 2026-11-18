@@ -22,7 +22,7 @@ from app.core.qr_context import (
     get_session_context,
     SessionContext,
 )
-from app.core.rate_limit import enforce as rate_limit
+from app.core.rate_limit import _client_ip, enforce as rate_limit
 from app.models.dining_table import DiningTable
 from app.api.v1.cart import service
 from app.api.v1.plan import service as plan_service
@@ -71,7 +71,9 @@ async def open_session(body: SessionOpenIn, request: Request):
         ).scalar_one_or_none()
         if table is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Mesa no encontrada o inactiva")
-        return service.open_session(ctx.db, ctx.tenant.id, table, body.display_name)
+        return service.open_session(
+            ctx.db, ctx.tenant.id, table, body.display_name, client_ip=_client_ip(request),
+        )
 
 
 @router.get("", response_model=CartResponse, summary="Ver carrito de la sesión")

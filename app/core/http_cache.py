@@ -67,3 +67,23 @@ def json_or_304(request: Request, adapter: TypeAdapter[Any], data: Any) -> Respo
         return Response(status_code=304, headers=headers)
 
     return Response(content=body, media_type="application/json", headers=headers)
+
+
+def json_or_304_with_hash(
+    request: Request, adapter: TypeAdapter[Any], data: Any, content_hash: str
+) -> Response:
+    """Variante de `json_or_304` para los documentos legales (spec 162,
+    research.md Decisión 4): el `ETag` es directamente `content_hash` — ya
+    persistido en columna propia, calculado sobre el contenido (Markdown),
+    no sobre el cuerpo JSON servido — en vez de un hash del cuerpo. Dos
+    respuestas con distinto `contenido_html` (p. ej. una futura mejora de
+    render) pero el mismo `content_hash` siguen comparando igual, que es la
+    semántica que pide la spec ("marca de verificación de contenido")."""
+    etag = f'{_PREFIX}"{content_hash}"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+
+    if _matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+
+    body = adapter.dump_json(data)
+    return Response(content=body, media_type="application/json", headers=headers)

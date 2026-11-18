@@ -43,6 +43,16 @@ async def _hit(key: str, limit: int, window: int) -> int:
     return count
 
 
+#: Límite de IP propio por bucket (spec 162, research.md Decisión 9): a
+#: diferencia de los buckets del QR (todos comparten `RATE_LIMIT_PER_IP`),
+#: los endpoints públicos de documentos legales no tienen mesa asociada y
+#: necesitan su propio umbral, más bajo. Un bucket ausente de este mapa sigue
+#: usando `settings.RATE_LIMIT_PER_IP` (comportamiento sin cambios).
+_PER_IP_LIMIT_OVERRIDES = {
+    "legal_public": lambda: settings.RATE_LIMIT_LEGAL_PUBLIC_PER_IP,
+}
+
+
 async def enforce(request: Request, bucket: str, *, table_id=None) -> None:
     """Aplica el límite al par (IP, mesa). Lanza 429 con `Retry-After`.
 
@@ -53,7 +63,8 @@ async def enforce(request: Request, bucket: str, *, table_id=None) -> None:
         return
 
     window = settings.RATE_LIMIT_WINDOW_SECONDS
-    checks = [(f"rl:{bucket}:ip:{_client_ip(request)}", settings.RATE_LIMIT_PER_IP)]
+    per_ip_limit = _PER_IP_LIMIT_OVERRIDES.get(bucket, lambda: settings.RATE_LIMIT_PER_IP)()
+    checks = [(f"rl:{bucket}:ip:{_client_ip(request)}", per_ip_limit)]
     if table_id is not None:
         checks.append((f"rl:{bucket}:tb:{table_id}", settings.RATE_LIMIT_PER_TABLE))
 
