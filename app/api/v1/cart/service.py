@@ -18,6 +18,7 @@ from app.core.asset_refs import resolve_receipt_key
 from app.core.config import settings
 from app.core.crud import get_or_404
 from app.core.exceptions import PendingPaymentExit
+from app.core.legal_consent import ip_hash
 from app.core.models import Tenant
 from app.core.order_audit import (
     ActorType,
@@ -35,9 +36,11 @@ from app.core.storage import (
     public_url_for,
 )
 from app.api.v1.table_sessions.service import notify_sessions_closed, try_release_if_empty
+from app.models.client_consent_acceptance import ClientConsentAcceptance
 from app.models.dining_table import DiningTable
 from app.models.table_session import TableSession
 from app.models.session_participant import SessionParticipant
+from app.models.tenant_legal_document import TenantLegalDocument
 from app.models.cart import Cart
 from app.models.cart_item import CartItem, CartItemOption, CartItemTopping
 from app.models.customer_order import CustomerOrder
@@ -150,11 +153,31 @@ def unique_display_label(db: Session, table_session_id: UUID, display_name: str)
 
 
 def open_session(
-    db: Session, tenant_id: int, table: DiningTable, display_name: str
+    db: Session,
+    tenant_id: int,
+    table: DiningTable,
+    display_name: str,
+    client_ip: str | None = None,
 ) -> SessionOpenResponse:
     """Une al comensal a la sesión activa de la mesa (o la abre si es el primero),
-    crea su carrito y emite el token de sesión. Marca la mesa `ocupada`."""
+    crea su carrito y emite el token de sesión. Marca la mesa `ocupada`.
+
+    Spec 162 (FR-016/FR-018, research.md Decisión 6/7): rechaza con `409` si el
+    tenant no tiene ningún `TenantLegalDocument` en `estado='publicado'` --
+    evaluado ANTES de crear el `SessionParticipant`, ninguna sesión de mesa nace
+    sin un documento legal vigente que aceptar. Cuando sí existe uno, registra el
+    consentimiento (`ClientConsentAcceptance`) en la MISMA transacción que crea
+    al comensal -- si cualquiera de las dos inserciones falla, ninguna persiste."""
     try:
+        legal_document = db.execute(
+            select(TenantLegalDocument).where(TenantLegalDocument.estado == "publicado")
+        ).scalar_one_or_none()
+        if legal_document is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "El negocio aún no tiene un documento legal publicado",
+            )
+
         table_session = _get_or_create_table_session(db, table)
 
         participant = SessionParticipant(
@@ -168,6 +191,12 @@ def open_session(
         db.add(participant)
         db.flush()
 
+        db.add(ClientConsentAcceptance(
+            session_participant_id=participant.id,
+            tenant_legal_document_id=legal_document.id,
+            ip_hash=ip_hash(client_ip or "desconocida", settings.CONSENT_IP_HASH_SALT),
+        ))
+
         cart = Cart(participant_id=participant.id, status="abierto")
         db.add(cart)
 
@@ -176,6 +205,9 @@ def open_session(
             table.status = "ocupada"
 
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception:
         db.rollback()
         logger.exception("Error abriendo sesión de comensal")

@@ -73,6 +73,7 @@ from app.models.order_payment_attempt import OrderPaymentAttempt
 from app.models.cash_register import CashRegister
 from app.models.cash_shift import CashShift
 from app.models.plan import Plan
+from app.models.tenant_legal_document import TenantLegalDocument
 
 
 # --------------------------------------------------------------- Esquema SQLite
@@ -126,6 +127,13 @@ _CART_TABLE_NAMES = [
     # aunque el escenario probado no abra ningún turno.
     "cash_registers",
     "cash_shifts",
+    # spec 162 (FR-016/FR-018): `open_session` ahora exige un
+    # `TenantLegalDocument` publicado y registra el consentimiento ahí mismo
+    # -- sin estas dos tablas, cualquier test que llegue a `open_session`
+    # revienta con "no such table" aunque el escenario probado no le
+    # interese nada legal.
+    "tenant_legal_documents",
+    "client_consent_acceptances",
 ]
 
 _TABLE_NAMES = _CATALOG_TABLE_NAMES + _CART_TABLE_NAMES
@@ -233,7 +241,21 @@ def new_session() -> Session:
     Base.metadata.create_all(bind=conn, tables=tables)
     attach_shared_tenants(conn)  # spec 088: `shared.tenants.logo_url` (is_key_referenced)
     conn.commit()
-    return Session(bind=conn)
+    db = Session(bind=conn)
+    # spec 162 (FR-016): `open_session` ahora exige un `TenantLegalDocument`
+    # publicado para no rechazar con 409 -- ninguno de los escenarios de este
+    # módulo (mesas/carrito/pedidos/promociones) ejercita esa regla a propósito,
+    # así que se siembra uno por defecto para que el comportamiento histórico
+    # (abrir sesión sin restricción legal) siga reproducible aquí. Los tests
+    # que SÍ quieren ejercitar la ausencia de documento usan
+    # `legal_fixtures.new_session()` en su lugar (sin este seed).
+    db.add(TenantLegalDocument(
+        version=1, master_template_id=uuid.uuid4(), master_template_version=1,
+        contenido_renderizado="contenido de prueba", content_hash="0" * 32,
+        estado="publicado",
+    ))
+    db.commit()
+    return db
 
 
 def _uid() -> uuid.UUID:

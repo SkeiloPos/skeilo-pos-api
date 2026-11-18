@@ -46,6 +46,8 @@ from app.api.v1.plan.router import router as plan_router
 from app.api.v1.realtime.router import router as realtime_router
 from app.api.v1.notifications.router import router as notifications_router
 from app.api.v1.bootstrap.router import router as bootstrap_router
+from app.api.v1.legal.public_router import router as legal_public_router
+from app.api.v1.legal.tenant_router import router as legal_tenant_router
 load_dotenv()
 
 logging.basicConfig(
@@ -176,6 +178,8 @@ def create_app()->FastAPI:
     app.include_router(realtime_router, prefix="/api/v1")
     app.include_router(notifications_router, prefix="/api/v1")
     app.include_router(bootstrap_router, prefix="/api/v1")
+    app.include_router(legal_public_router, prefix="/api/v1")
+    app.include_router(legal_tenant_router, prefix="/api/v1")
     return app
 
 app = create_app()
