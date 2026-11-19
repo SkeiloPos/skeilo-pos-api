@@ -143,6 +143,30 @@ class Settings(BaseSettings):
     # push service puede usar si necesita alcanzar al emisor.
     VAPID_SUBJECT:Optional[str] = Field(default=None,env="VAPID_SUBJECT")
 
+    # --- Suscripción del tenant y pago por link de Wompi (spec 161) ---
+    # Las tres credenciales son opcionales a propósito: el arranque y las suites no
+    # deben depender de una cuenta de Wompi (hoy no existe). Sin ellas, pedir un link
+    # responde 503 controlado y el webhook rechaza todo evento por firma inválida.
+    # Un valor vacío (`WOMPI_PUBLIC_KEY=` en el .env) cuenta como "sin configurar".
+    WOMPI_PUBLIC_KEY:Optional[str] = Field(default=None,env="WOMPI_PUBLIC_KEY")
+    # Secreto de INTEGRIDAD: firma la URL del checkout. No es la llave privada ni el secreto de eventos.
+    WOMPI_INTEGRITY_SECRET:Optional[str] = Field(default=None,env="WOMPI_INTEGRITY_SECRET")
+    # Secreto de EVENTOS: verifica el checksum de los avisos que Wompi envía al webhook.
+    WOMPI_EVENTS_SECRET:Optional[str] = Field(default=None,env="WOMPI_EVENTS_SECRET")
+    # Base del Web Checkout. La doc de Wompi no publica un host aparte para Sandbox
+    # (spec 161, research.md Decisión 1): se confirma con la cuenta y se ajusta aquí.
+    WOMPI_CHECKOUT_URL:str = Field(default="https://checkout.wompi.co/p/",env="WOMPI_CHECKOUT_URL")
+    # A dónde vuelve el cliente tras pagar; `{host}` se reemplaza por el host del tenant.
+    WOMPI_REDIRECT_URL_TEMPLATE:str = Field(default="https://{host}/",env="WOMPI_REDIRECT_URL_TEMPLATE")
+    # Vigencia del link de pago pendiente.
+    WOMPI_LINK_TTL_HOURS:int = Field(default=24,env="WOMPI_LINK_TTL_HOURS")
+    # Frecuencia del job de avisos de suscripción (`evaluate_subscription_alerts`) y la ventana
+    # horaria LOCAL del tenant en la que se permite emitirlos (8 a 20 por defecto; `0` y `24` la
+    # desactivan). Los tramos de 48 h / 120 h no son configurables: los fija la spec 161 (D6).
+    SUBSCRIPTION_ALERT_INTERVAL_MINUTES:int = Field(default=60,env="SUBSCRIPTION_ALERT_INTERVAL_MINUTES")
+    SUBSCRIPTION_ALERT_LOCAL_START_HOUR:int = Field(default=8,env="SUBSCRIPTION_ALERT_LOCAL_START_HOUR")
+    SUBSCRIPTION_ALERT_LOCAL_END_HOUR:int = Field(default=20,env="SUBSCRIPTION_ALERT_LOCAL_END_HOUR")
+
     PROJECT_NAME:str ="pos"
     # Ambiente de ejecución: "prod" o "dev". Afecta, p. ej., la URL de login del correo.
     ENVIRONMENT:str = Field(default="dev",env="ENVIRONMENT")
