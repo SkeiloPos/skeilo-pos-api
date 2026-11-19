@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 
 from app.core.models import Tenant
 from app.core.plan_limits import RESOURCE_CONFIG, count_resource_usage
-from app.core.timezone import utc_now_naive
+from app.core.subscription import compute_subscription_status
 from app.models.plan import Plan
 
 
@@ -21,13 +21,18 @@ def build_plan_summary(db: Session, tenant: Tenant) -> dict:
             "limit": getattr(plan, config.limit_column),
         }
 
-    vencido = tenant.plan_vence_en is not None and tenant.plan_vence_en < utc_now_naive()
+    # spec 161: el mismo cálculo puro que usan el bloqueo y el job de avisos, para que nunca discrepen.
+    # `vencido` pasa a significar "bloqueada" (A-163): en gracia el tenant sigue operando con normalidad.
+    subscription = compute_subscription_status(tenant.plan_vence_en)
 
     return {
         "plan_name": plan.name,
         "ciclo_facturacion": tenant.ciclo_facturacion,
         "plan_vence_en": tenant.plan_vence_en,
-        "vencido": vencido,
+        "vencido": subscription.state == "bloqueada",
+        "subscription_state": subscription.state,
+        "dias_restantes": subscription.dias_restantes,
+        "fecha_limite_pago": subscription.fecha_limite_pago,
         "resources": resources,
         "modules": {
             "inventario": plan.inventario_access,

@@ -8,6 +8,9 @@ proveedores y compras, spec 141) y promociones.
 llama como primer paso dentro de `enforce_plan_limit`/`require_module_access`
 — ningún router de recurso o módulo necesita tocarse para heredar el
 bloqueo por vencimiento (research.md Decisión 14).
+
+Spec 161 (A-161): el bloqueo ya no es inmediato al vencer. Hay 5 días (120 h) de
+gracia en los que todo opera; solo el estado `bloqueada` rechaza.
 """
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -19,9 +22,9 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db, get_tenant
 from app.core.dependencies import get_current_user
-from app.core.exceptions import ModuleNotInPlanError
+from app.core.exceptions import ModuleNotInPlanError, SubscriptionBlockedError
 from app.core.models import Tenant, User, UserInvitation
-from app.core.timezone import utc_now_naive
+from app.core.subscription import compute_subscription_status
 from app.models.cash_register import CashRegister
 from app.models.dining_table import DiningTable
 from app.models.payment import PaymentMethod
@@ -85,18 +88,19 @@ def count_resource_usage(db: Session, tenant: Tenant, resource_key: str) -> int:
 
 
 def ensure_plan_not_expired(tenant: Tenant) -> None:
-    """Bloquea (límites y módulos por igual) si `tenant.plan_vence_en` ya
-    pasó sin que el Super Admin haya renovado (FR-019). `NULL` = nunca
-    vence (FR-021) — no bloquea nunca por este motivo. Llamada como primer
-    paso de `enforce_plan_limit`/`require_module_access` (research.md
-    Decisión 14): ningún router necesita invocarla por su cuenta."""
-    if tenant.plan_vence_en is None:
-        return
-    if tenant.plan_vence_en < utc_now_naive():
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Tu plan venció. Debe renovarse para seguir usando el sistema.",
-        )
+    """Bloquea (límites y módulos por igual) cuando la suscripción del tenant está `bloqueada`:
+    pasaron 120 h (5 días de gracia) desde `plan_vence_en` sin un pago aprobado ni una renovación
+    del Super Admin (spec 033 FR-019; spec 161 FR-005/FR-006, A-161). Entre el vencimiento y las
+    120 h el tenant está `en_gracia` y todo opera con normalidad. `NULL` = nunca vence (spec 033
+    FR-021) — no bloquea nunca por este motivo.
+
+    Lanza `SubscriptionBlockedError` (403, `code = "subscription_blocked"`), que sigue siendo un
+    `HTTPException` con el mismo `detail` de siempre. El cálculo del estado es el de
+    `compute_subscription_status`, el mismo que usan `GET /plan` y el job de avisos, para que nunca
+    discrepen. Llamada como primer paso de `enforce_plan_limit`/`require_module_access`
+    (research.md Decisión 14 de spec 033): ningún router necesita invocarla por su cuenta."""
+    if compute_subscription_status(tenant.plan_vence_en).state == "bloqueada":
+        raise SubscriptionBlockedError()
 
 
 def enforce_plan_limit(db: Session, tenant: Tenant, resource_key: str) -> None:

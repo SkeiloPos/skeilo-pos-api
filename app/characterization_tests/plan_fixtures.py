@@ -68,6 +68,12 @@ _TABLE_NAMES = [
     "user_sessions",
     "admin_audit_logs",
     "password_reset_tokens",
+    # spec 161: pagos de suscripción por link de Wompi (esquema `shared`).
+    "subscription_payments",
+    # spec 161 (Historia 5): avisos de suscripción dirigidos por rol y su canal push.
+    "notification_events",
+    "notification_channel_preferences",
+    "push_subscriptions",
 ]
 
 
@@ -81,11 +87,18 @@ def _compile_jsonb_as_json_on_sqlite(element, compiler, **kw):  # pragma: no cov
     return "JSON"
 
 
-def new_session() -> Session:
+def new_session(multithreaded: bool = False) -> Session:
     """Sesión SQLAlchemy real, limpia, sobre SQLite en memoria — colapsa
-    tanto `tenant` como `shared` al schema por defecto de SQLite."""
+    tanto `tenant` como `shared` al schema por defecto de SQLite.
+
+    `multithreaded=True` (spec 161) permite usarla desde otro hilo: `TestClient` ejecuta los endpoints
+    síncronos en un pool de hilos, y SQLite rechaza por defecto una conexión usada fuera del hilo que la
+    creó. Por defecto es `False`, idéntico a como siempre se ha comportado."""
     tables = [t for t in Base.metadata.tables.values() if t.name in _TABLE_NAMES]
-    engine = create_engine("sqlite:///:memory:")
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False} if multithreaded else {},
+    )
     conn = engine.connect().execution_options(
         schema_translate_map={"tenant": None, "shared": None}
     )

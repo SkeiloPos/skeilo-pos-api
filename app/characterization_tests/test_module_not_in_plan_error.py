@@ -31,7 +31,7 @@ from app.characterization_tests import fixtures  # noqa: F401  - variables de en
 from app.characterization_tests import plan_fixtures as fx
 from app.core.db import get_db, get_tenant
 from app.core.dependencies import get_current_user, require_tenant_admin
-from app.core.exceptions import ModuleNotInPlanError
+from app.core.exceptions import ModuleNotInPlanError, SubscriptionBlockedError
 from app.core.models import Base
 from app.core.plan_limits import ensure_module_access, has_module_access, require_module_access
 from app.models.inventory_item import InventoryItem
@@ -90,9 +90,13 @@ class ModuleNotInPlanErrorTests(unittest.TestCase):
 
     # ---------------------------------------------------------- (b) precedencia
 
-    def test_plan_vencido_gana_sobre_modulo_ausente_y_no_lleva_code(self):
+    def test_plan_vencido_gana_sobre_modulo_ausente_y_lleva_su_propio_code(self):
         """FR-009, US2.5: un plan vencido se rechaza antes de mirar el módulo, con
-        el mismo 403 de siempre y **sin** `code`."""
+        el mismo 403 y el mismo `detail` de siempre.
+
+        spec 161 (A-162): antes este 403 iba **sin** `code`; ahora lleva el suyo propio,
+        `subscription_blocked`, que lo distingue del `MODULE_NOT_IN_PLAN` de esta spec. La
+        precedencia (el vencimiento gana sobre el módulo ausente) no cambia."""
         db = fx.new_session()
         plan = fx.make_plan(db, inventario_access=False)
         tenant = fx.make_tenant(
@@ -104,9 +108,10 @@ class ModuleNotInPlanErrorTests(unittest.TestCase):
             ensure_module_access(db, tenant, "inventario")
 
         self.assertNotIsInstance(ctx.exception, ModuleNotInPlanError)
+        self.assertIsInstance(ctx.exception, SubscriptionBlockedError)
         self.assertEqual(ctx.exception.status_code, 403)
         self.assertEqual(ctx.exception.detail, "Tu plan venció. Debe renovarse para seguir usando el sistema.")
-        self.assertFalse(hasattr(ctx.exception, "code"))
+        self.assertEqual(ctx.exception.code, "subscription_blocked")
 
     # ---------------------------------------------------------- (c) has_module_access
 
@@ -297,8 +302,10 @@ class ModuleNotInPlanHttpTests(unittest.TestCase):
 
     # ---------------------------------------------------------- precedencias
 
-    def test_plan_vencido_responde_403_sin_code(self):
-        """FR-009: el plan vencido conserva su propio rechazo."""
+    def test_plan_vencido_responde_403_con_su_propio_code(self):
+        """FR-009: el plan vencido conserva su propio rechazo (mismo `detail` de siempre).
+
+        spec 161 (A-162): antes iba sin `code`; ahora lleva `subscription_blocked`."""
         plan = fx.make_plan(self.db, inventario_access=False)
         tenant = fx.make_tenant(
             self.db, plan=plan, ciclo_facturacion="mensual", plan_iniciado_en=datetime(2020, 1, 1)
@@ -309,7 +316,10 @@ class ModuleNotInPlanHttpTests(unittest.TestCase):
         resp = self._cliente(tenant, admin).get("/api/v1/inventory/suppliers")
 
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json(), {"detail": "Tu plan venció. Debe renovarse para seguir usando el sistema."})
+        self.assertEqual(
+            resp.json(),
+            {"detail": "Tu plan venció. Debe renovarse para seguir usando el sistema.", "code": "subscription_blocked"},
+        )
 
     def test_el_modulo_se_comprueba_antes_que_el_rol(self):
         """Contrato § 2: orden 3 (módulo) antes que orden 4 (rol)."""

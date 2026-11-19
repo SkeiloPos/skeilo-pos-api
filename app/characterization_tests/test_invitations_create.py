@@ -154,7 +154,9 @@ class CreateInvitationTests(unittest.TestCase):
     # ---------------------------------------------------------- FR-018 (plan vencido)
 
     def test_tenant_con_plan_vencido_es_403_sin_enviar_correo(self):
-        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
+        # spec 161 (A-161): antes bastaba `−1 día`; ahora un plan recién vencido tiene 5 días de gracia y
+        # sigue operando. Para seguir probando el 403 hay que pasar de las 120 h: `−6 días`.
+        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=6)
         expired_tenant = af.make_tenant(self.db, plan_vence_en=past)
         admin = _make_admin(self.db, expired_tenant)
         self.db.commit()
@@ -169,6 +171,19 @@ class CreateInvitationTests(unittest.TestCase):
                 )
         self.assertEqual(ctx.exception.status_code, 403)
         mock_send.assert_not_called()
+
+    def test_tenant_en_gracia_puede_invitar_con_normalidad(self):
+        """spec 161 (A-161, FR-005): vencido hace 1 día = `en_gracia`, el tenant opera con normalidad."""
+        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
+        grace_tenant = af.make_tenant(self.db, plan_vence_en=past)
+        admin = _make_admin(self.db, grace_tenant)
+        self.db.commit()
+
+        resp, mock_send = self._create(email="nuevo@acme.com", tenant=grace_tenant, admin=admin)
+
+        self.assertEqual(resp.email, "nuevo@acme.com")
+        mock_send.assert_called_once()
+        self.assertEqual(_count(self.db, UserInvitation, UserInvitation.email == "nuevo@acme.com"), 1)
 
     # ---------------------------------------------------------- research.md Decisión 5
 
