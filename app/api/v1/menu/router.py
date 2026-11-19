@@ -18,6 +18,7 @@ from app.core.models import Tenant
 from app.core.qr_context import open_qr_context
 from app.core.rate_limit import enforce as rate_limit
 from app.models.category import Category
+from app.models.tenant_legal_document import TenantLegalDocument
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.models.option_group import OptionGroup
@@ -404,12 +405,22 @@ async def menu_by_signed_qr(token: str, request: Request):
         ).scalar_one_or_none()
         if table is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Mesa no encontrada o inactiva")
+        legal_document = ctx.db.execute(
+            select(TenantLegalDocument).where(TenantLegalDocument.estado == "publicado")
+        ).scalar_one_or_none()
         return {
             "table": MenuTableResponse.model_validate(table),
             "business": MenuBusinessResponse.model_validate(ctx.tenant),
             "menu": _build_menu(ctx.db, ctx.tenant, only_visible_en_qr=True),
             # spec 040 (FR-021): clave aditiva; el resto del dict no cambia.
             "promotions": _build_menu_promotions(ctx.db, datetime.now(timezone.utc), ctx.tenant),
+            # spec 162 (Decisión 8): id/versión del snapshot vigente del tenant, o
+            # `null` si todavía no publicó ninguno -- el frontend usa esto para
+            # mostrar el aviso de FR-017 y bloquear el formulario de nombre (T040).
+            "legal_document": (
+                {"id": legal_document.id, "version": legal_document.version}
+                if legal_document is not None else None
+            ),
         }
 
 

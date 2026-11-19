@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Integer,String,Column,DateTime, UniqueConstraint,func,Boolean,MetaData,ForeignKey,Index,CheckConstraint,text
+from sqlalchemy import Integer,String,Column,DateTime, UniqueConstraint,func,Boolean,MetaData,ForeignKey,Index,CheckConstraint,text,Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm  import mapped_column,Mapped,DeclarativeBase,relationship,validates
 
@@ -293,6 +293,125 @@ class UserInvitation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "status IN ('pending', 'consumed', 'cancelled')",
             name="ck_user_invitations_status",
+        ),
+        {"schema": "shared"},
+    )
+
+
+class PlatformLegalDocument(UUIDPrimaryKeyMixin, Base):
+    """Una fila por versión de un documento legal de plataforma (Privacidad o
+    Términos) — spec 162. Máquina de estados borrador/publicado/superado
+    aplicada a nivel de servicio (FR-003): la edición solo se permite con
+    `estado='borrador'`, nunca por constraint de BD. `UNIQUE (tipo) WHERE
+    estado='publicado'` (FR-004, data-model.md tabla 1) es la barrera real
+    contra dos publicaciones concurrentes del mismo `tipo`: la segunda en
+    comitear choca contra el índice y recibe 409 del servicio, no corrompe
+    el estado."""
+
+    __tablename__ = "platform_legal_documents"
+
+    tipo: Mapped[str] = mapped_column(String(20), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    contenido_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    estado: Mapped[str] = mapped_column(String(12), nullable=False, server_default="borrador")
+    # blake2b-128 hex de `contenido_markdown` (research.md Decisión 4, mismo
+    # algoritmo que `http_cache.py::weak_etag`).
+    content_hash: Mapped[str] = mapped_column(String(32), nullable=False)
+    fecha_vigencia: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    published_by_user_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("shared.users.id"), nullable=True
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    published_by: Mapped[Optional["User"]] = relationship()
+
+    __table_args__ = (
+        Index(
+            "idx_platform_legal_document_vigente_por_tipo",
+            "tipo",
+            unique=True,
+            postgresql_where=text("estado = 'publicado'"),
+            sqlite_where=text("estado = 'publicado'"),
+        ),
+        Index("idx_platform_legal_document_tipo_version", "tipo", "version"),
+        CheckConstraint(
+            "tipo IN ('privacidad', 'terminos')",
+            name="ck_platform_legal_documents_tipo",
+        ),
+        CheckConstraint(
+            "estado IN ('borrador', 'publicado', 'superado')",
+            name="ck_platform_legal_documents_estado",
+        ),
+        {"schema": "shared"},
+    )
+
+
+class MasterLegalTemplate(UUIDPrimaryKeyMixin, Base):
+    """Una fila por versión de la plantilla legal maestra que cada tenant
+    rellena con sus propios datos — spec 162. Misma máquina de estados que
+    `PlatformLegalDocument`, pero a lo sumo una fila `publicado` en total (no
+    por `tipo`: solo hay un tipo de plantilla), de ahí el índice único sobre
+    `estado` en vez de sobre una columna de tipo (data-model.md tabla 2)."""
+
+    __tablename__ = "master_legal_templates"
+
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Markdown con placeholders `{{variable}}` de la lista cerrada
+    # (`app/core/legal_template.py::ALLOWED_TEMPLATE_VARIABLES`, FR-008).
+    contenido_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    estado: Mapped[str] = mapped_column(String(12), nullable=False, server_default="borrador")
+    content_hash: Mapped[str] = mapped_column(String(32), nullable=False)
+    fecha_vigencia: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    published_by_user_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("shared.users.id"), nullable=True
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    published_by: Mapped[Optional["User"]] = relationship()
+
+    __table_args__ = (
+        Index(
+            "idx_master_legal_template_vigente",
+            "estado",
+            unique=True,
+            postgresql_where=text("estado = 'publicado'"),
+            sqlite_where=text("estado = 'publicado'"),
+        ),
+        CheckConstraint(
+            "estado IN ('borrador', 'publicado', 'superado')",
+            name="ck_master_legal_templates_estado",
+        ),
+        {"schema": "shared"},
+    )
+
+
+class TenantAdminPlatformAcceptance(UUIDPrimaryKeyMixin, Base):
+    """Evidencia de que un administrador de tenant aceptó la versión vigente
+    de un documento legal de plataforma (FR-019, spec 162) — separada de
+    `ClientConsentAcceptance` (aceptación del cliente final, schema tenant).
+    `UNIQUE (user_id, platform_document_id)` hace idempotente reenviar la
+    aceptación (data-model.md tabla 3)."""
+
+    __tablename__ = "tenant_admin_platform_acceptances"
+
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("shared.users.id"), nullable=False)
+    # Denormalizado desde user.tenant_id para consultas directas por tenant.
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("shared.tenants.id"), nullable=False, index=True)
+    platform_document_id: Mapped[UUID] = mapped_column(
+        ForeignKey("shared.platform_legal_documents.id"), nullable=False
+    )
+    accepted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    user: Mapped["User"] = relationship()
+    tenant: Mapped["Tenant"] = relationship()
+    platform_document: Mapped["PlatformLegalDocument"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "platform_document_id",
+            name="uq_tenant_admin_platform_acceptance_user_document",
         ),
         {"schema": "shared"},
     )

@@ -73,3 +73,8 @@ from .notification_channel_pref import NotificationChannelPreference
 from .tenant_membership import TenantMembership
 from .user_session import UserSession
 from .admin_audit_log import AdminAuditLog
+
+# Documentos legales de tenant y consentimiento del cliente final (spec 162)
+from .tenant_legal_profile import TenantLegalProfile
+from .tenant_legal_document import TenantLegalDocument
+from .client_consent_acceptance import ClientConsentAcceptance
