@@ -76,3 +76,7 @@ from .admin_audit_log import AdminAuditLog
 
 # Suscripción del tenant y pago por link de Wompi (spec 161)
 from .subscription_payment import SubscriptionPayment
+# Documentos legales de tenant y consentimiento del cliente final (spec 162)
+from .tenant_legal_profile import TenantLegalProfile
+from .tenant_legal_document import TenantLegalDocument
+from .client_consent_acceptance import ClientConsentAcceptance

@@ -21,6 +21,7 @@ from app.api.v1.super_admin.schemas import (
     UserStats,
 )
 from app.api.v1.super_admin.audit_router import router as audit_router
+from app.api.v1.super_admin.legal_router import router as legal_router
 from app.api.v1.super_admin.payment_methods_router import router as payment_methods_catalog_router
 from app.api.v1.super_admin.plans_router import router as plans_router
 from app.api.v1.super_admin.users_router import router as users_detail_router
@@ -44,6 +45,7 @@ router.include_router(payment_methods_catalog_router)
 router.include_router(plans_router)
 router.include_router(audit_router)
 router.include_router(subscription_payments_router)  # spec 161: historial de pagos de suscripción por tenant
+router.include_router(legal_router)
 
 
 # spec 159, Edge case "Sin actividad reciente": el spec no fija un número
