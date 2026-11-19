@@ -212,3 +212,182 @@ class PasarelaConfiguradaTests(unittest.TestCase):
         cfg = SimpleNamespace(WOMPI_PUBLIC_KEY="pub_test_x", WOMPI_INTEGRITY_SECRET="test_integrity_x", WOMPI_EVENTS_SECRET=None)
 
         self.assertIs(wompi.gateway_configured(cfg), True)
+
+
+# ======================================================================
+# Historia 4 — el checksum del evento (contrato `wompi-webhook.md § 2`)
+# ======================================================================
+
+SECRETO_EVENTOS = "test_events_local"
+
+
+def _dig(data, ruta):
+    """Recorre `transaction.status` dentro de `data`. Independiente a propósito del código bajo prueba."""
+    for parte in ruta.split("."):
+        data = data[parte]
+    return data
+
+
+def _checksum(event, secret=SECRETO_EVENTOS):
+    """La fórmula de la documentación de Wompi, recalculada aparte: valores de `signature.properties` (en el
+    orden recibido) + `timestamp` + secreto, SHA-256 hexadecimal."""
+    valores = "".join(str(_dig(event["data"], p)) for p in event["signature"]["properties"])
+    return sha256((valores + str(event["timestamp"]) + secret).encode()).hexdigest()
+
+
+def _evento(*, status="APPROVED", cents=8_990_000, tx_id="1234-1610641025-49201", reference="SKP-abc",
+            properties=None, secret=SECRETO_EVENTOS, timestamp=1530291411, event="transaction.updated"):
+    ev = {
+        "event": event,
+        "data": {"transaction": {
+            "id": tx_id, "status": status, "amount_in_cents": cents, "reference": reference, "currency": "COP",
+        }},
+        "environment": "test",
+        "signature": {
+            "properties": properties or ["transaction.id", "transaction.status", "transaction.amount_in_cents"],
+            "checksum": "",
+        },
+        "timestamp": timestamp,
+        "sent_at": "2026-11-30T14:12:09.000Z",
+    }
+    ev["signature"]["checksum"] = _checksum(ev, secret).upper()  # la documentación de Wompi lo muestra en mayúsculas
+    return ev
+
+
+class ChecksumDelEventoTests(unittest.TestCase):
+    def test_coincide_con_la_formula_de_la_documentacion_recalculada_aparte(self):
+        ev = _evento()
+
+        self.assertEqual(wompi.compute_event_checksum(ev, SECRETO_EVENTOS), _checksum(ev))
+
+    def test_concatena_valores_de_properties_mas_timestamp_mas_secreto(self):
+        ev = _evento(tx_id="TX-9", status="APPROVED", cents=123, timestamp=77)
+
+        esperado = sha256(("TX-9" + "APPROVED" + "123" + "77" + SECRETO_EVENTOS).encode()).hexdigest()
+
+        self.assertEqual(wompi.compute_event_checksum(ev, SECRETO_EVENTOS), esperado)
+
+    def test_el_orden_de_los_properties_cuenta_y_se_lee_del_evento(self):
+        a = _evento(properties=["transaction.id", "transaction.status", "transaction.amount_in_cents"])
+        b = _evento(properties=["transaction.status", "transaction.id", "transaction.amount_in_cents"])
+
+        self.assertNotEqual(wompi.compute_event_checksum(a, SECRETO_EVENTOS), wompi.compute_event_checksum(b, SECRETO_EVENTOS))
+
+    def test_el_timestamp_el_monto_y_el_secreto_cambian_el_checksum(self):
+        base = wompi.compute_event_checksum(_evento(), SECRETO_EVENTOS)
+
+        self.assertNotEqual(base, wompi.compute_event_checksum(_evento(timestamp=1530291412), SECRETO_EVENTOS))
+        self.assertNotEqual(base, wompi.compute_event_checksum(_evento(cents=8_990_001), SECRETO_EVENTOS))
+        self.assertNotEqual(base, wompi.compute_event_checksum(_evento(), "otro_secreto"))
+
+    def test_es_hexadecimal_de_64_caracteres_en_minusculas(self):
+        self.assertRegex(wompi.compute_event_checksum(_evento(), SECRETO_EVENTOS), r"^[0-9a-f]{64}$")
+
+    def test_acepta_otros_properties_firmados_ademas_de_los_minimos(self):
+        ev = _evento(properties=["transaction.id", "transaction.status", "transaction.amount_in_cents", "transaction.reference"])
+
+        wompi.verify_event(ev, None, SECRETO_EVENTOS)  # no lanza
+
+
+class VerificacionDelEventoTests(unittest.TestCase):
+    def _rechaza(self, ev, header=None, secret=SECRETO_EVENTOS, status=None):
+        with self.assertRaises(wompi.WompiEventError) as ctx:
+            wompi.verify_event(ev, header, secret)
+        if status is not None:
+            self.assertEqual(ctx.exception.status_code, status)
+        return ctx.exception
+
+    def test_un_evento_bien_firmado_pasa(self):
+        wompi.verify_event(_evento(), None, SECRETO_EVENTOS)
+
+    def test_el_checksum_se_compara_sin_distinguir_mayusculas(self):
+        ev = _evento()
+        for variante in (ev["signature"]["checksum"].upper(), ev["signature"]["checksum"].lower()):
+            with self.subTest(variante[:6]):
+                ev["signature"]["checksum"] = variante
+                wompi.verify_event(ev, None, SECRETO_EVENTOS)
+
+    def test_checksum_alterado_es_401(self):
+        ev = _evento()
+        ev["signature"]["checksum"] = "0" * 64
+
+        self._rechaza(ev, status=401)
+
+    def test_un_dato_alterado_despues_de_firmar_es_401(self):
+        ev = _evento()
+        ev["data"]["transaction"]["amount_in_cents"] = 1
+
+        self._rechaza(ev, status=401)
+
+    def test_firmado_con_otro_secreto_es_401(self):
+        self._rechaza(_evento(secret="de_otro"), status=401)
+
+    def test_sin_secreto_configurado_es_401_aunque_el_evento_sea_valido(self):
+        for secreto in (None, ""):
+            with self.subTest(secreto=secreto):
+                self._rechaza(_evento(), secret=secreto, status=401)
+
+    def test_la_cabecera_x_event_checksum_si_llega_debe_coincidir(self):
+        ev = _evento()
+        correcto = _checksum(ev)
+
+        wompi.verify_event(ev, correcto, SECRETO_EVENTOS)
+        wompi.verify_event(ev, correcto.upper(), SECRETO_EVENTOS)
+        self._rechaza(ev, header="f" * 64, status=401)
+
+    def test_sin_cabecera_basta_con_el_checksum_del_cuerpo(self):
+        wompi.verify_event(_evento(), None, SECRETO_EVENTOS)
+        wompi.verify_event(_evento(), "", SECRETO_EVENTOS)
+
+    def test_un_checksum_no_ascii_no_rompe_la_comparacion(self):
+        ev = _evento()
+        ev["signature"]["checksum"] = "ñ" * 64
+
+        self._rechaza(ev, status=401)
+
+    def test_properties_sin_los_tres_minimos_es_400(self):
+        """Solo lo firmado está protegido: el estado y el monto que se aplican deben ir firmados."""
+        for props in (
+            ["transaction.id", "transaction.status"],
+            ["transaction.id", "transaction.amount_in_cents"],
+            ["transaction.status", "transaction.amount_in_cents"],
+            ["transaction.reference"],
+        ):
+            with self.subTest(props):
+                self._rechaza(_evento(properties=props), status=400)
+
+    def test_estructura_incompleta_es_400(self):
+        base = _evento()
+        casos = {
+            "no es un objeto": ["x"],
+            "sin signature": {k: v for k, v in base.items() if k != "signature"},
+            "sin properties": {**base, "signature": {"checksum": "a"}},
+            "properties vacío": {**base, "signature": {"properties": [], "checksum": "a"}},
+            "properties no es lista": {**base, "signature": {"properties": "transaction.id", "checksum": "a"}},
+            "sin checksum": {**base, "signature": {"properties": base["signature"]["properties"]}},
+            "sin timestamp": {k: v for k, v in base.items() if k != "timestamp"},
+            "sin data": {k: v for k, v in base.items() if k != "data"},
+            "una propiedad firmada no existe en data": {
+                **base, "signature": {"properties": ["transaction.id", "transaction.status", "transaction.amount_in_cents", "transaction.nada"], "checksum": "a"},
+            },
+        }
+        for nombre, ev in casos.items():
+            with self.subTest(nombre):
+                self._rechaza(ev, status=400)
+
+    def test_el_secreto_ausente_gana_sobre_la_estructura(self):
+        """Orden del contrato: sin secreto es 401 siempre, nunca se llega a mirar el cuerpo."""
+        self._rechaza({"basura": True}, secret=None, status=401)
+
+    def test_el_error_no_filtra_el_secreto_ni_el_checksum_esperado(self):
+        ev = _evento()
+        ev["signature"]["checksum"] = "0" * 64
+
+        exc = self._rechaza(ev, status=401)
+
+        self.assertNotIn(SECRETO_EVENTOS, exc.detail)
+        self.assertNotIn(_checksum(ev), exc.detail)
+
+
+if __name__ == "__main__":
+    unittest.main()

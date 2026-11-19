@@ -145,3 +145,154 @@ def get_or_create_payment_link(
         logger.info("Solicitud simultánea de link de pago para el tenant %s: se reutiliza el pendiente", tenant.id)
         return existing, True
     return payment, False
+
+
+# ======================================================================
+# Historia 4 — la confirmación del pago (webhook)
+# ======================================================================
+
+_REJECTING_STATUSES = ("DECLINED", "ERROR")
+
+
+def apply_wompi_event(db: Session, event: dict, *, now: Optional[datetime] = None) -> str:
+    """Aplica un evento `transaction.updated` YA VERIFICADO (`wompi.verify_event`) y devuelve `"processed"`,
+    `"duplicate"` o `"ignored"`. Todo ocurre en **una** transacción de la base compartida (FR-023): el pago y las
+    fechas del tenant cambian juntos o no cambian.
+
+    El pago se localiza por `transaction.reference` (el aviso no llega por el subdominio del tenant, FR-020) y se
+    bloquea con `SELECT … FOR UPDATE`, así que dos entregas simultáneas del mismo evento se serializan y la segunda
+    ve el resultado de la primera. Una aprobación NO genera notificación (la spec define solo los tres avisos), así
+    que el webhook nunca entra al esquema del tenant.
+
+    Matriz (data-model.md § 2.1), con `S` = estado del pago:
+
+    - `APPROVED`: desde `pending`, `expired` y `rejected` se aplica (el dinero ya entró, FR-025; un reintento
+      dentro del mismo checkout puede aprobar tras un rechazo); desde `approved` es `duplicate`; desde `voided` se
+      ignora.
+    - `DECLINED`/`ERROR`: solo `pending → rejected`. Nunca retroceden un `approved`.
+    - `VOIDED`: solo `approved → voided`, **sin revertir fechas** (lo resuelve soporte a mano, D7).
+    - Cualquier otro estado (`PENDING`...) se ignora.
+
+    Un evento cuyo monto o moneda no coincide con el pago, con referencia desconocida o con una transacción ya
+    ligada a otro pago se ignora sin cambiar nada (FR-026); la respuesta es `200` para que Wompi no reintente.
+    """
+    now = now if now is not None else utc_now_naive()
+    try:
+        return _apply_wompi_event(db, event, now)
+    except IntegrityError:
+        # Carrera contra otra entrega que ligó la misma transacción a otro pago (índice único parcial).
+        db.rollback()
+        logger.warning("Evento de Wompi rechazado por el índice de transacción única (referencia %s)",
+                       ((event.get("data") or {}).get("transaction") or {}).get("reference"))
+        return "ignored"
+    except Exception:
+        db.rollback()  # el pago no queda a medias: Wompi reintentará y se procesará completo
+        raise
+
+
+def _apply_wompi_event(db: Session, event: dict, now: datetime) -> str:
+    tx = (event.get("data") or {}).get("transaction")
+    if not isinstance(tx, dict):
+        return "ignored"
+    reference = tx.get("reference")
+    tx_id = str(tx["id"]) if tx.get("id") is not None else None
+    status = str(tx.get("status") or "").upper()
+
+    payment = None
+    if reference:
+        payment = db.execute(
+            select(SubscriptionPayment)
+            .where(SubscriptionPayment.gateway_reference == reference)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+    if payment is None:
+        logger.warning("Evento de Wompi con referencia desconocida: reference=%s transaction.id=%s", reference, tx_id)
+        return "ignored"
+
+    # El monto y la moneda deben coincidir con lo que se cobró: lo que Wompi cobró es lo que firmamos.
+    try:
+        cents = int(tx.get("amount_in_cents"))
+    except (TypeError, ValueError):
+        cents = None
+    if cents != wompi.amount_in_cents(payment.amount) or tx.get("currency") != wompi.CURRENCY:
+        logger.warning(
+            "Evento de Wompi con monto o moneda distintos del pago: reference=%s transaction.id=%s",
+            reference, tx_id,
+        )
+        return "ignored"
+
+    # Una transacción de Wompi no puede aplicarse a dos pagos distintos (defensa en profundidad: `reference`
+    # no va entre los campos firmados del evento).
+    if tx_id is not None:
+        bound_elsewhere = db.execute(
+            select(SubscriptionPayment.id).where(
+                SubscriptionPayment.gateway_transaction_id == tx_id,
+                SubscriptionPayment.id != payment.id,
+            )
+        ).first()
+        if bound_elsewhere is not None:
+            logger.warning(
+                "Evento de Wompi con una transacción ya ligada a otro pago: reference=%s transaction.id=%s",
+                reference, tx_id,
+            )
+            return "ignored"
+
+    if status == "APPROVED":
+        if payment.status == "approved":
+            return "duplicate"
+        if payment.status == "voided":
+            return "ignored"
+        return _approve(db, payment, tx_id, now)
+
+    if status in _REJECTING_STATUSES:
+        if payment.status != "pending":
+            return "ignored"
+        payment.status = "rejected"
+        payment.gateway_transaction_id = tx_id
+        db.commit()
+        return "processed"
+
+    if status == "VOIDED":
+        if payment.status != "approved":
+            return "ignored"
+        payment.status = "voided"
+        db.commit()
+        return "processed"
+
+    return "ignored"
+
+
+def _approve(db: Session, payment: SubscriptionPayment, tx_id: Optional[str], now: datetime) -> str:
+    """Marca el pago aprobado y recalcula la vigencia del tenant (FR-022, RN-7):
+
+    - antes del vencimiento o durante la gracia → el período nuevo parte del vencimiento anterior;
+    - con el tenant `bloqueada` → parte de la fecha de pago.
+
+    Un tenant que ya no tiene ciclo mensual con vencimiento (p. ej. el Super Admin lo pasó a anual mientras el
+    link seguía pendiente) deja el pago `approved` **sin** tocar fechas y se avisa en el log (FR-027)."""
+    tenant = db.execute(
+        select(Tenant).where(Tenant.id == payment.tenant_id).with_for_update().execution_options(populate_existing=True)
+    ).scalar_one()
+
+    payment.status = "approved"
+    payment.paid_at = now
+    payment.gateway_transaction_id = tx_id
+
+    if tenant.ciclo_facturacion == "mensual" and tenant.plan_vence_en is not None:
+        blocked = compute_subscription_status(tenant.plan_vence_en, now).state == "bloqueada"
+        start = now if blocked else tenant.plan_vence_en
+        end = calculate_plan_vencimiento(start, "mensual")
+        payment.period_start = start
+        payment.period_end = end
+        tenant.plan_iniciado_en = start
+        tenant.plan_vence_en = end
+    else:
+        logger.warning(
+            "Pago aprobado de un tenant sin ciclo mensual con vencimiento: no se tocan fechas, requiere revisión de "
+            "soporte (reference=%s tenant_id=%s)",
+            payment.gateway_reference, payment.tenant_id,
+        )
+
+    db.commit()
+    return "processed"

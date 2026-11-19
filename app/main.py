@@ -12,6 +12,7 @@ from app.core.error_middleware import (
     RequestIdMiddleware,
     register_error_handlers,
     register_module_error_handler,
+    register_subscription_error_handlers,
 )
 from app.core.redis import token_blocklist
 from app.core.event_bus import event_bus
@@ -46,6 +47,7 @@ from app.api.v1.plan.router import router as plan_router
 from app.api.v1.realtime.router import router as realtime_router
 from app.api.v1.notifications.router import router as notifications_router
 from app.api.v1.bootstrap.router import router as bootstrap_router
+from app.api.v1.webhooks.router import router as webhooks_router
 load_dotenv()
 
 logging.basicConfig(
@@ -134,6 +136,8 @@ def create_app()->FastAPI:
     register_error_handlers(app, path_prefix=SUPER_ADMIN_ERROR_PREFIX)
     # spec 141 (A-151): el 403 por módulo no incluido lleva `code`/`module` en toda la API.
     register_module_error_handler(app)
+    # spec 161 (A-162): el 403 por suscripción bloqueada lleva `code = "subscription_blocked"` en toda la API.
+    register_subscription_error_handlers(app)
     # spec 074 (FR-015–FR-021): log operativo de toda petición mutativa fuera
     # de super-admin. Sin `path_prefix`: el filtrado de alcance (método y
     # prefijo excluido) vive dentro de la clase. Se agrega de último a
@@ -176,6 +180,8 @@ def create_app()->FastAPI:
     app.include_router(realtime_router, prefix="/api/v1")
     app.include_router(notifications_router, prefix="/api/v1")
     app.include_router(bootstrap_router, prefix="/api/v1")
+    # spec 161: webhooks públicos de pasarelas (sin tenant, sin token; los autentica la firma del evento).
+    app.include_router(webhooks_router, prefix="/api/v1")
     return app
 
 app = create_app()
