@@ -19,6 +19,7 @@ import bcrypt
 from app.core.config import settings
 from app.core.models import Tenant, User, convention, Base
 import app.models  # registra modelos tenant en Base.metadata
+from app.core.subscription_guard import enforce_subscription_access
 from app.core.timezone import utc_now_naive
 from app.models.plan import Plan
 from app.models.denomination_catalog import seed_default_denominations
@@ -297,6 +298,11 @@ def get_tenant(req: Request) -> Tenant:
     # tenant. No cambia qué devuelve esta función, ni cuándo falla, ni su firma.
     req.state.tenant_id = tenant.id
 
+    # spec 161 (A-162): con la suscripción `bloqueada` toda ruta del tenant se rechaza, salvo las exentas
+    # (login, plan, notificaciones...). Va DESPUÉS de fijar `req.state.tenant_id` para que el log operativo
+    # del intento rechazado ya sepa de qué tenant era. En gracia, o sin vencimiento, no hace nada.
+    enforce_subscription_access(tenant, req)
+
     return tenant
 
 def resolve_tenant_by_id(tenant_id: int) -> Tenant:
@@ -307,6 +313,9 @@ def resolve_tenant_by_id(tenant_id: int) -> Tenant:
         tenant = db.query(Tenant).filter(Tenant.id == tenant_id).one_or_none()
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # spec 161 (A-162): el comensal de un tenant bloqueado también se rechaza. Sin `request` no hay
+    # exenciones: ninguna ruta del comensal es exenta.
+    enforce_subscription_access(tenant)
     return tenant
 
 
