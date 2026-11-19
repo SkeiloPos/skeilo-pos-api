@@ -73,3 +73,6 @@ from .notification_channel_pref import NotificationChannelPreference
 from .tenant_membership import TenantMembership
 from .user_session import UserSession
 from .admin_audit_log import AdminAuditLog
+
+# Suscripción del tenant y pago por link de Wompi (spec 161)
+from .subscription_payment import SubscriptionPayment
