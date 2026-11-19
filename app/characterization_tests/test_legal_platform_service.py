@@ -14,8 +14,11 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from pydantic import ValidationError
+
 from app.characterization_tests import legal_fixtures
 from app.api.v1.super_admin import legal_platform_service as service
+from app.api.v1.super_admin import legal_schemas
 
 
 class TestPlatformDocumentStateMachine(unittest.TestCase):
@@ -122,6 +125,29 @@ class TestPlatformDocumentStateMachine(unittest.TestCase):
         self.assertEqual(cm.exception.status_code, 409)
         self.assertEqual(service._get_platform_document_or_404(db, doc.id).estado, "publicado")
 
+    def test_publicar_borrador_vacio_rechaza_422_y_no_publica(self):
+        """`create` permite contenido vacío a propósito (primer borrador sin
+        versión previa de la que partir), pero publicarlo así dejaría al
+        tenant con un snapshot vacío -- debe bloquearse antes de que pase a
+        `publicado`."""
+        db = legal_fixtures.new_session()
+        doc = service.create_platform_document_draft(db, tipo="terminos", contenido_markdown="")
+        with self.assertRaises(HTTPException) as cm:
+            service.publish_platform_document(
+                db, doc.id, fecha_vigencia=datetime.now(timezone.utc), published_by_user_id=uuid4(),
+            )
+        self.assertEqual(cm.exception.status_code, 422)
+        self.assertEqual(service._get_platform_document_or_404(db, doc.id).estado, "borrador")
+
+    def test_publicar_borrador_de_solo_espacios_rechaza_422(self):
+        db = legal_fixtures.new_session()
+        doc = service.create_platform_document_draft(db, tipo="terminos", contenido_markdown="   \n  ")
+        with self.assertRaises(HTTPException) as cm:
+            service.publish_platform_document(
+                db, doc.id, fecha_vigencia=datetime.now(timezone.utc), published_by_user_id=uuid4(),
+            )
+        self.assertEqual(cm.exception.status_code, 422)
+
 
 class TestMasterTemplateStateMachine(unittest.TestCase):
     """T041 — `master_legal_templates` (misma máquina de estados)."""
@@ -171,6 +197,16 @@ class TestMasterTemplateStateMachine(unittest.TestCase):
         with self.assertRaises(HTTPException) as cm:
             service.edit_master_template_draft(db, template.id, contenido_markdown="otro")
         self.assertEqual(cm.exception.status_code, 409)
+
+    def test_publicar_plantilla_vacia_rechaza_422_y_no_publica(self):
+        db = legal_fixtures.new_session()
+        template = service.create_master_template_draft(db, contenido_markdown="")
+        with self.assertRaises(HTTPException) as cm:
+            service.publish_master_template(
+                db, template.id, fecha_vigencia=datetime.now(timezone.utc), published_by_user_id=uuid4(),
+            )
+        self.assertEqual(cm.exception.status_code, 422)
+        self.assertEqual(service._get_master_template_or_404(db, template.id).estado, "borrador")
 
 
 class TestMasterTemplateVariableValidation(unittest.TestCase):
@@ -223,6 +259,31 @@ class TestMasterTemplateVariableValidation(unittest.TestCase):
             )
         self.assertEqual(cm.exception.status_code, 422)
         self.assertEqual(cm.exception.detail["variables_no_permitidas"], ["inventado"])
+
+
+class TestEsquemasRechazanContenidoVacioAlEditar(unittest.TestCase):
+    """El body de `POST .../{id}` (crear) puede llegar vacío a propósito
+    (primer borrador sin versión previa), pero el de `PATCH` (edición
+    explícita del admin) no debería aceptar guardar la nada -- ese fue el
+    hueco que dejaba publicar contenido vacío en producción."""
+
+    def test_patch_platform_document_rechaza_contenido_vacio(self):
+        with self.assertRaises(ValidationError):
+            legal_schemas.PlatformLegalDocumentPatch(contenido_markdown="")
+
+    def test_patch_platform_document_rechaza_solo_espacios(self):
+        with self.assertRaises(ValidationError):
+            legal_schemas.PlatformLegalDocumentPatch(contenido_markdown="   ")
+
+    def test_patch_master_template_rechaza_contenido_vacio(self):
+        with self.assertRaises(ValidationError):
+            legal_schemas.MasterLegalTemplatePatch(contenido_markdown="")
+
+    def test_post_master_template_in_sigue_permitiendo_vacio(self):
+        # `create` (POST) debe seguir aceptando vacío -- es el borrador
+        # inicial sin versión previa de la que partir.
+        schema = legal_schemas.MasterLegalTemplateIn(contenido_markdown="")
+        self.assertEqual(schema.contenido_markdown, "")
 
 
 if __name__ == "__main__":

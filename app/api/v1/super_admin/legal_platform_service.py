@@ -100,6 +100,11 @@ def publish_platform_document(
             status.HTTP_409_CONFLICT,
             "Solo se puede publicar un documento en estado borrador",
         )
+    if not doc.contenido_markdown.strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "El borrador no tiene contenido — guárdalo con texto antes de publicar",
+        )
 
     try:
         previous = db.execute(
@@ -289,6 +294,11 @@ def publish_master_template(
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "Solo se puede publicar una plantilla en estado borrador",
+        )
+    if not template.contenido_markdown.strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "El borrador no tiene contenido — guárdalo con texto antes de publicar",
         )
 
     variables_no_permitidas = validate_variables(template.contenido_markdown)
