@@ -47,6 +47,7 @@ for _k, _v in {
     "R2_BUCKET_NAME": "x", "R2_ENDPOINT_URL": "https://example.invalid",
     "R2_PUBLIC_BASE_URL": "https://example.invalid",
     "ASSETS_BASE_URL": "https://assets.example.invalid",
+    "CONSENT_IP_HASH_SALT": "test",
     "SUPER_ADMIN_NAME": "t", "SUPER_ADMIN_EMAIL": "t@example.invalid",
     "SUPER_ADMIN_PASSWORD": "t",
 }.items():
