@@ -44,6 +44,16 @@ def stream_key(tenant_id: int) -> str:
 CH_STAFF = "staff"
 
 
+def staff_role_channel(role: str) -> str:
+    """Canal del personal de UN rol (spec 161, FR-031, A-164): `staff:admin`, `staff:cashier`...
+
+    Lo usan las notificaciones dirigidas a un rol (los avisos de suscripción, solo para ADMIN): se publican
+    únicamente aquí y no en `CH_STAFF`. Cada conexión del staff se suscribe a `CH_STAFF` **y** al canal de su
+    propio rol, derivado del ticket y nunca pedido por el cliente, así que un cajero no puede escuchar el del admin.
+    """
+    return f"staff:{role.lower()}"
+
+
 def session_channel(table_session_id: UUID | str) -> str:
     """Canal de una sesión de mesa: solo sus comensales.
 

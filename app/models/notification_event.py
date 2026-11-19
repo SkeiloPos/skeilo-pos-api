@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, Index, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,8 +37,29 @@ class NotificationEvent(UUIDPrimaryKeyMixin, Base):
         PGUUID(as_uuid=True), nullable=True
     )
 
+    # Rol al que va dirigida la notificación (spec 161, FR-031, A-164). `NULL` = todo el personal, que es el
+    # comportamiento de todos los eventos anteriores a la spec 161 (`order.created`, `payment.completed`): sin
+    # backfill ni cambio para ellos. Con valor (`ADMIN`), solo los usuarios de ese rol la ven en el listado,
+    # en el canal en tiempo real (`staff:<rol>`) y en el push; los demás roles ni siquiera pueden marcarla
+    # atendida (404).
+    audience_role: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
     # Resumen informativo de intentos por canal, p. ej.
     # {"in_app": {"delivered_at": "..."}, "push": {"attempted": 3, "delivered": 2}}.
     delivery: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
 
-    __table_args__ = ({"schema": "tenant"},)
+    __table_args__ = (
+        # Un aviso de suscripción por tipo y ciclo de vencimiento (spec 161, FR-029, SC-008): `related_entity_id`
+        # se deriva del tipo y de `plan_vence_en`, así que repetirlo es el mismo aviso. Parcial: no toca a los
+        # demás tipos de evento, que no tienen esa unicidad. Garantiza «una sola vez» aunque dos instancias
+        # del planificador corran a la vez.
+        Index(
+            "ux__notification_events__subscription_once",
+            "event_type",
+            "related_entity_id",
+            unique=True,
+            postgresql_where=text("event_type LIKE 'subscription.%'"),
+            sqlite_where=text("event_type LIKE 'subscription.%'"),
+        ),
+        {"schema": "tenant"},
+    )

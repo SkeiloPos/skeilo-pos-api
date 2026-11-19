@@ -37,4 +37,18 @@ def summarize(event: NotificationEvent) -> str:
             f"Pago recibido · {_formato_pesos_espacio(total)}"
             if total is not None else "Pago recibido"
         )
+    # spec 161 (A-164): avisos de suscripción para el ADMIN. La fecha límite ya viene formateada en la zona
+    # horaria del tenant (`fecha_limite_pago_local`): `summarize` no recibe el tenant.
+    if event.event_type == "subscription.expiring":
+        dias = payload.get("dias_restantes")
+        if dias is None:
+            return "Tu suscripción está por vencer. Paga para evitar interrupciones."
+        return f"Tu suscripción vence en {dias} día{'s' if dias != 1 else ''}. Paga para evitar interrupciones."
+    if event.event_type == "subscription.grace_started":
+        limite = payload.get("fecha_limite_pago_local")
+        if not limite:
+            return "Tu suscripción venció. Paga ahora para evitar el bloqueo."
+        return f"Tu suscripción venció. Tienes hasta el {limite} para pagar sin interrupciones."
+    if event.event_type == "subscription.blocked":
+        return "Tu suscripción está bloqueada. Paga tu plan para volver a operar."
     return event.event_type

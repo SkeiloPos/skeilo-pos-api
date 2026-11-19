@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.models import Role, User
 from app.core.notifications.summary import summarize
 from app.models.notification_event import NotificationEvent
 from app.models.push_subscription import PushSubscription
@@ -34,9 +35,16 @@ class BrowserPushChannel:
             logger.warning("VAPID no configurado; se omite el canal push")
             return
 
-        suscripciones = self._db.execute(
-            select(PushSubscription).where(PushSubscription.active.is_(True))
-        ).scalars().all()
+        consulta = select(PushSubscription).where(PushSubscription.active.is_(True))
+        if event.audience_role:
+            # spec 161 (A-164): una notificación dirigida a un rol solo se empuja a los dispositivos de usuarios de
+            # ese rol. `users`/`roles` son del esquema `shared`, que el `schema_translate_map` no toca.
+            consulta = consulta.where(
+                PushSubscription.user_id.in_(
+                    select(User.id).join(Role, User.role_id == Role.id).where(Role.name == event.audience_role)
+                )
+            )
+        suscripciones = self._db.execute(consulta).scalars().all()
         if not suscripciones:
             return
 

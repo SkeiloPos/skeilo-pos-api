@@ -8,7 +8,7 @@ sale siempre de `Depends(get_tenant)`, y las consultas ORM corren bajo el
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.api.v1.notifications.schemas import (
@@ -29,6 +29,15 @@ from app.core.timezone import utc_now_naive
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 
+def _visible_to(role: str | None):
+    """Condición SQL de las notificaciones que un rol puede ver (spec 161, A-164): las dirigidas a todo el personal
+    (`audience_role` NULL, todas las anteriores a la spec 161) y las dirigidas a su propio rol. Un usuario sin rol
+    conocido solo ve las primeras."""
+    if not role:
+        return NotificationEvent.audience_role.is_(None)
+    return or_(NotificationEvent.audience_role.is_(None), NotificationEvent.audience_role == role)
+
+
 @router.get("", response_model=NotificationListResponse, summary="Listar notificaciones del tenant")
 def list_notifications(
     page: int = Query(1, ge=1),
@@ -37,9 +46,13 @@ def list_notifications(
     limit: int = Query(100, ge=1, le=500),
     only_pending: bool = Query(False),
     db: Session = Depends(get_db),
+    # El parámetro se sigue llamando `_`: `bootstrap/service.py` (spec 100) llama a esta función por nombre
+    # (`_=user`). Renombrarlo rompería ese bloque en silencio, porque el bootstrap degrada a `null` en vez de fallar.
     _: User = Depends(get_current_user),
 ):
-    stmt = select(NotificationEvent)
+    # spec 161 (A-164): solo se ven las notificaciones dirigidas a todo el personal o al rol del usuario.
+    # `getattr`: un usuario sin `role_name` (los dobles de prueba de la spec 077) cuenta como «sin rol».
+    stmt = select(NotificationEvent).where(_visible_to(getattr(_, "role_name", None)))
     if only_pending:
         stmt = stmt.where(NotificationEvent.attended_at.is_(None))
 
@@ -142,7 +155,9 @@ def attend_notification(
     user: User = Depends(get_current_user),
 ):
     notification = db.get(NotificationEvent, notification_id)
-    if notification is None:
+    # Una notificación dirigida a otro rol responde 404 y no 403: no se revela que existe (spec 161, A-164).
+    role = getattr(user, "role_name", None)
+    if notification is None or (notification.audience_role and notification.audience_role != role):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Notificación no encontrada")
 
     # Idempotente: si ya la atendió otro cajero, no cambia nada y responde 200

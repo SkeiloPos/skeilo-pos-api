@@ -27,7 +27,7 @@ import anyio
 from fastapi import HTTPException, status
 
 from app.core.config import settings
-from app.core.events import CH_STAFF, menu_channel, session_channel
+from app.core.events import CH_STAFF, menu_channel, session_channel, staff_role_channel
 from app.core.qr_context import open_session_context
 from app.core.redis import token_blocklist as redis
 
@@ -79,12 +79,18 @@ async def resolve_diner(token: str) -> Subscriber:
     return await anyio.to_thread.run_sync(_validate_diner_sync, token)
 
 
-async def issue_ticket(tenant_id: int, user_id) -> str:
-    """Emite el ticket de un solo uso del staff."""
+async def issue_ticket(tenant_id: int, user_id, role: str | None = None) -> str:
+    """Emite el ticket de un solo uso del staff.
+
+    `role` (spec 161, A-164) es el rol del usuario: con él `resolve_staff` suscribe la conexión al canal de
+    ese rol además del común. Sale del usuario autenticado, nunca de la petición."""
     raw = secrets.token_urlsafe(24)
+    payload = {"t": tenant_id, "u": str(user_id)}
+    if role:
+        payload["r"] = role
     await redis.set(
         f"{_TICKET_PREFIX}{raw}",
-        json.dumps({"t": tenant_id, "u": str(user_id)}),
+        json.dumps(payload),
         ex=settings.REALTIME_TICKET_TTL_SECONDS,
     )
     return raw
@@ -105,9 +111,15 @@ async def resolve_staff(ticket: str) -> Subscriber:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Ticket inválido o ya usado")
 
     data = json.loads(raw if isinstance(raw, str) else raw.decode())
+    # spec 161 (A-164): además del canal común, el del rol del usuario (`staff:admin`...), donde se publican las
+    # notificaciones dirigidas a ese rol. Un ticket sin `r` (emitido antes del despliegue, vive 30 s) conserva
+    # solo el común, que es lo que tenía.
+    channels = {CH_STAFF}
+    if data.get("r"):
+        channels.add(staff_role_channel(data["r"]))
     return Subscriber(
         tenant_id=int(data["t"]),
-        channels=frozenset({CH_STAFF}),
+        channels=frozenset(channels),
         kind="staff",
     )
 

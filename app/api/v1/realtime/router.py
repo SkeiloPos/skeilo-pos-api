@@ -173,7 +173,7 @@ async def create_ticket(
     if not settings.REALTIME_ENABLED:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Tiempo real desactivado")
     await rate_limit(request, "realtime_ticket")
-    raw = await issue_ticket(tenant.id, user.id)
+    raw = await issue_ticket(tenant.id, user.id, user.role_name)
     return TicketResponse(ticket=raw, expires_in=settings.REALTIME_TICKET_TTL_SECONDS)
 
 
