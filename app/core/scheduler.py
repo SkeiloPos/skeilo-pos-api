@@ -29,8 +29,8 @@ Dos detalles que no son opcionales:
   mismas filas.
 """
 import logging
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, text
 
@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 _LOCK_KEY = "lock:sweep_table_sessions"
 _PROMO_LOCK_KEY = "lock:expire_promotions"
 _NOTIFICATIONS_PURGE_LOCK_KEY = "lock:purge_notifications"
+_SUBSCRIPTION_ALERTS_LOCK_KEY = "lock:subscription_alerts"
 
 
 def _abandonadas_sin_pedir(db, now: datetime) -> list:
@@ -269,6 +270,118 @@ def expire_promotions() -> int:
     return total
 
 
+# ======================================================================
+# Avisos de suscripción (spec 161, Historia 5; research.md Decisión 12)
+# ======================================================================
+
+
+def _alert_window_open(now: datetime, timezone_name: str) -> bool:
+    """¿Está la hora LOCAL del tenant dentro de la ventana en que se permite emitir avisos (FR-030)?
+
+    La zona horaria decide únicamente CUÁNDO se emite el aviso: los tramos de estado (48 h / 120 h) son exactos en
+    UTC y no se tocan. Inicio inclusivo y fin exclusivo; con `0` y `24` la ventana está siempre abierta. Una zona
+    desconocida cae a la de por defecto del sistema."""
+    start = settings.SUBSCRIPTION_ALERT_LOCAL_START_HOUR
+    end = settings.SUBSCRIPTION_ALERT_LOCAL_END_HOUR
+    if start <= 0 and end >= 24:
+        return True
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo(settings.TENANT_TIMEZONE)
+    local_hour = now.replace(tzinfo=timezone.utc).astimezone(zone).hour
+    return start <= local_hour < end
+
+
+def expire_stale_subscription_payments(now: datetime | None = None) -> int:
+    """Marca `expired` los pagos de suscripción `pending` cuyo link ya venció (`payment_link_expires_at <= now`,
+    el mismo criterio con el que el servicio decide no reutilizarlos), para que el historial no muestre links
+    caducados como pendientes. Una aprobación tardía igual se aplica después (D7). Devuelve cuántos tocó."""
+    from sqlalchemy import update
+    from app.models.subscription_payment import SubscriptionPayment
+
+    now = now if now is not None else utc_now_naive()
+    with with_db(None) as db:
+        result = db.execute(
+            update(SubscriptionPayment)
+            .where(SubscriptionPayment.status == "pending", SubscriptionPayment.payment_link_expires_at <= now)
+            .values(status="expired")
+        )
+        db.commit()
+        return result.rowcount
+
+
+def evaluate_subscription_alerts(now: datetime | None = None) -> int:
+    """Emite, para cada tenant con vencimiento, el aviso de suscripción que corresponde a su estado ACTUAL y que
+    aún no se haya enviado en este ciclo (FR-028 a FR-032). Devuelve cuántos avisos emitió.
+
+    - `por_vencer` → `subscription.expiring`; `en_gracia` → `.grace_started`; `bloqueada` → `.blocked`;
+      `activa` → ninguno. Solo el del estado vigente (FR-032): tras una caída larga del job no se avisa
+      «vence en 2 días» a un tenant que ya está bloqueado.
+    - Solo se emite dentro de la ventana horaria local del tenant (`_alert_window_open`); fuera de ella se espera
+      al siguiente tick. El estado y el bloqueo en sí siguen siendo exactos.
+    - Idempotente: un aviso por tipo y ciclo de vencimiento (`dispatch._dispatch_once`).
+    - Un tenant que falla no impide el barrido de los demás, igual que `sweep_orphan_sessions`.
+    - De paso marca `expired` los links de pago vencidos.
+    """
+    from app.core.models import Tenant
+    from app.core.notifications import dispatch
+    from app.core.subscription import compute_subscription_status
+
+    now = now if now is not None else utc_now_naive()
+
+    try:
+        expire_stale_subscription_payments(now)
+    except Exception:
+        logger.exception("Error expirando los links de pago vencidos")
+
+    with with_db(None) as db:
+        tenants = [
+            (t.id, t.schema, t.timezone)
+            for t in db.execute(select(Tenant).where(Tenant.plan_vence_en.is_not(None))).scalars().all()
+        ]
+
+    emitidos = 0
+    for tenant_id, schema, timezone_name in tenants:
+        try:
+            if not _alert_window_open(now, timezone_name):
+                continue
+            with with_db(schema) as db:
+                tenant = db.get(Tenant, tenant_id)
+                status = compute_subscription_status(tenant.plan_vence_en, now)
+                # Se busca por nombre en `dispatch` en cada pasada (no una tabla fijada al importar): permite
+                # parchear una función en las pruebas, y un renombre falla de inmediato en vez de callar.
+                notify = {
+                    "por_vencer": dispatch.notify_subscription_expiring,
+                    "en_gracia": dispatch.notify_subscription_grace_started,
+                    "bloqueada": dispatch.notify_subscription_blocked,
+                }.get(status.state)
+                if notify is not None and notify(db, tenant, status) is not None:
+                    emitidos += 1
+        except Exception:
+            logger.exception("Error emitiendo avisos de suscripción del tenant %s", tenant_id)
+
+    if emitidos:
+        logger.info("Avisos de suscripción: %d emitido(s)", emitidos)
+    return emitidos
+
+
+async def _run_subscription_alerts_with_lock() -> None:
+    """Igual patrón que `_run_expire_promotions_with_lock`: un solo worker corre el job por ciclo. El TTL del lock
+    es la mitad del intervalo para que el siguiente disparo no quede bloqueado."""
+    ttl = max(int(settings.SUBSCRIPTION_ALERT_INTERVAL_MINUTES * 60 / 2), 30)
+    try:
+        got = await redis.set(_SUBSCRIPTION_ALERTS_LOCK_KEY, "1", ex=ttl, nx=True)
+    except Exception:
+        logger.warning("Redis no disponible; se omiten los avisos de suscripción", exc_info=True)
+        return
+    if not got:
+        return  # otro worker lo está haciendo
+
+    import anyio
+    await anyio.to_thread.run_sync(evaluate_subscription_alerts)
+
+
 async def _run_expire_promotions_with_lock() -> None:
     """Igual patrón que `_run_with_lock`: un solo worker corre el job por ciclo.
 
@@ -366,6 +479,16 @@ def start_scheduler():
         replace_existing=True,
         max_instances=1,
     )
+    scheduler.add_job(
+        _run_subscription_alerts_with_lock,
+        # `IntervalTrigger`, no un `CronTrigger` de hora fija: igual que `expire_promotions`, una hora fija se
+        # interpretaría en la zona del servidor y no en la de cada tenant (A-128). La ventana horaria local de
+        # cada tenant se aplica dentro de `evaluate_subscription_alerts`.
+        IntervalTrigger(minutes=settings.SUBSCRIPTION_ALERT_INTERVAL_MINUTES),
+        id="subscription_alerts",
+        replace_existing=True,
+        max_instances=1,
+    )
     scheduler.start()
     logger.info(
         "Barrido de sesiones activo: cada %d min, cierra las de más de %d h",
@@ -373,4 +496,9 @@ def start_scheduler():
     )
     logger.info("Expiración de promociones activa: a medianoche")
     logger.info("Purga de notificaciones activa: a medianoche y media")
+    logger.info(
+        "Avisos de suscripción activos: cada %d min, ventana local %02d:00–%02d:00",
+        settings.SUBSCRIPTION_ALERT_INTERVAL_MINUTES,
+        settings.SUBSCRIPTION_ALERT_LOCAL_START_HOUR, settings.SUBSCRIPTION_ALERT_LOCAL_END_HOUR,
+    )
     return scheduler
