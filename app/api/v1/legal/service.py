@@ -11,13 +11,22 @@ from app.core.legal_markdown import render_markdown_to_html
 from app.core.models import MasterLegalTemplate
 from app.models import TenantLegalDocument, TenantLegalProfile
 
-_CAMPOS_OBLIGATORIOS = (
+_CAMPOS_PERFIL = (
     "razon_social",
     "identificacion_legal",
     "direccion_legal",
     "ciudad",
     "correo_contacto",
     "telefono_contacto",
+)
+
+# `identificacion_legal` (NIT/RUT) es, por ahora, el único dato del perfil
+# que no bloquea la generación ni la publicación del documento (spec 162,
+# FR-012/FR-012a): el tenant puede publicar sin haberlo ingresado y la línea
+# correspondiente se omite del texto renderizado (legal_template.py
+# OPTIONAL_TEMPLATE_VARIABLES).
+_CAMPOS_OBLIGATORIOS = tuple(
+    campo for campo in _CAMPOS_PERFIL if campo != "identificacion_legal"
 )
 
 
@@ -92,7 +101,7 @@ _CAMPO_A_VARIABLE = {"razon_social": "nombre_negocio"}
 def _render_for_profile(template: MasterLegalTemplate, profile: TenantLegalProfile) -> str:
     valores = {
         _CAMPO_A_VARIABLE.get(campo, campo): getattr(profile, campo)
-        for campo in _CAMPOS_OBLIGATORIOS
+        for campo in _CAMPOS_PERFIL
     }
     return substitute_variables(template.contenido_markdown, valores)
 
