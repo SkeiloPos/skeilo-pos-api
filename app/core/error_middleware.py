@@ -72,7 +72,12 @@ from starlette.responses import JSONResponse, Response
 
 from app.core.config import settings
 from app.core.domain_errors import DomainError
-from app.core.exceptions import ModuleNotInPlanError
+from app.core.exceptions import (
+    ModuleNotInPlanError,
+    PaymentGatewayNotConfiguredError,
+    SubscriptionBlockedError,
+    SubscriptionNotPayableError,
+)
 from app.core.error_response import (
     envelope_from_domain_error,
     envelope_from_http_exception,
@@ -358,5 +363,45 @@ def register_module_error_handler(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail, "code": exc.code, "module": exc.module},
+            headers=getattr(exc, "headers", None),
+        )
+
+
+# ==========================================================================
+# Suscripción bloqueada (spec 161, A-162)
+# ==========================================================================
+
+
+def register_subscription_error_handlers(app: FastAPI) -> None:
+    """Responde los tres errores de suscripción con `{detail, code[, reason]}` en **toda** la API: el 403 por
+    suscripción bloqueada, el 409 por link no pagable y el 503 por pasarela sin configurar.
+
+    Mismo mecanismo que `register_module_error_handler`: Starlette elige el handler recorriendo el MRO de la
+    excepción, así que este tipo más específico gana sobre el de `HTTPException` sin alterar ningún otro
+    rechazo (rol, límite, módulo fuera del plan). Ninguna ruta de super-admin lo lanza (no resuelven tenant),
+    así que no se solapa con el envelope de `register_error_handlers`.
+    """
+
+    @app.exception_handler(SubscriptionBlockedError)
+    async def _subscription_blocked_handler(request: Request, exc: SubscriptionBlockedError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "code": exc.code},
+            headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(SubscriptionNotPayableError)
+    async def _subscription_not_payable_handler(request: Request, exc: SubscriptionNotPayableError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "code": exc.code, "reason": exc.reason},
+            headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(PaymentGatewayNotConfiguredError)
+    async def _payment_gateway_not_configured_handler(request: Request, exc: PaymentGatewayNotConfiguredError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "code": exc.code},
             headers=getattr(exc, "headers", None),
         )

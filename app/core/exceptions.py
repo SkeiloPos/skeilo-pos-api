@@ -50,6 +50,72 @@ class ModuleNotInPlanError(HTTPException):
         self.module = module
 
 
+class SubscriptionBlockedError(HTTPException):
+    """La suscripción del tenant está `bloqueada`: pasaron 120 h desde `plan_vence_en` sin un pago aprobado
+    (spec 161, FR-006/FR-007, A-161/A-162).
+
+    Es `HTTPException(403)` para que los `except HTTPException` existentes la sigan atrapando, y `detail`
+    sigue siendo **siempre un `str`**, con el mismo texto de siempre del 403 por plan vencido (spec 033):
+    solo gana `code`, que viaja aparte en el cuerpo (ver `register_subscription_error_handlers` en
+    `app/core/error_middleware.py`) para que el front distinga este rechazo del de módulo fuera del plan
+    (`MODULE_NOT_IN_PLAN`), de los de rol y de los de límite de recursos.
+
+    El `code` va en minúsculas porque así lo fija la spec 161 (D1); `MODULE_NOT_IN_PLAN` va en mayúsculas.
+    """
+
+    code = "subscription_blocked"
+
+    def __init__(self):
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu plan venció. Debe renovarse para seguir usando el sistema.",
+        )
+
+
+#: Por qué un tenant no puede pedir un link de pago (spec 161, FR-012/FR-013, contrato `subscription-api.md § 2`).
+#: Texto en español de Colombia, pensado para mostrarse tal cual al ADMIN.
+SUBSCRIPTION_NOT_PAYABLE_REASONS = {
+    # Ciclo en curso ya pagado: un solo período abierto, nunca se pagan meses por adelantado (D5).
+    "already_active": "Tu suscripción está al día; podrás pagar la siguiente cuando falten 48 horas para vencer.",
+    "no_expiry": "Tu plan no tiene vencimiento; no requiere pago.",
+    "unsupported_cycle": "Tu plan se renueva con la plataforma; contacta a soporte.",
+    "no_price": "Tu plan no tiene un precio mensual definido; contacta a soporte.",
+}
+
+
+class SubscriptionNotPayableError(HTTPException):
+    """El tenant no puede pedir un link de pago por este flujo (spec 161, FR-012/FR-013): conflicto controlado.
+
+    `reason` ∈ `SUBSCRIPTION_NOT_PAYABLE_REASONS` viaja aparte en el cuerpo junto con `code`, y `detail` sigue
+    siendo siempre un `str`. Una razón desconocida es un error de programación y se rechaza al construir.
+    """
+
+    code = "subscription_not_payable"
+
+    def __init__(self, reason: str):
+        if reason not in SUBSCRIPTION_NOT_PAYABLE_REASONS:
+            raise ValueError(f"reason inválida: {reason!r}")
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=SUBSCRIPTION_NOT_PAYABLE_REASONS[reason],
+        )
+        self.reason = reason
+
+
+class PaymentGatewayNotConfiguredError(HTTPException):
+    """Faltan las credenciales de Wompi en la configuración del entorno (spec 161, FR-017): sin ellas no se
+    puede firmar un link. Es un 503 controlado, nunca un 500, y se lanza **antes** de escribir nada. El
+    mensaje no revela qué variable falta."""
+
+    code = "payment_gateway_not_configured"
+
+    def __init__(self):
+        super().__init__(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El pago en línea no está disponible por ahora. Intenta más tarde o contacta a soporte.",
+        )
+
+
 class PendingPaymentExit(HTTPException):
     """Un comensal intenta salir del Menú QR con un pago propio sin confirmar (spec 130, A-139).
 
