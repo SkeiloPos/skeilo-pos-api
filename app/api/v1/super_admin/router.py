@@ -24,6 +24,7 @@ from app.api.v1.super_admin.audit_router import router as audit_router
 from app.api.v1.super_admin.payment_methods_router import router as payment_methods_catalog_router
 from app.api.v1.super_admin.plans_router import router as plans_router
 from app.api.v1.super_admin.users_router import router as users_detail_router
+from app.api.v1.super_admin.subscription_payments_router import router as subscription_payments_router
 
 from app.celery_task import send_email_task
 from app.core.config import settings
@@ -42,6 +43,7 @@ router = APIRouter(
 router.include_router(payment_methods_catalog_router)
 router.include_router(plans_router)
 router.include_router(audit_router)
+router.include_router(subscription_payments_router)  # spec 161: historial de pagos de suscripción por tenant
 
 
 # spec 159, Edge case "Sin actividad reciente": el spec no fija un número

@@ -296,3 +296,27 @@ def _approve(db: Session, payment: SubscriptionPayment, tx_id: Optional[str], no
 
     db.commit()
     return "processed"
+
+
+# ======================================================================
+# Historia 6 — el historial de pagos
+# ======================================================================
+
+
+def list_payments(db: Session, tenant_id: int, page: int, size: int) -> tuple[list[SubscriptionPayment], int]:
+    """Pagos de UN tenant, del más reciente al más antiguo, paginados, y su total (FR-033, FR-034).
+
+    El `tenant_id` lo pone siempre el llamador a partir del tenant resuelto por la petición (`x-tenant-host`) o
+    de la ruta del Super Admin; **nunca** viene de un parámetro del cliente, así que un ADMIN no puede pedir los
+    pagos de otro tenant (SC-010). Se desempata por `id` para que dos pagos con la misma fecha salgan siempre en
+    el mismo orden entre páginas."""
+    where = SubscriptionPayment.tenant_id == tenant_id
+    total = db.execute(select(func.count()).select_from(SubscriptionPayment).where(where)).scalar_one()
+    items = db.execute(
+        select(SubscriptionPayment)
+        .where(where)
+        .order_by(SubscriptionPayment.created_at.desc(), SubscriptionPayment.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    ).scalars().all()
+    return list(items), total

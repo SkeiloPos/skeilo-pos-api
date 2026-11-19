@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db, get_tenant
@@ -7,7 +7,7 @@ from app.core.models import Tenant, User
 from app.core import wompi
 from app.api.v1.plan import service, subscription_service
 from app.api.v1.plan.schemas import PlanSummaryResponse
-from app.api.v1.plan.subscription_schemas import PaymentLinkResponse
+from app.api.v1.plan.subscription_schemas import PaymentHistoryItem, PaymentHistoryResponse, PaymentLinkResponse
 
 router = APIRouter(prefix="/plan", tags=["plan"])
 
@@ -73,4 +73,29 @@ def create_payment_link(
         payment_link_url=payment.payment_link_url,
         payment_link_expires_at=payment.payment_link_expires_at,
         reused=reused,
+    )
+
+
+@router.get(
+    "/subscription/payments",
+    response_model=PaymentHistoryResponse,
+    summary="Historial de pagos de suscripción del tenant",
+    description=(
+        "Pagos de suscripción del propio tenant, del más reciente al más antiguo y paginados (spec 161, FR-033, "
+        "FR-035). Solo el ADMIN. El tenant sale siempre de `x-tenant-host`: no existe un parámetro de tenant, así "
+        "que nunca se ven pagos de otro. No expone el link de pago, la transacción ni la firma. Con el tenant "
+        "bloqueado sigue funcionando (ruta exenta del bloqueo)."
+    ),
+    responses={403: {"description": "El usuario no es ADMIN del tenant."}},
+)
+def list_subscription_payments(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    _: User = Depends(require_tenant_admin),
+):
+    items, total = subscription_service.list_payments(db, tenant.id, page, size)
+    return PaymentHistoryResponse(
+        items=[PaymentHistoryItem.model_validate(p) for p in items], total=total, page=page, size=size
     )
