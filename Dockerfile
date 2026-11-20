@@ -4,12 +4,14 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    TZ=America/Bogota
 
 # Dependencias del sistema
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependencias de Python
