@@ -222,7 +222,7 @@ def sweep_orphan_sessions() -> int:
 
 
 def expire_promotions() -> int:
-    """Pasa a `finished` las promociones cuyo `ends_at` ya venció, en todos los
+    """Pasa a `finished` las promociones cuya vigencia ya venció, en todos los
     tenants. `ends_at` se guarda en hora **local del tenant** (A-08, igual que
     `_valid_now`), así que el corte también se calcula en esa misma zona
     horaria por tenant (`now_local` abajo, vía `ZoneInfo(tz_name)`) -- eso
@@ -235,10 +235,22 @@ def expire_promotions() -> int:
     antes de tiempo según el offset del tenant (A-128). `active_variant_set_rules`
     filtra `status == "active"` en SQL antes de llamar a `_valid_now()`, así
     que una promoción marcada `finished` de más deja de evaluarse aunque su
-    `ends_at` siga vigente. `finished` es terminal: para revivir una
-    promoción se duplica."""
-    from sqlalchemy import update
+    vigencia real siga vigente. `finished` es terminal: para revivir una
+    promoción se duplica.
+
+    El corte real NO es solo `ends_at`: `_valid_now` también evalúa
+    `days_of_week` y la ventana horaria `start_time`/`end_time` (con soporte
+    de cruce de medianoche). `ends_at` llega del frontend como solo-fecha
+    (medianoche, naive) -- compararlo tal cual contra `now_local` marcaba
+    `finished` apenas empezaba el día, aunque la promoción debía seguir
+    vigente esa fecha (y posiblemente solo en ciertos días/horas). Por eso el
+    corte real se calcula con `promotion_expiry_cutoff()`
+    (app/api/v1/promotions/service.py), que combina las cuatro reglas igual
+    que `_valid_now`, para que el `status` persistido refleje la misma
+    vigencia que se evalúa en vivo en caja."""
+    from sqlalchemy import func, update
     from app.models.promotion import Promotion
+    from app.api.v1.promotions.service import promotion_expiry_cutoff
 
     total = 0
     with with_db(None) as db:
@@ -251,24 +263,46 @@ def expire_promotions() -> int:
             tz = ZoneInfo(tz_name) if tz_name else ZoneInfo(
                 settings.TENANT_TIMEZONE)
             now_local = datetime.now(tz).replace(tzinfo=None)
+            today_local = now_local.date()
             with with_db(schema) as db:
-                # `update()` sobre el modelo (no SQL crudo): el `schema_translate_map`
-                # de `with_db` solo traduce sentencias ORM, no texto plano con nombres
-                # de tabla sin calificar.
-                logger.info(
+                # `update()`/`select()` sobre el modelo (no SQL crudo): el
+                # `schema_translate_map` de `with_db` solo traduce sentencias
+                # ORM, no texto plano con nombres de tabla sin calificar.
+                logger.debug(
                     "expire_promotions: schema=%s tz_name=%s now_local=%s",
                     schema, tz_name, now_local,
                 )
 
-                result = db.execute(
-                    update(Promotion)
-                    .where(Promotion.status.in_(("active", "paused", "draft")),
-                           Promotion.ends_at.is_not(None), Promotion.ends_at < now_local)
-                    .values(status="finished")
-                    .returning(Promotion.id, Promotion.name, Promotion.ends_at)
-                )
-                expiradas = result.all()
-                db.commit()
+                # Poda de performance por índice (`ix_promotions_status_ends_at`):
+                # siempre es un superconjunto seguro, porque el corte real
+                # (`promotion_expiry_cutoff`) nunca cae después de
+                # `ends_at.date() + 1`. La decisión exacta se evalúa en
+                # Python abajo, fila por fila.
+                candidatas = db.execute(
+                    select(Promotion).where(
+                        Promotion.status.in_(("active", "paused", "draft")),
+                        Promotion.ends_at.is_not(None),
+                        func.date(Promotion.ends_at) <= today_local,
+                    )
+                ).scalars().all()
+
+                vencidas_ids = [
+                    p.id for p in candidatas
+                    if (cutoff := promotion_expiry_cutoff(p)) is not None
+                    and now_local > cutoff
+                ]
+
+                expiradas = []
+                if vencidas_ids:
+                    result = db.execute(
+                        update(Promotion)
+                        .where(Promotion.id.in_(vencidas_ids))
+                        .values(status="finished")
+                        .returning(Promotion.id, Promotion.name, Promotion.ends_at)
+                    )
+                    expiradas = result.all()
+                    db.commit()
+
                 total += len(expiradas)
                 for promo_id, name, ends_at in expiradas:
                     logger.info(
