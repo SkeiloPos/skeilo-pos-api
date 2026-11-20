@@ -255,16 +255,27 @@ def expire_promotions() -> int:
                 # `update()` sobre el modelo (no SQL crudo): el `schema_translate_map`
                 # de `with_db` solo traduce sentencias ORM, no texto plano con nombres
                 # de tabla sin calificar.
-                logger.info("hora local %s", now_local)
+                logger.info(
+                    "expire_promotions: schema=%s tz_name=%s now_local=%s",
+                    schema, tz_name, now_local,
+                )
 
                 result = db.execute(
                     update(Promotion)
                     .where(Promotion.status.in_(("active", "paused", "draft")),
                            Promotion.ends_at.is_not(None), Promotion.ends_at < now_local)
                     .values(status="finished")
+                    .returning(Promotion.id, Promotion.name, Promotion.ends_at)
                 )
+                expiradas = result.all()
                 db.commit()
-                total += result.rowcount
+                total += len(expiradas)
+                for promo_id, name, ends_at in expiradas:
+                    logger.info(
+                        "expire_promotions: finaliza promocion id=%s name=%r "
+                        "ends_at=%s (now_local=%s, tz_name=%s, schema=%s)",
+                        promo_id, name, ends_at, now_local, tz_name, schema,
+                    )
         except Exception:
             logger.exception(
                 "Error expirando promociones del schema %s", schema)
