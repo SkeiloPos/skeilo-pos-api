@@ -111,6 +111,39 @@ def _valid_now(promo: Promotion, now: datetime, tenant: Tenant | None = None) ->
     return _in_time_window(now.time(), promo.start_time, promo.end_time)
 
 
+def _last_eligible_date(ends_date: date, days_of_week: str | None) -> date:
+    """Último día <= ends_date en que la promoción aplica según days_of_week.
+    Mismo formato que `_valid_now` (arriba): CSV de "0=lunes..6=domingo"."""
+    if not days_of_week:
+        return ends_date
+    allowed = {d.strip() for d in days_of_week.split(",") if d.strip()}
+    for offset in range(7):
+        candidate = ends_date - timedelta(days=offset)
+        if str(candidate.weekday()) in allowed:
+            return candidate
+    return ends_date  # days_of_week vacío/mal formado tras el strip: no recorta
+
+
+def promotion_expiry_cutoff(promo: Promotion) -> datetime | None:
+    """Último instante en que `promo` puede ser válida, combinando `ends_at`,
+    `days_of_week` y `start_time`/`end_time` (misma lógica de cruce de
+    medianoche que `_valid_now`). `None` si `ends_at` es `None` (sin fecha de
+    fin -> nunca expira por este mecanismo). La usa `expire_promotions`
+    (app/core/scheduler.py) para que el `status` persistido refleje la misma
+    vigencia que `_valid_now` evalúa en vivo, en vez de solo la fecha."""
+    if promo.ends_at is None:
+        return None
+    last_day = _last_eligible_date(promo.ends_at.date(), promo.days_of_week)
+    overnight = (
+        promo.start_time is not None
+        and promo.end_time is not None
+        and promo.start_time > promo.end_time
+    )
+    cutoff_date = last_day + timedelta(days=1) if overnight else last_day
+    cutoff_time = promo.end_time if promo.end_time is not None else time.max
+    return datetime.combine(cutoff_date, cutoff_time)
+
+
 def _line_get(line, name: str, default=None):
     """Acceso uniforme a una línea, sea un `SaleLine` (atributos) o un dict
     enriquecido de `promo_lines_for` (claves)."""
