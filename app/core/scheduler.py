@@ -216,7 +216,8 @@ def sweep_orphan_sessions() -> int:
             logger.exception("Error barriendo sesiones del schema %s", schema)
 
     if total:
-        logger.info("Barrido de sesiones: %d sesión(es) de mesa cerradas", total)
+        logger.info(
+            "Barrido de sesiones: %d sesión(es) de mesa cerradas", total)
     return total
 
 
@@ -247,12 +248,15 @@ def expire_promotions() -> int:
 
     for schema, tz_name in tenants:
         try:
-            tz = ZoneInfo(tz_name) if tz_name else ZoneInfo(settings.TENANT_TIMEZONE)
+            tz = ZoneInfo(tz_name) if tz_name else ZoneInfo(
+                settings.TENANT_TIMEZONE)
             now_local = datetime.now(tz).replace(tzinfo=None)
             with with_db(schema) as db:
                 # `update()` sobre el modelo (no SQL crudo): el `schema_translate_map`
                 # de `with_db` solo traduce sentencias ORM, no texto plano con nombres
                 # de tabla sin calificar.
+                logger.info("hora local %s", now_local)
+
                 result = db.execute(
                     update(Promotion)
                     .where(Promotion.status.in_(("active", "paused", "draft")),
@@ -262,10 +266,12 @@ def expire_promotions() -> int:
                 db.commit()
                 total += result.rowcount
         except Exception:
-            logger.exception("Error expirando promociones del schema %s", schema)
+            logger.exception(
+                "Error expirando promociones del schema %s", schema)
 
     if total:
-        logger.info("Expiración de promociones: %d promoción(es) finalizada(s)", total)
+        logger.info(
+            "Expiración de promociones: %d promoción(es) finalizada(s)", total)
     return total
 
 
@@ -281,7 +287,8 @@ async def _run_expire_promotions_with_lock() -> None:
     try:
         got = await redis.set(_PROMO_LOCK_KEY, "1", ex=ttl, nx=True)
     except Exception:
-        logger.warning("Redis no disponible; se omite la expiración de promociones", exc_info=True)
+        logger.warning(
+            "Redis no disponible; se omite la expiración de promociones", exc_info=True)
         return
     if not got:
         return  # otro worker lo está haciendo
@@ -295,7 +302,8 @@ async def _run_purge_notifications_with_lock() -> None:
     try:
         got = await redis.set(_NOTIFICATIONS_PURGE_LOCK_KEY, "1", ex=3600, nx=True)
     except Exception:
-        logger.warning("Redis no disponible; se omite la purga de notificaciones", exc_info=True)
+        logger.warning(
+            "Redis no disponible; se omite la purga de notificaciones", exc_info=True)
         return
     if not got:
         return  # otro worker lo está haciendo
@@ -313,7 +321,8 @@ async def _run_with_lock() -> None:
     try:
         got = await redis.set(_LOCK_KEY, "1", ex=ttl, nx=True)
     except Exception:
-        logger.warning("Redis no disponible; se omite el barrido de sesiones", exc_info=True)
+        logger.warning(
+            "Redis no disponible; se omite el barrido de sesiones", exc_info=True)
         return
     if not got:
         return  # otro worker lo está haciendo
