@@ -35,6 +35,7 @@ class ActiveOrderRow:
     id: UUID
     order_type: str | None
     status: str
+    payment_status: str
     dining_table_id: UUID | None
     table_number: int | None
     customer_name: str | None
@@ -50,6 +51,7 @@ def list_active_orders(db: Session) -> list[ActiveOrderRow]:
             CustomerOrder.id,
             CustomerOrder.order_type,
             CustomerOrder.status,
+            CustomerOrder.payment_status,
             CustomerOrder.dining_table_id,
             DiningTable.number,
             CustomerOrder.customer_name,
@@ -62,11 +64,11 @@ def list_active_orders(db: Session) -> list[ActiveOrderRow]:
     ).all()
     return [
         ActiveOrderRow(
-            id=id_, order_type=order_type, status=status,
+            id=id_, order_type=order_type, status=status, payment_status=payment_status,
             dining_table_id=dining_table_id, table_number=table_number,
             customer_name=customer_name, created_at=created_at,
         )
-        for id_, order_type, status, dining_table_id, table_number, customer_name, created_at in rows
+        for id_, order_type, status, payment_status, dining_table_id, table_number, customer_name, created_at in rows
     ]
 
 

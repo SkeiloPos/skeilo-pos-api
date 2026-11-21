@@ -24,13 +24,16 @@ from fastapi import HTTPException
 
 from app.core.db import with_db
 from app.models.inventory_item import InventoryItem
+from app.models.inventory_movement import InventoryMovement
 from app.models.supplier import Supplier
 from app.models.supplier_item import SupplierItem
 from app.models.purchase import Purchase
 from app.models.purchase_generation_request import PurchaseGenerationRequest
 from app.models.unit_measure import UnitMeasure
-from app.api.v1.inventory import service, supplier_items as svc
-from app.api.v1.inventory.schemas import SupplierItemCreate, SuggestedPurchaseLineIn
+from app.api.v1.inventory import router as inventory_router, service, supplier_items as svc
+from app.api.v1.inventory.schemas import (
+    PurchaseOrderCreate, PurchaseOrderItemIn, SupplierItemCreate, SuggestedPurchaseLineIn,
+)
 
 
 def _schema() -> str:
@@ -59,6 +62,16 @@ def _expect_error(label, status_code, fn):
         _check(label, exc.status_code, status_code)
     else:
         raise AssertionError(f"{label}: se esperaba HTTPException {status_code}, no se lanzó nada")
+
+
+def _movements_for(db, inventory_item_id, purchase_id) -> list[InventoryMovement]:
+    return db.execute(
+        select(InventoryMovement).where(
+            InventoryMovement.inventory_item_id == inventory_item_id,
+            InventoryMovement.reference_type == "purchase",
+            InventoryMovement.reference_id == purchase_id,
+        )
+    ).scalars().all()
 
 
 def _unit(db) -> UnitMeasure:
@@ -107,6 +120,9 @@ def _cleanup(db, schema: str, purchase_ids, relation_ids, item_ids, supplier_ids
     if relation_ids:
         db.execute(text(f'DELETE FROM "{schema}".supplier_items WHERE id = ANY(:i)'),
                    {"i": [str(i) for i in relation_ids]})
+    if item_ids:
+        db.execute(text(f'DELETE FROM "{schema}".inventory_movements WHERE inventory_item_id = ANY(:i)'),
+                   {"i": [str(i) for i in item_ids]})
     for item_id in item_ids:
         db.execute(text(f'DELETE FROM "{schema}".inventory_items WHERE id = :i'), {"i": str(item_id)})
     for supplier_id in supplier_ids:
@@ -246,6 +262,9 @@ def main():
             relacion_agua = _preferred_relation(db, proveedor_b, agua, Decimal("500"))
             relation_ids.append(relacion_agua.id)
 
+            almendras_stock_antes = almendras.current_stock
+            agua_stock_antes = agua.current_stock
+
             idem_key_1 = f"test-{uuid4().hex}"
             idempotency_keys.append(idem_key_1)
             purchases, was_created = service.generate_suggested_purchases(
@@ -262,13 +281,54 @@ def main():
                 ],
             )
             purchase_ids.extend(p.id for p in purchases)
-            _check("generar: 2 proveedores -> 2 Purchase draft", len(purchases), 2)
+            _check("generar: 2 proveedores -> 2 Purchase recibidas", len(purchases), 2)
             _check("generar: was_created=True (primera vez)", was_created, True)
             for p in purchases:
-                _check(f"generar: Purchase {p.id} status=draft", p.status, "draft")
+                _check(f"generar: Purchase {p.id} status=received", p.status, "received")
+                for purchase_item in p.items:
+                    _check(
+                        f"generar: PurchaseItem {purchase_item.id} received_quantity == quantity",
+                        purchase_item.received_quantity, purchase_item.quantity,
+                    )
+                    movimientos = _movements_for(db, purchase_item.inventory_item_id, p.id)
+                    _check(
+                        f"generar: PurchaseItem {purchase_item.id} tiene 1 InventoryMovement type=in",
+                        [(m.type, m.quantity) for m in movimientos],
+                        [("in", purchase_item.quantity_base)],
+                    )
             _check(
                 "generar: last_cost de almendras NO cambia aunque el precio generado fue distinto (9000 vs 8000)",
                 db.get(SupplierItem, relacion_almendras.id).last_cost, Decimal("8000.00"),
+            )
+            db.refresh(almendras)
+            db.refresh(agua)
+            almendras_item = next(p for p in purchases if any(
+                it.inventory_item_id == almendras.id for it in p.items
+            ))
+            almendras_purchase_item = next(it for it in almendras_item.items if it.inventory_item_id == almendras.id)
+            agua_item = next(p for p in purchases if any(it.inventory_item_id == agua.id for it in p.items))
+            agua_purchase_item = next(it for it in agua_item.items if it.inventory_item_id == agua.id)
+            _check(
+                "generar: current_stock de almendras aumentó exactamente quantity_base",
+                almendras.current_stock, almendras_stock_antes + almendras_purchase_item.quantity_base,
+            )
+            _check(
+                "generar: current_stock de agua aumentó exactamente quantity_base",
+                agua.current_stock, agua_stock_antes + agua_purchase_item.quantity_base,
+            )
+
+            # ===================== Historia 2: trazabilidad en el historial =====================
+            historial_almendras = inventory_router.item_movements(
+                almendras.id, page=1, size=100, db=db, _=None,
+            )
+            movimiento_almendras = next(
+                m for m in historial_almendras["items"]
+                if m.reference_type == "purchase" and m.reference_id == almendras_item.id
+            )
+            _check(
+                "historial: movimiento de la compra sugerida visible en el kardex del insumo",
+                (movimiento_almendras.type, movimiento_almendras.quantity, movimiento_almendras.reference_id),
+                ("in", almendras_purchase_item.quantity_base, almendras_item.id),
             )
 
             # Dos líneas con el mismo proveedor -> una sola Purchase con dos PurchaseItem.
@@ -295,6 +355,14 @@ def main():
             purchase_ids.extend(p.id for p in purchases_2)
             _check("generar: mismo proveedor -> 1 sola Purchase", len(purchases_2), 1)
             _check("generar: mismo proveedor -> 2 PurchaseItem", len(purchases_2[0].items), 2)
+            _check("generar: mismo proveedor -> Purchase status=received", purchases_2[0].status, "received")
+            for purchase_item in purchases_2[0].items:
+                movimientos = _movements_for(db, purchase_item.inventory_item_id, purchases_2[0].id)
+                _check(
+                    f"generar: mismo proveedor -> movimiento independiente para PurchaseItem {purchase_item.id}",
+                    [(m.type, m.quantity) for m in movimientos],
+                    [("in", purchase_item.quantity_base)],
+                )
 
             # Línea inválida (cantidad < 1 vía SimpleNamespace, ya que el DTO lo rechaza
             # antes de llegar aquí) -> 422, ninguna orden creada.
@@ -358,6 +426,8 @@ def main():
             item_ids.append(fila_2.id)
             rel_2 = _preferred_relation(db, proveedor_b, fila_2, Decimal("50"))
             relation_ids.append(rel_2.id)
+            db.commit()
+            fila_1_stock_antes, fila_2_stock_antes = fila_1.current_stock, fila_2.current_stock
 
             idem_key_fallo = f"test-{uuid4().hex}"
             original_build = service._build_purchase_order
@@ -403,8 +473,27 @@ def main():
                 ).scalar_one_or_none(),
                 None,
             )
+            db.refresh(fila_1)
+            db.refresh(fila_2)
+            _check(
+                "generar: fallo a mitad de la creación -> current_stock sin cambios",
+                (fila_1.current_stock, fila_2.current_stock),
+                (fila_1_stock_antes, fila_2_stock_antes),
+            )
+            _check(
+                "generar: fallo a mitad de la creación -> sin InventoryMovement para ningún insumo del lote",
+                db.execute(
+                    select(InventoryMovement).where(
+                        InventoryMovement.inventory_item_id.in_([fila_1.id, fila_2.id]),
+                    )
+                ).scalars().all(),
+                [],
+            )
 
             # Reenvío de la misma idempotency_key -> misma respuesta, sin duplicar.
+            db.refresh(almendras)
+            almendras_stock_antes_reenvio = almendras.current_stock
+            movimientos_antes_reenvio = len(_movements_for(db, almendras.id, almendras_item.id))
             purchases_reenvio, was_created_reenvio = service.generate_suggested_purchases(
                 db, idem_key_1,
                 [
@@ -424,6 +513,45 @@ def main():
                 {"k": idem_key_1},
             ).scalar_one()
             _check("reenvío: COUNT(*) en purchase_generation_requests sigue siendo 1", count_idem, 1)
+            db.refresh(almendras)
+            _check(
+                "reenvío: current_stock de almendras no vuelve a subir",
+                almendras.current_stock, almendras_stock_antes_reenvio,
+            )
+            _check(
+                "reenvío: no se insertó un segundo InventoryMovement para la orden",
+                len(_movements_for(db, almendras.id, almendras_item.id)), movimientos_antes_reenvio,
+            )
+
+            # Creación manual de órdenes (fuera de esta pantalla) sigue sin cambios (FR-011):
+            # nace en 'draft', sin recepción, sin movimiento ni cambio de stock.
+            tapas_stock_antes = db.get(InventoryItem, tapas.id).current_stock
+            orden_manual = service.create_purchase_order(
+                db,
+                PurchaseOrderCreate(
+                    supplier_id=proveedor_a.id,
+                    items=[PurchaseOrderItemIn(
+                        inventory_item_id=tapas.id, supplier_item_id=relacion_tapas.id,
+                        presentation_quantity=Decimal("1"), presentation_unit_cost=Decimal("100"),
+                    )],
+                ),
+                user_id=None,
+            )
+            purchase_ids.append(orden_manual.id)
+            _check("creación manual: Purchase nace status=draft (sin regresión, FR-011)", orden_manual.status, "draft")
+            _check(
+                "creación manual: PurchaseItem received_quantity=0 (sin regresión, FR-011)",
+                orden_manual.items[0].received_quantity, Decimal("0"),
+            )
+            db.refresh(tapas)
+            _check(
+                "creación manual: current_stock de tapas sin cambios (sin regresión, FR-011)",
+                tapas.current_stock, tapas_stock_antes,
+            )
+            _check(
+                "creación manual: sin InventoryMovement nuevo (sin regresión, FR-011)",
+                _movements_for(db, tapas.id, orden_manual.id), [],
+            )
 
             print("TODO OK ✔")
         finally:

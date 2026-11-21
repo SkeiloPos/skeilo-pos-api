@@ -264,6 +264,7 @@ class ActiveOrderSummary(BaseModel):
     id: UUID
     order_type: str | None = None
     status: str
+    payment_status: str
     dining_table_id: UUID | None = None
     table_number: int | None = None
     customer_name: str | None = None

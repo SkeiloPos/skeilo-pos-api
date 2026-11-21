@@ -149,6 +149,33 @@ class TestBloqueoDeCierrePorPedidosActivos(unittest.TestCase):
         self.assertFalse(isinstance(segundo, JSONResponse))
         self.assertEqual(segundo.status, "closed")
 
+    def test_pedido_confirmado_ya_pagado_bloquea_con_mensaje_de_falta_entrega(self):
+        """Caso reportado por soporte: un pedido `confirmado` con
+        `payment_status='PAID'` (ya cobrado, pero sin pasar por el
+        `deliver_order` explícito) sigue bloqueando el cierre -- spec 147
+        trata `confirmado` igual que `pendiente`, sin importar el pago. El
+        mensaje ya NO dice "sin cobrar" para este caso (sería falso, confunde
+        al cajero que ve la orden ya pagada): debe indicar que está cobrada
+        pero falta marcarla como entregada."""
+        db = fx.new_session()
+        register = fx.make_cash_register(db)
+        shift = fx.make_cash_shift(db, register=register)
+        db.commit()
+        orden = _seed_active_order(db, order_type="DINE_IN", status="confirmado")
+        orden.payment_status = "PAID"
+        db.commit()
+
+        resp = router.close_shift(shift.id, ShiftClose(), db)
+
+        self.assertIsInstance(resp, JSONResponse)
+        self.assertEqual(resp.status_code, 409)
+        body = json.loads(resp.body)
+        self.assertNotIn("sin cobrar", body["detail"])
+        self.assertIn("sin marcar como entregado", body["detail"])
+        row = body["active_orders"][0]
+        self.assertEqual(row["id"], str(orden.id))
+        self.assertEqual(row["payment_status"], "PAID")
+
     def test_pedido_activo_sin_mesa_ni_cliente_tambien_bloquea(self):
         """Edge case de `spec.md`: un pedido activo que no se ancla a
         ninguna mesa (`TAKEAWAY`/`DELIVERY`) cuenta igual para el bloqueo,
