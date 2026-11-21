@@ -424,14 +424,21 @@ def _fill_incomplete_line_defaults(it: PurchaseOrderItemIn) -> PurchaseItemIn | 
 
 def _build_purchase_order(
     db: Session, data: PurchaseOrderCreate, user_id: UUID | None, tenant=None,
-    update_supplier_cost: bool = True,
+    update_supplier_cost: bool = True, receive_immediately: bool = False,
 ) -> Purchase:
     """Variante no-commiteadora de `create_purchase_order` (spec 158, research.md D5):
     construye la `Purchase`+`PurchaseItem[]` en `draft` sin llamar a `db.commit()` -- el
     llamador decide cuándo cerrar la transacción (necesario para generar N órdenes, una por
     proveedor, dentro de una sola transacción todo-o-nada, FR-009). `create_purchase_order()`
     sigue comiteando ella misma, pasando `update_supplier_cost=True` (comportamiento idéntico,
-    cero cambios observables)."""
+    cero cambios observables).
+
+    spec 163 (research.md D1): `receive_immediately=True` da por recibida la orden completa
+    en el mismo bucle -- mismos tres pasos que ya usa `create_purchase()` por cada
+    `PurchaseItem` (`received_quantity = quantity`, `record_movement(type="in", ...)`,
+    `item.unit_cost = cost_base`) -- y la deja en `status="received"` en vez de `"draft"`.
+    Solo `generate_suggested_purchases()` pasa `True`; `create_purchase_order()` sigue con el
+    default `False` (FR-011, cero cambios observables para la creación manual)."""
     if data.supplier_id is not None:
         get_or_404(db, Supplier, data.supplier_id, "Supplier not found")
     purchase = Purchase(
@@ -444,13 +451,25 @@ def _build_purchase_order(
     total = Decimal("0")
     for it in data.items:
         line = _fill_incomplete_line_defaults(it) if data.allow_incomplete else it
-        purchase_item, line_total, _item = _resolve_purchase_line(
+        purchase_item, line_total, item = _resolve_purchase_line(
             db, purchase, line, tenant, update_supplier_cost=update_supplier_cost,
         )
-        purchase_item.received_quantity = Decimal("0")
-        db.add(purchase_item)
+        if receive_immediately:
+            purchase_item.received_quantity = purchase_item.quantity
+            db.add(purchase_item)
+            record_movement(
+                db, item.id, type="in", quantity=purchase_item.quantity_base,
+                reason=reasons.COMPRA, reference_type=reasons.REF_PURCHASE, reference_id=purchase.id,
+                user_id=user_id,
+            )
+            item.unit_cost = purchase_item.cost_base
+        else:
+            purchase_item.received_quantity = Decimal("0")
+            db.add(purchase_item)
         total += line_total
     purchase.total = total
+    if receive_immediately:
+        purchase.status = "received"
     return purchase
 
 
@@ -800,7 +819,9 @@ def generate_suggested_purchases(
                 for line in group_lines
             ]
             order = PurchaseOrderCreate(supplier_id=supplier_id, items=order_items)
-            purchase = _build_purchase_order(db, order, user_id=None, update_supplier_cost=False)
+            purchase = _build_purchase_order(
+                db, order, user_id=None, update_supplier_cost=False, receive_immediately=True,
+            )
             purchases.append(purchase)
 
         db.flush()

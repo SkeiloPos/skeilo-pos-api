@@ -143,12 +143,32 @@ def close_shift(
         active_orders.list_active_orders(db) if active_orders.count_active_orders(db) else []
     )
     if active:
+        # El mensaje distingue "sin cobrar" (payment_status == "UNPAID") de
+        # "sin entregar" (ya pagados, status aún "pendiente"/"confirmado"):
+        # un pedido `confirmado` ya PAGADO bloquea el cierre igual (spec 147,
+        # ver `active_orders._IS_ACTIVE`), pero decirle al cajero "sin cobrar"
+        # en ese caso es falso y confunde -- la orden ya se cobró, solo falta
+        # marcarla "Entregada".
+        sin_cobrar = sum(1 for o in active if o.payment_status == "UNPAID")
+        sin_entregar = len(active) - sin_cobrar
+        if sin_entregar and not sin_cobrar:
+            detalle = (
+                f"ya cobrados pero sin marcar como entregado"
+                f"{'s' if sin_entregar != 1 else ''}"
+            )
+        elif sin_entregar:
+            detalle = (
+                f"sin cobrar ({sin_cobrar}) o ya cobrados pero sin marcar como "
+                f"entregado{'s' if sin_entregar != 1 else ''} ({sin_entregar})"
+            )
+        else:
+            detalle = "sin cobrar"
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={
                 "detail": (
                     f"No se puede cerrar el turno: hay {len(active)} "
-                    "pedidos activos sin cobrar."
+                    f"pedidos activos {detalle}."
                 ),
                 "active_orders": [
                     ActiveOrderSummary.model_validate(o).model_dump(mode="json")
