@@ -58,6 +58,39 @@ def _delete_order_if_empty(db: Session, order: CustomerOrder) -> bool:
     return False
 
 
+def _sync_status_from_items(order: CustomerOrder) -> None:
+    """Bugfix (reportado tras implementar spec 164): una orden nueva o
+    modificada por estas 3 operaciones no puede quedar con `status`
+    desalineado de `estado_cocina` de sus líneas, porque nada más en el
+    sistema lo corrige después -- `status` solo cambia con la acción
+    explícita "Entregar" (`POST /orders/{id}/deliver`), y esa acción (y su
+    botón en la terminal, `canDeliverOrder`) solo aparece cuando hay algún
+    ítem `pendiente` que entregar. Una orden nueva creada con una línea YA
+    `entregado` (p. ej. se dividió/movió un ítem que el mesero ya había
+    marcado entregado) quedaba con `status='pendiente'` para siempre: sin
+    ítems `pendiente` que mostrar el botón, y por lo tanto sin forma de
+    liberar la mesa (`release_table` bloquea mientras quede alguna orden en
+    `'pendiente'`/`'confirmado'`, sin importar el pago).
+
+    Misma idea documentada en research.md §4 ("el status de la orden
+    resultante se deriva de sus líneas... una orden con todas las líneas
+    entregado ya se considera entregada") -- aquí se aplica explícitamente
+    en vez de asumir que algo más lo hace. No toca `'cancelada'` (terminal)
+    ni una orden sin ítems (la borra `_delete_order_if_empty`, no esto)."""
+    if order.status == "cancelada":
+        return
+    items = [it for it in order.items if it.estado_cocina != "cancelado"]
+    if not items:
+        return
+    if all(it.estado_cocina == "entregado" for it in items):
+        order.status = "entregada"
+    elif order.status == "entregada":
+        # Caso simétrico: se movió/fusionó una línea todavía `pendiente`
+        # hacia una orden que ya estaba `entregada` -- reabre el status para
+        # que "Entregar" (idempotente, re-entregable) vuelva a aparecer.
+        order.status = "pendiente"
+
+
 def _new_sibling_order(db: Session, source_order: CustomerOrder) -> CustomerOrder:
     """Orden nueva en la misma mesa que `source_order` (research.md §4):
     mismo `table_session_id`/`dining_table_id`/`channel`/`order_type`, un
@@ -179,6 +212,7 @@ def split_order(db: Session, order_id: UUID) -> dict:
     for item in items:
         sibling = _new_sibling_order(db, order)
         new_item = _copy_item_to_order(db, item, sibling, item.quantity)
+        _sync_status_from_items(sibling)
         created.append({
             "order_id": sibling.id,
             "table_order_number": sibling.table_order_number,
@@ -227,10 +261,13 @@ def move_item(
         db.flush()
     else:
         _copy_item_to_order(db, item, target_order, moved_qty)
+    _sync_status_from_items(target_order)
 
     _decrement_source_item(db, item, moved_qty)
 
     source_deleted = _delete_order_if_empty(db, order)
+    if not source_deleted:
+        _sync_status_from_items(order)
     db.commit()
 
     source_total = Decimal("0") if source_deleted else service.build_billing_summary(db, order).total
@@ -267,9 +304,12 @@ def split_item_to_new_order(
 
     new_order = _new_sibling_order(db, order)
     _copy_item_to_order(db, item, new_order, moved_qty)
+    _sync_status_from_items(new_order)
     _decrement_source_item(db, item, moved_qty)
 
     source_deleted = _delete_order_if_empty(db, order)
+    if not source_deleted:
+        _sync_status_from_items(order)
     db.commit()
 
     source_total = Decimal("0") if source_deleted else service.build_billing_summary(db, order).total

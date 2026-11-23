@@ -93,6 +93,28 @@ class TestSplitOrder(ItemTransferTestCase):
         self.assertEqual(len(new_order.items), 1)
         self.assertEqual(new_order.items[0].quantity, 2)
 
+    def test_split_de_linea_ya_entregada_crea_orden_ya_entregada(self):
+        """Bugfix (reportado tras implementar la feature): una orden nueva
+        creada a partir de una línea YA `entregado` no puede quedar en
+        `status='pendiente'` para siempre -- sin ningún ítem `pendiente`, la
+        terminal nunca vuelve a mostrar "Entregar" para esa orden, y eso
+        bloquea `release_table` (bloquea mientras exista una orden
+        `'pendiente'`/`'confirmado'`, sin importar el pago) de forma
+        permanente."""
+        db, table, ts = self._seed_table()
+        v1, v2 = self._variant(db), self._variant(db)
+        order = fx.make_order_with_items(
+            db, ts, [v1, v2], quantities=[1, 1], estado_cocina="entregado",
+        )
+        db.commit()
+        order_id = order.id
+
+        result = item_transfer.split_order(db, order_id)
+
+        for created in result["created_orders"]:
+            new_order = db.get(CustomerOrder, created["order_id"])
+            self.assertEqual(new_order.status, "entregada")
+
     def test_split_403_con_pago_registrado_y_orden_original_intacta(self):
         """FR-008 / quickstart Escenario 1, paso 6."""
         db, table, ts = self._seed_table()
@@ -244,6 +266,22 @@ class TestMoveItem(ItemTransferTestCase):
         self.assertEqual(ctx.exception.status_code, 403)
         self.assertEqual(len(db.get(CustomerOrder, order_a_id).items), 1)
         self.assertEqual(len(db.get(CustomerOrder, order_b_id).items), 1)
+
+    def test_mover_item_ya_entregado_hacia_orden_vacia_la_deja_entregada(self):
+        """Bugfix: `move_item` crea una línea nueva (caso no-fusión) en el
+        destino -- si el destino queda con todas sus líneas `entregado`
+        (incluida la recién llegada), su `status` debe promoverse a
+        `'entregada'`, no quedar atascado en `'pendiente'`."""
+        db, table, ts = self._seed_table()
+        order_a = fx.make_order_with_items(db, ts, self._variant(db), quantities=[1], estado_cocina="entregado")
+        order_b = fx.make_order_with_items(db, ts, self._variant(db), quantities=[1], estado_cocina="entregado")
+        db.commit()
+        item_id, order_a_id, order_b_id = order_a.items[0].id, order_a.id, order_b.id
+
+        item_transfer.move_item(db, order_a_id, item_id, order_b_id)
+
+        target = db.get(CustomerOrder, order_b_id)
+        self.assertEqual(target.status, "entregada")
 
     def test_mover_400_si_destino_es_de_otra_mesa(self):
         """FR-009 / quickstart Escenario 2, paso 10."""
