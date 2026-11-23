@@ -49,7 +49,9 @@ from app.api.v1.orders.schemas import (
     PaymentAttemptResponse, PaymentAttemptApproveIn, PaymentAttemptRejectIn,
     PaymentAttemptConfirmCashIn, PaymentAttemptAdjustSplitIn, PaymentEventOut,
     KitchenBoardResponse, KitchenCardOut, ChangeKitchenStatusIn,
+    ItemMoveIn, SplitToNewIn, SplitOrderResponse, MoveItemResponse, SplitToNewResponse,
 )
+from app.api.v1.orders import item_transfer
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -203,6 +205,33 @@ def merge_orders(
     db: Session = Depends(get_db), _: User = Depends(get_current_user),
 ):
     return tables_advanced.merge_orders(db, body.order_ids)
+
+
+@router.post("/{order_id}/split", response_model=SplitOrderResponse,
+             summary="Dividir una orden en una cuenta independiente por línea (spec 164)")
+def split_order(
+    order_id: UUID,
+    db: Session = Depends(get_db), _: User = Depends(get_current_user),
+):
+    return item_transfer.split_order(db, order_id)
+
+
+@router.post("/{order_id}/items/{item_id}/move", response_model=MoveItemResponse,
+             summary="Mover un ítem hacia otra orden de la misma mesa (spec 164)")
+def move_item(
+    order_id: UUID, item_id: UUID, body: ItemMoveIn,
+    db: Session = Depends(get_db), _: User = Depends(get_current_user),
+):
+    return item_transfer.move_item(db, order_id, item_id, body.target_order_id, body.quantity)
+
+
+@router.post("/{order_id}/items/{item_id}/split-to-new", response_model=SplitToNewResponse,
+             summary="Crear una cuenta nueva a partir de un ítem (spec 164)")
+def split_item_to_new_order(
+    order_id: UUID, item_id: UUID, body: SplitToNewIn,
+    db: Session = Depends(get_db), _: User = Depends(get_current_user),
+):
+    return item_transfer.split_item_to_new_order(db, order_id, item_id, body.quantity)
 
 
 @router.get("/group/{group_id}/bill", response_model=GroupBillResponse,
@@ -1013,7 +1042,15 @@ def list_orders(
     if page is None and size is None:
         orders = service.list_orders(db, status_filter, active_sessions_only)
         _decorate_orders(db, orders, tenant=tenant)
-        return json_or_304(request, _ORDERS_ADAPTER, orders)
+        # `dump_json` sobre los ORM crudos no valida -- `applied_promotions`
+        # trae JSONB con formas viejas (solo `name`) o con `rule_id` interno
+        # (`promotions.applied_to_dicts`, nunca pensado para publicarse) y
+        # pydantic-core lo serializa best-effort con un warning, filtrando
+        # `rule_id` al cliente. Validar primero (igual que ya hace
+        # `response_model` en el resto de rutas de esta misma lista) corrige
+        # los tipos y descarta lo no declarado, sin cambiar el contrato.
+        validated = [OrderResponse.model_validate(o) for o in orders]
+        return json_or_304(request, _ORDERS_ADAPTER, validated)
 
     # Rama paginada: `status` se valida contra el enum cerrado de 6 valores
     # (5 + ausente) y se interpreta como "estado que ve la persona" (FR-016).

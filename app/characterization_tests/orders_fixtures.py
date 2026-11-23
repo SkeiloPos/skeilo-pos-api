@@ -355,6 +355,23 @@ def make_order_item(db: Session, order: CustomerOrder, variant: ProductVariant, 
     return obj
 
 
+def make_order_with_items(
+    db: Session, table_session: TableSession, variant: ProductVariant | list[ProductVariant],
+    *, quantities: list[int], estado_cocina: str = "pendiente", **kw,
+) -> CustomerOrder:
+    """Orden con un `OrderItem` por entrada de `quantities` (spec 164) --
+    evita repetir `make_customer_order`/`make_order_item` en cada test de
+    `test_orders_item_transfer.py`. `variant` acepta una sola variante
+    (repetida en cada línea) o una lista alineada con `quantities`, para los
+    escenarios de líneas de producto distintas (p. ej. Acceptance Scenario 1
+    de User Story 1)."""
+    order = make_customer_order(db, table_session, **kw)
+    variants = variant if isinstance(variant, list) else [variant] * len(quantities)
+    for v, qty in zip(variants, quantities):
+        make_order_item(db, order, v, quantity=qty, estado_cocina=estado_cocina)
+    return order
+
+
 def make_order_item_void_log(db: Session, order_item: OrderItem, **kw) -> OrderItemVoidLog:
     """No es una factory que ningún test de esta spec necesite llamar
     directamente para sembrar estado previo (`kitchen.void_item` la crea

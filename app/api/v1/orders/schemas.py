@@ -97,6 +97,59 @@ class MergeResponse(BaseModel):
     order_ids: list[UUID]
 
 
+# ---------- Transferencia de ítems entre órdenes (spec 164) ----------
+class ItemMoveIn(BaseModel):
+    target_order_id: UUID
+    #: Cantidad a mover; si se omite, se mueve la cantidad total de la línea.
+    quantity: int | None = Field(None, gt=0)
+
+
+class SplitToNewIn(BaseModel):
+    #: Cantidad a separar; si se omite, se mueve la cantidad total de la línea.
+    quantity: int | None = Field(None, gt=0)
+
+
+class OrderTotalSummary(BaseModel):
+    order_id: UUID
+    #: `True` cuando la orden quedó sin ítems y se eliminó (FR-007/SC-002).
+    deleted: bool = False
+    total: Decimal = Decimal("0")
+
+
+class SplitOrderCreatedItemSummary(BaseModel):
+    product_variant_id: UUID
+    quantity: int
+    unit_price: Decimal
+
+
+class SplitOrderCreatedItem(BaseModel):
+    order_id: UUID
+    table_order_number: int | None = None
+    item: SplitOrderCreatedItemSummary
+
+
+class SplitOrderResponse(BaseModel):
+    original_order_id: UUID
+    created_orders: list[SplitOrderCreatedItem] = Field(default_factory=list)
+
+
+class MoveItemResponse(BaseModel):
+    source_order: OrderTotalSummary
+    target_order: OrderTotalSummary
+    merged: bool
+
+
+class SplitToNewOrderSummary(BaseModel):
+    order_id: UUID
+    table_order_number: int | None = None
+    total: Decimal = Decimal("0")
+
+
+class SplitToNewResponse(BaseModel):
+    source_order: OrderTotalSummary
+    new_order: SplitToNewOrderSummary
+
+
 class GroupBillOrderLine(BaseModel):
     order_id: UUID
     dining_table_id: UUID | None = None

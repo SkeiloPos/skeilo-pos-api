@@ -53,8 +53,20 @@ def resolve_dine_in_table_order(db: Session) -> tuple[UUID | None, int | None]:
     `with_for_update()` bloquea la fila del turno hasta el commit de quien
     llama, serializando el conteo+asignación de dos pedidos creados casi al
     mismo tiempo dentro del mismo turno (evita que ambos lean el mismo
-    `COUNT(*)` y choquen contra el índice único de
-    `uq_customer_orders_shift_table_order_number`)."""
+    siguiente número y choquen contra el índice único de
+    `uq_customer_orders_shift_table_order_number`).
+
+    `MAX(table_order_number) + 1`, no `COUNT(*) + 1` (bugfix spec 164): desde
+    que `item_transfer.split_order`/`move_item`/`split_item_to_new_order`
+    pueden ELIMINAR un `CustomerOrder` DINE_IN a mitad de turno (FR-007), ya
+    no hay garantía de "sin huecos" en la numeración del turno -- `COUNT(*)`
+    bajaba por cada orden borrada mientras el número más alto ya asignado
+    seguía intacto, así que el siguiente pedido normal (`create_order`/
+    `submit_cart`) terminaba pidiendo un número que una orden sobreviviente
+    ya tenía, violando `uq_customer_orders_shift_table_order_number` con un
+    500. `MAX+1` es monótono sin importar cuántas filas se hayan borrado en
+    el medio; `COALESCE(..., 0)` cubre el turno todavía sin ningún pedido
+    numerado."""
     shift = db.execute(
         select(CashShift)
         .where(CashShift.status == "open")
@@ -64,12 +76,12 @@ def resolve_dine_in_table_order(db: Session) -> tuple[UUID | None, int | None]:
     ).scalar_one_or_none()
     if shift is None:
         return None, None
-    count = db.execute(
-        select(func.count()).select_from(CustomerOrder).where(
+    max_number = db.execute(
+        select(func.coalesce(func.max(CustomerOrder.table_order_number), 0)).where(
             CustomerOrder.cash_shift_id == shift.id
         )
     ).scalar_one()
-    return shift.id, count + 1
+    return shift.id, max_number + 1
 
 
 def list_shifts(
