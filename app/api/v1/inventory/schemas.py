@@ -90,6 +90,11 @@ class MovementResponse(BaseModel):
     inventory_item_id: UUID
     type: str
     quantity: Decimal
+    signed_quantity: Decimal | None = Field(
+        None,
+        description="Positivo = entrada/aumento, negativo = salida/disminución. "
+        "Null en movimientos de ajuste anteriores a este campo.",
+    )
     reason: str | None = None
     reference_type: str | None = None
     reference_id: UUID | None = None

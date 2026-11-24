@@ -16,6 +16,13 @@ class InventoryReasonsCatalogTests(unittest.TestCase):
         self.assertEqual(r.VENCIMIENTO, "vencimiento")
         self.assertEqual(r.CONSUMO_INTERNO, "consumo_interno")
 
+    # A-165 (registro-de-anomalias.md): séptimo motivo canónico -- la
+    # importación masiva de Excel ahora pasa por kardex en vez de escribir
+    # `current_stock` directo.
+    def test_a165_importacion_masiva_y_referencia_de_job(self):
+        self.assertEqual(r.IMPORTACION_MASIVA, "importacion_masiva")
+        self.assertEqual(r.REF_IMPORT_JOB, "import_job")
+
     def test_rn_inv_13_ajuste_es_valido_como_entrada_y_como_salida_a_la_vez(self):
         self.assertIn(r.AJUSTE, r.ENTRADA_REASONS)
         self.assertIn(r.AJUSTE, r.SALIDA_REASONS)
@@ -27,7 +34,7 @@ class InventoryReasonsCatalogTests(unittest.TestCase):
         self.assertNotIn(r.COMPRA, r.SALIDA_REASONS)
 
     def test_rn_inv_13_catalogo_completo_de_entrada_y_salida(self):
-        self.assertEqual(set(r.ENTRADA_REASONS), {"compra", "ajuste"})
+        self.assertEqual(set(r.ENTRADA_REASONS), {"compra", "ajuste", "importacion_masiva"})
         self.assertEqual(
             set(r.SALIDA_REASONS),
             {"venta", "daño", "vencimiento", "consumo_interno", "ajuste"},

@@ -27,6 +27,13 @@ class InventoryMovement(UUIDPrimaryKeyMixin, Base):
     # que alimenta con conversiones de unidad que pueden tener más de 3 decimales.
     quantity: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
 
+    # Con signo: positivo = entrada/aumento, negativo = salida/disminución (spec 165
+    # follow-up). Para 'in'/'out' es redundante con `type` (se deriva); para
+    # 'adjustment' es la única forma de saber la dirección, ya que `quantity`
+    # siempre es su valor absoluto por el CHECK `quantity > 0`. Nullable porque los
+    # movimientos de ajuste creados antes de este cambio no tienen esta información.
+    signed_quantity: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6), nullable=True)
+
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     reference_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)

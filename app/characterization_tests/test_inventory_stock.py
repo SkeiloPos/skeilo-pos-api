@@ -62,6 +62,7 @@ class RecordMovementTests(unittest.TestCase):
         )
         self.assertEqual(mv.type, "out")
         self.assertEqual(mv.quantity, Decimal("2"))
+        self.assertEqual(mv.signed_quantity, Decimal("-2"))
         self.assertEqual(mv.reason, "venta")
         self.assertEqual(mv.reference_id, ref_id)
 
@@ -76,12 +77,14 @@ class ApplyAdjustmentTests(unittest.TestCase):
         self.assertEqual(item.current_stock, Decimal("7.5"))
         self.assertEqual(mv.type, "adjustment")
         self.assertEqual(mv.quantity, Decimal("2.5"), "quantity siempre positiva, el signo va en current_stock")
+        self.assertEqual(mv.signed_quantity, Decimal("-2.5"), "signed_quantity sí guarda el signo del ajuste")
         self.assertEqual(mv.reason, "Merma por derrame")
 
     def test_rn_inv_08_ajuste_con_delta_positivo_suma(self):
         item = f.make_inventory_item(self.db, current_stock=Decimal("10"))
-        apply_adjustment(self.db, item.id, signed_delta=Decimal("4"))
+        mv = apply_adjustment(self.db, item.id, signed_delta=Decimal("4"))
         self.assertEqual(item.current_stock, Decimal("14"))
+        self.assertEqual(mv.signed_quantity, Decimal("4"))
 
     def test_rn_inv_09_ajuste_que_dejaria_negativo_se_rechaza_sin_bandera_para_forzarlo(self):
         item = f.make_inventory_item(self.db, current_stock=Decimal("3"))
