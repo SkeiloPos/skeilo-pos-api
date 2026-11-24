@@ -305,6 +305,8 @@ class CurrentPaymentAttemptSummary(BaseModel):
     transfer_amount: Decimal | None = None
     cash_confirmed_at: UtcDatetime | None = None
 
+    model_config = ConfigDict(from_attributes=True)
+
 
 class AppliedPromotionOut(BaseModel):
     """Una entrada del snapshot `applied_promotions` (spec 094, FR-011).
