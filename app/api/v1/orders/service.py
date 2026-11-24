@@ -492,8 +492,13 @@ def staff_user_names(db: Session, user_ids: list[UUID]) -> dict[UUID, str]:
 
 def list_orders(
     db: Session, status_filter: str | None = None, active_sessions_only: bool = False,
+    dining_table_id: UUID | None = None,
 ) -> list[CustomerOrder]:
     """Listado de comandas para la Terminal de Mesas (`GET /orders`).
+
+    `dining_table_id`: filtro aditivo para quien solo necesita los pedidos de
+    UNA mesa (el detalle de la Terminal, en su propia ruta) -- mismo patrón
+    que el de `list_tables` en este mismo módulo.
 
     `active_sessions_only=True` (spec 029, hotfix): descarta pedidos ya
     pagados cuya `TableSession` ya cerró — sin esto, un pedido de una visita
@@ -516,6 +521,8 @@ def list_orders(
     ).order_by(CustomerOrder.created_at.desc())
     if status_filter is not None:
         q = q.where(CustomerOrder.status == status_filter)
+    if dining_table_id is not None:
+        q = q.where(CustomerOrder.dining_table_id == dining_table_id)
     if active_sessions_only:
         inactive_sessions = select(TableSession.id).where(TableSession.status != "active")
         # Bugfix spec 156 (A-156/A-157): "ya pagado" se detectaba solo por

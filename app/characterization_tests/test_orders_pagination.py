@@ -54,7 +54,7 @@ class _FakeRequest:
 
 
 def _call_list_orders(db, *, status=None, order_type=None, active_sessions_only=False,
-                      page=None, size=None, request=None):
+                      dining_table_id=None, page=None, size=None, request=None):
     # Spec 157 (A-160): `list_orders` ahora calcula `qr_payment_instruction_mode`
     # en bloque vía `plan_service.get_qr_payment_instruction_mode(db, tenant)`
     # -- `tenant` explícito (ya no el sentinel `Depends(...)` del llamado
@@ -69,6 +69,7 @@ def _call_list_orders(db, *, status=None, order_type=None, active_sessions_only=
             status_filter=status,
             order_type=order_type,
             active_sessions_only=active_sessions_only,
+            dining_table_id=dining_table_id,
             page=page,
             size=size,
             date_from=None,
@@ -84,7 +85,9 @@ def _call_list_orders(db, *, status=None, order_type=None, active_sessions_only=
 
 
 def _call_list_tables(db, *, page=None, size=None):
-    return orders_router.list_tables(page=page, size=size, db=db, _=fx.make_user_double())
+    return orders_router.list_tables(
+        page=page, size=size, dining_table_id=None, db=db, _=fx.make_user_double(),
+    )
 
 
 def _seed_order(db, ts, *, created_at, status="pendiente", order_type="DINE_IN", con_sale=False):
@@ -141,6 +144,21 @@ class TestOrdersListModoCompatible(unittest.TestCase):
 
         ids = [o["id"] for o in json.loads(resp.body)]
         self.assertEqual(ids, [str(vivo.id)])
+
+    def test_dining_table_id_filtra_solo_los_pedidos_de_esa_mesa(self):
+        """Filtro nuevo (Terminal: detalle de un pedido en su propia ruta) --
+        aditivo, mismo patrón que `active_sessions_only`."""
+        db = fx.new_session()
+        ts_a = fx.make_table_session(db)
+        pedido_a = _seed_order(db, ts_a, created_at=datetime(2026, 9, 1, 12, 0))
+        ts_b = fx.make_table_session(db)
+        _seed_order(db, ts_b, created_at=datetime(2026, 9, 1, 13, 0))
+        db.commit()
+
+        resp = _call_list_orders(db, dining_table_id=ts_a.dining_table_id)
+
+        ids = [o["id"] for o in json.loads(resp.body)]
+        self.assertEqual(ids, [str(pedido_a.id)])
 
     def test_status_crudo_se_conserva_en_modo_compatible(self):
         # Spec 147: 'abierta'/'bloqueada' ya no son valores válidos --
@@ -413,6 +431,28 @@ class TestTablesListPaginado(unittest.TestCase):
         self.assertEqual(vacio["page"], 1)
         self.assertEqual(vacio["items"], [])
         self.assertEqual(vacio["total"], 0)
+
+    def test_dining_table_id_devuelve_solo_esa_mesa(self):
+        """Filtro nuevo (Terminal: carga acotada al entrar directo al detalle
+        de un pedido por URL) -- aditivo, sigue devolviendo una lista."""
+        db = self._seed(5)
+        mesas = db.execute(select(DiningTable).order_by(DiningTable.number)).scalars().all()
+        objetivo = mesas[2]
+
+        result = orders_router.list_tables(
+            page=None, size=None, dining_table_id=objetivo.id, db=db, _=fx.make_user_double(),
+        )
+
+        self.assertEqual([t.id for t in result], [objetivo.id])
+
+    def test_dining_table_id_inexistente_devuelve_lista_vacia(self):
+        db = self._seed(3)
+
+        result = orders_router.list_tables(
+            page=None, size=None, dining_table_id=uuid4(), db=db, _=fx.make_user_double(),
+        )
+
+        self.assertEqual(result, [])
 
 
 if __name__ == "__main__":

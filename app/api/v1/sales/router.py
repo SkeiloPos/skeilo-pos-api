@@ -12,7 +12,7 @@ from app.core.models import Tenant, User
 from app.core.pagination import Page, paginate
 from app.core.plan_limits import enforce_plan_limit
 from app.core.storage import asset_display_url
-from app.models.payment import PaymentMethod
+from app.models.payment import Payment, PaymentMethod
 from app.models.payment_method_catalog import PaymentMethodCatalog
 from app.models.sale import Sale
 from app.api.v1.sales import service
@@ -159,7 +159,7 @@ def _load_sale(db: Session, sale_id: UUID) -> Sale:
         select(Sale)
         .options(
             selectinload(Sale.items),
-            selectinload(Sale.payments),
+            selectinload(Sale.payments).selectinload(Payment.payment_method),
             selectinload(Sale.invoice),
             selectinload(Sale.dining_table),
         )

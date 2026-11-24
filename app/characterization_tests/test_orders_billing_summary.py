@@ -64,6 +64,7 @@ def _list_orders(db, **kw):
             status_filter=None,
             order_type=None,
             active_sessions_only=False,
+            dining_table_id=None,
             page=kw["page"],
             size=kw["size"],
             date_from=None,
@@ -707,7 +708,7 @@ class TestQrPaymentInstructionModeEnEndpointsDeStaff(unittest.TestCase):
         ):
             response = orders_router.list_orders(
                 _FakeRequest(), status_filter=None, order_type=None,
-                active_sessions_only=False, page=None, size=None,
+                active_sessions_only=False, dining_table_id=None, page=None, size=None,
                 date_from=None, date_to=None, q=None, entregadas_sin_cobrar=False,
                 db=db, tenant=fx.make_tenant_double(), _=fx.make_user_double(),
             )

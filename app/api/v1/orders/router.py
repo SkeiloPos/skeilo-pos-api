@@ -116,6 +116,7 @@ def _load_order(db: Session, order_id: UUID, tenant: Tenant | None = None) -> Cu
 def list_tables(
     page: int | None = Query(None, ge=1),
     size: int | None = Query(None, ge=1, le=100),
+    dining_table_id: UUID | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -123,7 +124,17 @@ def list_tables(
     FR-025 — Terminal, Dashboard, detalle de orden y hoja de QR lo consumen
     completo). Con `page` y/o `size`: `Page[TableResponse]` con el mismo orden
     (`number` es `UNIQUE`, sin desempate) y el clamp de página fuera de rango
-    de spec 079 (contracts/tables-list-api.md)."""
+    de spec 079 (contracts/tables-list-api.md).
+
+    `dining_table_id`: filtro aditivo para quien solo necesita una mesa (la
+    Terminal, al entrar directo al detalle de un pedido por URL) -- sigue
+    devolviendo una lista (0 o 1 fila), no un objeto, para no cambiar la forma
+    de respuesta que ya consumen los otros callers. Se ignora junto con
+    `page`/`size` si se combinan (no hay un caso de uso real para eso hoy)."""
+    if dining_table_id is not None:
+        return db.execute(
+            select(DiningTable).where(DiningTable.id == dining_table_id)
+        ).scalars().all()
     if page is None and size is None:
         return db.execute(select(DiningTable).order_by(DiningTable.number)).scalars().all()
     stmt = select(DiningTable).order_by(DiningTable.number.asc())
@@ -1011,6 +1022,7 @@ def list_orders(
     status_filter: str | None = Query(None, alias="status"),
     order_type: OrderType | None = Query(None),
     active_sessions_only: bool = Query(False),
+    dining_table_id: UUID | None = Query(None),
     page: int | None = Query(None, ge=1),
     size: int | None = Query(None, ge=1, le=100),
     date_from: date | None = Query(None, description="Fecha inicial (inclusive) sobre created_at."),
@@ -1036,11 +1048,12 @@ def list_orders(
     `order_type` opcional, `date_from`/`date_to`/`q` opcionales — spec 120,
     research.md §1-§2) paginado con `paginate` + `clamp_page`; `paid` y
     `staff_user_name` solo sobre los `items` de la página; **sin `ETag`** (la
-    pantalla se recarga a mano); `active_sessions_only` se ignora (ningún
-    consumidor legítimo lo combina con paginación). `date_from`/`date_to`/`q`
-    solo aplican a esta rama — la rama sin paginar no los recibe."""
+    pantalla se recarga a mano); `active_sessions_only`/`dining_table_id` se
+    ignoran (ningún consumidor legítimo los combina con paginación).
+    `date_from`/`date_to`/`q` solo aplican a esta rama — la rama sin paginar
+    no los recibe."""
     if page is None and size is None:
-        orders = service.list_orders(db, status_filter, active_sessions_only)
+        orders = service.list_orders(db, status_filter, active_sessions_only, dining_table_id)
         _decorate_orders(db, orders, tenant=tenant)
         # `dump_json` sobre los ORM crudos no valida -- `applied_promotions`
         # trae JSONB con formas viejas (solo `name`) o con `rule_id` interno

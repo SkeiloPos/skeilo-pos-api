@@ -437,7 +437,7 @@ def list_sales_query(
         select(Sale)
         .options(
             selectinload(Sale.items),
-            selectinload(Sale.payments),
+            selectinload(Sale.payments).selectinload(Payment.payment_method),
             selectinload(Sale.invoice),
             selectinload(Sale.dining_table),
         )
