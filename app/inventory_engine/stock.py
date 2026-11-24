@@ -97,6 +97,7 @@ def record_movement(
         inventory_item_id=inventory_item_id,
         type=type,
         quantity=quantity,
+        signed_quantity=delta,
         reason=reason,
         reference_type=reference_type,
         reference_id=reference_id,
@@ -112,6 +113,8 @@ def apply_adjustment(
     *,
     signed_delta: Decimal,
     reason: Optional[str] = None,
+    reference_type: Optional[str] = None,
+    reference_id: Optional[UUID] = None,
     user_id: Optional[UUID] = None,
 ) -> InventoryMovement:
     """Ajuste manual de stock (delta con signo). Registra un movimiento
@@ -132,7 +135,10 @@ def apply_adjustment(
         inventory_item_id=inventory_item_id,
         type="adjustment",
         quantity=abs(signed_delta),
+        signed_quantity=signed_delta,
         reason=reason,
+        reference_type=reference_type,
+        reference_id=reference_id,
     )
     movement.user_id = user_id
     db.add(movement)

@@ -18,9 +18,11 @@ from uuid import uuid4
 
 from sqlalchemy import select, delete, func, text
 
+from app.core import inventory_reasons as reasons
 from app.core.db import with_db
 from app.core.timezone import utc_now
 from app.models.inventory_item import InventoryItem
+from app.models.inventory_movement import InventoryMovement
 from app.models.unit_measure import UnitMeasure
 from app.models.unit_measure_group import UnitMeasureGroup
 from app.models.supplier import Supplier
@@ -96,6 +98,7 @@ def _cleanup(db, unit, item) -> None:
     if _proveedores_extra:
         db.execute(delete(SupplierItem).where(SupplierItem.supplier_id.in_(_proveedores_extra)))
         db.execute(delete(Supplier).where(Supplier.id.in_(_proveedores_extra)))
+    db.execute(delete(InventoryMovement).where(InventoryMovement.inventory_item_id.in_(all_item_ids)))
     db.execute(delete(InventoryItem).where(InventoryItem.id.in_(all_item_ids)))
     if _unidades_extra:
         db.execute(delete(UnitMeasure).where(UnitMeasure.id.in_(_unidades_extra)))
@@ -501,7 +504,7 @@ def test_interrupcion_a_mitad_de_archivo_conserva_lo_ya_aplicado(db, unit):
     job = _job(db, uuid4(), 2)
     db.commit()
 
-    resultado = validar_y_aplicar_fila(db, fila_aplicada)
+    resultado = validar_y_aplicar_fila(db, fila_aplicada, job)
     assert resultado["ok"], resultado
     # El proceso "se interrumpe" aquí -- nunca se llama procesar_archivo_importacion
     # ni se marca el job como finalizado.
@@ -757,6 +760,239 @@ def test_h3_actualizacion_ignora_grupo_y_unidad_de_compra(db, item, unit):
     print("OK: h3_actualizacion_ignora_grupo_y_unidad_de_compra")
 
 
+def test_us1_creacion_con_stock_positivo_genera_movimiento_in(db, unit):
+    """spec 165, quickstart.md Escenario 1: insumo nuevo con Stock = 50 ->
+    `current_stock == 50` vía un movimiento `in` de kardex referenciado al job,
+    no por escritura directa."""
+    code = f"T{uuid4().hex[:6]}"
+    fila = [code, f"Nuevo-stock50-{uuid4().hex[:6]}", "Materia prima",
+            unit.abbreviation, "50", "0", "100"]
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code)
+
+    item = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code)
+    ).scalar_one()
+    assert item.current_stock == Decimal("50")
+
+    movimientos = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert len(movimientos) == 1, movimientos
+    mov = movimientos[0]
+    assert mov.type == "in"
+    assert mov.quantity == Decimal("50")
+    assert mov.signed_quantity == Decimal("50")
+    assert mov.reason == reasons.IMPORTACION_MASIVA
+    assert mov.reference_type == reasons.REF_IMPORT_JOB
+    assert mov.reference_id == job.id
+    print("OK: us1_creacion_con_stock_positivo_genera_movimiento_in")
+
+
+def test_us1_creacion_con_stock_cero_no_genera_movimiento(db, unit):
+    """spec 165, quickstart.md Escenario 2: insumo nuevo con Stock = 0 ->
+    `current_stock == 0` y ningún movimiento de kardex."""
+    code = f"T{uuid4().hex[:6]}"
+    fila = [code, f"Nuevo-stock0-{uuid4().hex[:6]}", "Materia prima",
+            unit.abbreviation, "0", "0", "100"]
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code)
+
+    item = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code)
+    ).scalar_one()
+    assert item.current_stock == Decimal("0")
+
+    movimientos = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert movimientos == [], movimientos
+    print("OK: us1_creacion_con_stock_cero_no_genera_movimiento")
+
+
+def test_us2_actualizacion_genera_ajustes_con_signo_y_sin_cambio_no_genera_nada(db, unit):
+    """spec 165, quickstart.md Escenarios 3-4: insumo existente con
+    `current_stock = 30` -> Stock = 45 genera ajuste +15; sobre ese mismo
+    insumo, Stock = 10 genera ajuste -20; reimportar con Stock = 10 sin cambio
+    no agrega ningún movimiento nuevo."""
+    code = f"T{uuid4().hex[:6]}"
+    item = InventoryItem(
+        code=code, name=f"US2-ajuste-{uuid4().hex[:8]}", type="raw_material",
+        unit_measure_id=unit.id, current_stock=Decimal("30"), min_stock=Decimal("0"),
+        unit_cost=Decimal("100"),
+    )
+    db.add(item)
+    db.flush()
+    db.commit()
+    _codigos_extra.append(code)
+
+    fila_45 = [code, item.name, "Materia prima", unit.abbreviation, "45", "0", "100"]
+    job1 = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job1, [fila_45])
+    db.refresh(job1)
+    assert job1.updated_count == 1, job1.errors
+    db.refresh(item)
+    assert item.current_stock == Decimal("45")
+    mov_45 = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert len(mov_45) == 1, mov_45
+    assert mov_45[0].type == "adjustment"
+    assert mov_45[0].quantity == Decimal("15")
+    assert mov_45[0].signed_quantity == Decimal("15")
+    assert mov_45[0].reason == reasons.IMPORTACION_MASIVA
+    assert mov_45[0].reference_type == reasons.REF_IMPORT_JOB
+    assert mov_45[0].reference_id == job1.id
+
+    fila_10 = [code, item.name, "Materia prima", unit.abbreviation, "10", "0", "100"]
+    job2 = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job2, [fila_10])
+    db.refresh(job2)
+    assert job2.updated_count == 1, job2.errors
+    db.refresh(item)
+    assert item.current_stock == Decimal("10")
+    mov_todos = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert len(mov_todos) == 2, mov_todos
+    nuevo = [m for m in mov_todos if m.id != mov_45[0].id][0]
+    assert nuevo.quantity == Decimal("35"), nuevo.quantity  # 45 -> 10
+    assert nuevo.signed_quantity == Decimal("-35"), nuevo.signed_quantity
+    assert nuevo.reference_id == job2.id
+
+    fila_sin_cambio = [code, item.name, "Materia prima", unit.abbreviation, "10", "0", "100"]
+    job3 = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job3, [fila_sin_cambio])
+    db.refresh(job3)
+    assert job3.updated_count == 1, job3.errors
+    db.refresh(item)
+    assert item.current_stock == Decimal("10")
+    mov_finales = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert len(mov_finales) == 2, mov_finales
+    print("OK: us2_actualizacion_genera_ajustes_con_signo_y_sin_cambio_no_genera_nada")
+
+
+def test_us3_ajuste_que_dejaria_stock_negativo_rechaza_solo_esa_fila(db, unit, schema):
+    """spec 165, quickstart.md Escenario 5: insumo con `current_stock = 5` ->
+    una fila cuyo ajuste resultante sería negativo se reporta como fallida en
+    `job.errors[]`, sin modificar el insumo; la siguiente fila (código
+    distinto) se procesa con normalidad.
+
+    El delta de la fila por sí solo nunca puede dejar el stock negativo
+    (`new_stock = stock_antes + (stock - stock_antes) = stock`, y `Stock` del
+    Excel ya se valida como >= 0) -- el `InsufficientStockError` de
+    `apply_adjustment()` protege contra una venta/ajuste concurrente que baje
+    el stock real por debajo de lo que el Excel asumía, igual que simula
+    `test_job_cancelado_a_mitad_de_archivo_detiene_las_filas_restantes` con una
+    segunda sesión. Se simula aquí con una segunda sesión que vende stock justo
+    después de que `resolve_or_create_by_code` resuelve el insumo (ver
+    `_resolver_y_vender`), forzando `db.expire()` para que la siguiente
+    lectura (`apply_adjustment`'s `with_for_update()`) vea el valor real."""
+    code = f"T{uuid4().hex[:6]}"
+    item = InventoryItem(
+        code=code, name=f"US3-negativo-{uuid4().hex[:8]}", type="raw_material",
+        unit_measure_id=unit.id, current_stock=Decimal("5"), min_stock=Decimal("0"),
+        unit_cost=Decimal("100"),
+    )
+    db.add(item)
+    db.flush()
+    db.commit()
+    _codigos_extra.append(code)
+
+    original_resolve = service.resolve_or_create_by_code
+
+    def _resolver_y_vender(*args, **kwargs):
+        resultado = original_resolve(*args, **kwargs)
+        with with_db(schema) as otra_sesion:
+            otro_item = otra_sesion.execute(
+                select(InventoryItem).where(InventoryItem.code == code)
+            ).scalar_one()
+            otro_item.current_stock = Decimal("1")
+            otra_sesion.commit()
+        db.expire(resultado[0])
+        return resultado
+
+    code_ok = f"T{uuid4().hex[:6]}"
+    fila_negativa = [code, item.name, "Materia prima", unit.abbreviation, "3", "0", "100"]
+    fila_valida = [code_ok, f"US3-valido-{uuid4().hex[:6]}", "Materia prima",
+                   unit.abbreviation, "0", "0", "0"]
+    job = _job(db, uuid4(), 2)
+    db.commit()
+    service.resolve_or_create_by_code = _resolver_y_vender
+    try:
+        procesar_archivo_importacion(db, job, [fila_negativa, fila_valida])
+    finally:
+        service.resolve_or_create_by_code = original_resolve
+    db.refresh(job)
+    assert job.failed_count == 1, job.errors
+    assert job.created_count == 1, job.errors
+    _codigos_extra.append(code_ok)
+
+    motivos = [e["motivo"] for e in job.errors]
+    assert any("dejaría el stock" in m and "en negativo" in m for m in motivos), motivos
+
+    db.refresh(item)
+    assert item.current_stock == Decimal("1"), "el insumo debía quedar como lo dejó la venta concurrente"
+    movimientos = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert movimientos == [], movimientos
+
+    creado = db.execute(
+        select(InventoryItem).where(InventoryItem.code == code_ok)
+    ).scalar_one_or_none()
+    assert creado is not None, "la segunda fila debía procesarse con normalidad"
+    print("OK: us3_ajuste_que_dejaria_stock_negativo_rechaza_solo_esa_fila")
+
+
+def test_fr009_costo_se_sobrescribe_directo_sin_movimiento_de_costo(db, unit):
+    """spec 165, FR-009: el Costo de la fila sobrescribe `unit_cost`
+    directamente (fuera de alcance del kardex); el único `InventoryMovement`
+    generado por el cambio de Stock nunca referencia nada relacionado con
+    costo."""
+    code = f"T{uuid4().hex[:6]}"
+    item = InventoryItem(
+        code=code, name=f"FR009-costo-{uuid4().hex[:8]}", type="raw_material",
+        unit_measure_id=unit.id, current_stock=Decimal("20"), min_stock=Decimal("0"),
+        unit_cost=Decimal("100"),
+    )
+    db.add(item)
+    db.flush()
+    db.commit()
+    _codigos_extra.append(code)
+
+    fila = [code, item.name, "Materia prima", unit.abbreviation, "25", "0", "999"]
+    job = _job(db, uuid4(), 1)
+    db.commit()
+    procesar_archivo_importacion(db, job, [fila])
+    db.refresh(job)
+    assert job.updated_count == 1, job.errors
+    db.refresh(item)
+    assert item.unit_cost == Decimal("999")
+    assert item.current_stock == Decimal("25")
+
+    movimientos = db.execute(
+        select(InventoryMovement).where(InventoryMovement.inventory_item_id == item.id)
+    ).scalars().all()
+    assert len(movimientos) == 1, movimientos
+    assert movimientos[0].reason == reasons.IMPORTACION_MASIVA
+    assert "costo" not in (movimientos[0].reference_type or "").lower()
+    print("OK: fr009_costo_se_sobrescribe_directo_sin_movimiento_de_costo")
+
+
 def main() -> None:
     schema = _schema()
     print(f"Usando tenant con esquema: {schema}")
@@ -786,6 +1022,11 @@ def main() -> None:
             lambda: test_h3_unidad_de_compra_sin_proveedor_falla_la_fila(db, unit),
             lambda: test_h3_ambiguedad_de_grupo_en_unidad_base_falla_sin_crear_nada(db, unit),
             lambda: test_h3_actualizacion_ignora_grupo_y_unidad_de_compra(db, item, unit),
+            lambda: test_us1_creacion_con_stock_positivo_genera_movimiento_in(db, unit),
+            lambda: test_us1_creacion_con_stock_cero_no_genera_movimiento(db, unit),
+            lambda: test_us2_actualizacion_genera_ajustes_con_signo_y_sin_cambio_no_genera_nada(db, unit),
+            lambda: test_us3_ajuste_que_dejaria_stock_negativo_rechaza_solo_esa_fila(db, unit, schema),
+            lambda: test_fr009_costo_se_sobrescribe_directo_sin_movimiento_de_costo(db, unit),
         ]
         fallos = 0
         try:

@@ -22,6 +22,7 @@ import io
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest import mock
 from uuid import UUID
 
@@ -642,6 +643,9 @@ class ImportUnitLinkingTests(unittest.TestCase):
 
     def setUp(self):
         self.db = f.new_session()
+        # `f.new_session()` no crea `inventory_import_jobs` (fixtures.py no la
+        # incluye); un stub con `.id` basta porque `reference_id` no tiene FK.
+        self.job = SimpleNamespace(id=_uid())
 
     def _fila(self, code="", name="Insumo", tipo="Materia prima", unidad="un",
               stock="0", minimo="0", costo="0"):
@@ -655,8 +659,7 @@ class ImportUnitLinkingTests(unittest.TestCase):
         antes = self.db.execute(select(UnitMeasure.id)).scalars().all()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Harina", unidad="kg"),
-        )
+            self.db, self._fila(name="Harina", unidad="kg"), self.job,)
         self.assertTrue(resultado["ok"], resultado)
         self.assertEqual(resultado["accion"], "creado")
 
@@ -674,8 +677,7 @@ class ImportUnitLinkingTests(unittest.TestCase):
         `UnitMeasure` base de ese grupo, con `group_id` asignado (sin esto, la
         fila fallaría contra Postgres real por la restricción NOT NULL)."""
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Leche en galón", unidad="Galón"),
-        )
+            self.db, self._fila(name="Leche en galón", unidad="Galón"), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         item = self.db.execute(
@@ -699,8 +701,7 @@ class ImportUnitLinkingTests(unittest.TestCase):
         self.db.commit()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Insumo ambiguo", unidad="gal"),
-        )
+            self.db, self._fila(name="Insumo ambiguo", unidad="gal"), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("más de una unidad", resultado["motivo"])
         existe = self.db.execute(
@@ -711,8 +712,7 @@ class ImportUnitLinkingTests(unittest.TestCase):
     def test_unidad_vacia_en_fila_nueva_falla_por_campo_obligatorio(self):
         """FR-009: igual que cualquier otro campo requerido vacío."""
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Insumo sin unidad", unidad=""),
-        )
+            self.db, self._fila(name="Insumo sin unidad", unidad=""), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("obligatoria", resultado["motivo"])
         existe = self.db.execute(
@@ -731,6 +731,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
 
     def setUp(self):
         self.db = f.new_session()
+        self.job = SimpleNamespace(id=_uid())
 
     def _fila(
         self, code="", name="Insumo", tipo="Materia prima", unidad="g", grupo="",
@@ -745,8 +746,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
         """FR-010, Acceptance Scenario 1: "Masa" no existe -- se crea el grupo y
         la unidad base "g" dentro de él."""
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Harina", unidad="g", grupo="Masa"),
-        )
+            self.db, self._fila(name="Harina", unidad="g", grupo="Masa"), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         item = self.db.execute(
@@ -765,8 +765,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
         self.db.commit()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Harina", unidad="g", grupo="Masa"),
-        )
+            self.db, self._fila(name="Harina", unidad="g", grupo="Masa"), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         grupos = self.db.execute(
@@ -783,8 +782,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
         self.db.commit()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Insumo ambiguo", unidad="g", grupo="Masa"),
-        )
+            self.db, self._fila(name="Insumo ambiguo", unidad="g", grupo="Masa"), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("grupo", resultado["motivo"])
         existe = self.db.execute(
@@ -802,8 +800,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
         self.db.commit()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Insumo", unidad="lb", grupo="Masa"),
-        )
+            self.db, self._fila(name="Insumo", unidad="lb", grupo="Masa"), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("unidad base", resultado["motivo"])
 
@@ -822,8 +819,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
                 unidad_compra="KG",
-            ),
-        )
+            ), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         item = self.db.execute(
@@ -851,8 +847,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
                 unidad_compra="KG", factor_compra="900",
-            ),
-        )
+            ), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("factor", resultado["motivo"])
         self.db.refresh(kg)
@@ -875,8 +870,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
                 unidad_compra="KG", factor_compra="1000",
-            ),
-        )
+            ), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("otro grupo", resultado["motivo"])
 
@@ -887,8 +881,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
                 unidad_compra="KG", factor_compra="1000",
-            ),
-        )
+            ), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         item = self.db.execute(
@@ -911,8 +904,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 name="Harina", unidad="g", grupo="Masa", proveedor="Molino XYZ",
                 unidad_compra="KG",
-            ),
-        )
+            ), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("obligatorio", resultado["motivo"])
         existe = self.db.execute(
@@ -927,8 +919,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 name="Harina", unidad="g", grupo="Masa",
                 unidad_compra="KG", factor_compra="1000",
-            ),
-        )
+            ), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("Proveedor preferido", resultado["motivo"])
         existe = self.db.execute(
@@ -940,8 +931,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
         """FR-020, sin cambio: Proveedor preferido sin Unidad de compra sigue
         creando la relación con `unit_measure_id=NULL`."""
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(name="Harina", unidad="g", proveedor="Molino XYZ"),
-        )
+            self.db, self._fila(name="Harina", unidad="g", proveedor="Molino XYZ"), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         item = self.db.execute(
@@ -968,8 +958,7 @@ class ImportGroupAndPurchaseUnitTests(unittest.TestCase):
             self.db, self._fila(
                 code="0001", name="Harina", unidad="g", grupo="Masa",
                 proveedor="Molino XYZ", unidad_compra="KG", factor_compra="1000",
-            ),
-        )
+            ), self.job,)
         self.assertTrue(resultado["ok"], resultado)
         self.assertEqual(resultado["accion"], "actualizado")
 
@@ -998,6 +987,9 @@ class ImportUnitUnchangedOnUpdateTests(unittest.TestCase):
         self.item = f.make_inventory_item(
             self.db, name="Azúcar", code="0001", unit=self.unit,
         )
+        # `f.new_session()` no crea `inventory_import_jobs`; un stub con `.id`
+        # basta porque `reference_id` no tiene FK.
+        self.job = SimpleNamespace(id=_uid())
         self.db.commit()
 
     def _assert_unidad_sin_cambios_y_sin_unidades_nuevas(self, unidad_en_fila: str):
@@ -1005,8 +997,7 @@ class ImportUnitUnchangedOnUpdateTests(unittest.TestCase):
         resultado = import_service.validar_y_aplicar_fila(
             self.db, [
                 "0001", "Azúcar", "Materia prima", unidad_en_fila, "5", "1", "100",
-            ],
-        )
+            ], self.job,)
         self.assertTrue(resultado["ok"], resultado)
         self.assertEqual(resultado["accion"], "actualizado")
 
@@ -1040,6 +1031,9 @@ class ImportPreferredSupplierTests(unittest.TestCase):
     def setUp(self):
         self.db = f.new_session()
         self.item = f.make_inventory_item(self.db, name="Insumo", code="0001")
+        # `f.new_session()` no crea `inventory_import_jobs`; un stub con `.id`
+        # basta porque `reference_id` no tiene FK.
+        self.job = SimpleNamespace(id=_uid())
         self.db.commit()
 
     def _fila(self, proveedor: str) -> list:
@@ -1053,8 +1047,7 @@ class ImportPreferredSupplierTests(unittest.TestCase):
         self.db.commit()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila("otro proveedor"),
-        )
+            self.db, self._fila("otro proveedor"), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         self.db.refresh(relacion_otro)
@@ -1067,8 +1060,7 @@ class ImportPreferredSupplierTests(unittest.TestCase):
         desde el módulo de proveedores."""
         nombre = "Proveedor Nuevo"
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila(nombre),
-        )
+            self.db, self._fila(nombre), self.job,)
         self.assertTrue(resultado["ok"], resultado)
 
         proveedor = self.db.execute(
@@ -1092,7 +1084,7 @@ class ImportPreferredSupplierTests(unittest.TestCase):
         relacion = f.make_supplier_item(self.db, norte, self.item, preferred=True)
         self.db.commit()
 
-        resultado = import_service.validar_y_aplicar_fila(self.db, self._fila(""))
+        resultado = import_service.validar_y_aplicar_fila(self.db, self._fila(""), self.job)
         self.assertTrue(resultado["ok"], resultado)
 
         self.db.refresh(self.item)
@@ -1105,7 +1097,7 @@ class ImportPreferredSupplierTests(unittest.TestCase):
         f.make_supplier(self.db, name="abc")
         self.db.commit()
 
-        resultado = import_service.validar_y_aplicar_fila(self.db, self._fila("ABC"))
+        resultado = import_service.validar_y_aplicar_fila(self.db, self._fila("ABC"), self.job)
         self.assertFalse(resultado["ok"])
         self.assertIn("más de un proveedor", resultado["motivo"])
 
@@ -1123,8 +1115,7 @@ class ImportPreferredSupplierTests(unittest.TestCase):
         self.db.commit()
 
         resultado = import_service.validar_y_aplicar_fila(
-            self.db, self._fila("Distribuidora Norte"),
-        )
+            self.db, self._fila("Distribuidora Norte"), self.job,)
         self.assertFalse(resultado["ok"])
         self.assertIn("más de una relación", resultado["motivo"])
 

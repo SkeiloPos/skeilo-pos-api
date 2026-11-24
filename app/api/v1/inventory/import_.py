@@ -17,7 +17,9 @@ from fastapi import HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
+from app.core import inventory_reasons as reasons
 from app.core.timezone import utc_now_naive
+from app.inventory_engine import stock as stock_engine
 from app.models.inventory_item import InventoryItem
 from app.models.unit_measure import UnitMeasure
 from app.models.unit_measure_group import UnitMeasureGroup
@@ -391,7 +393,7 @@ def _apply_preferred_supplier(
         raise ValueError(str(detail)) from exc
 
 
-def validar_y_aplicar_fila(db: Session, fila: list[Any]) -> dict:
+def validar_y_aplicar_fila(db: Session, fila: list[Any], job) -> dict:
     """data-model.md, reglas de validación: valida y aplica una fila de forma
     independiente, con su propio commit. Devuelve
     `{ok, accion, motivo}` -- `accion` es "creado"/"actualizado" cuando `ok` es
@@ -402,7 +404,12 @@ def validar_y_aplicar_fila(db: Session, fila: list[Any]) -> dict:
     se ignoran por completo, sin resolver ni crear ninguna `UnitMeasure`/
     `UnitMeasureGroup`. Lo mismo aplica a Unidad de compra/Factor de conversión
     (compra), vía el `creado=False` que recibe `_apply_preferred_supplier`
-    (FR-021)."""
+    (FR-021).
+
+    spec 165: `current_stock` nunca se escribe directo -- el insumo nace con el
+    stock en 0 (default del modelo) y el Stock del Excel se aplica vía kardex
+    (`record_movement` en creación, `apply_adjustment` en actualización),
+    referenciado al job de importación (data-model.md, D2/D3)."""
     idx = _indices(len(fila))
     try:
         tipo = _resolve_type(_col(fila, idx, "TYPE"))
@@ -420,10 +427,11 @@ def validar_y_aplicar_fila(db: Session, fila: list[Any]) -> dict:
             existente = db.execute(
                 select(InventoryItem).where(InventoryItem.code == code)
             ).scalar_one_or_none()
+        stock_antes = existente.current_stock if existente is not None else None
 
         campos = dict(
             name=str(nombre).strip(), type=tipo,
-            current_stock=stock, min_stock=minimo, unit_cost=costo,
+            min_stock=minimo, unit_cost=costo,
         )
         if existente is None:
             campos["unit_measure_id"] = _resolve_unit(
@@ -431,12 +439,28 @@ def validar_y_aplicar_fila(db: Session, fila: list[Any]) -> dict:
             ).id
 
         item, creado = service.resolve_or_create_by_code(db, code, **campos)
+        if creado:
+            if stock > 0:
+                stock_engine.record_movement(
+                    db, item.id, type="in", quantity=stock,
+                    reason=reasons.IMPORTACION_MASIVA,
+                    reference_type=reasons.REF_IMPORT_JOB, reference_id=job.id,
+                )
+        else:
+            delta = stock - stock_antes
+            if delta != 0:
+                stock_engine.apply_adjustment(
+                    db, item.id, signed_delta=delta,
+                    reason=reasons.IMPORTACION_MASIVA,
+                    reference_type=reasons.REF_IMPORT_JOB, reference_id=job.id,
+                )
         _apply_preferred_supplier(db, item, fila, idx, creado=creado)
         db.commit()
         return {"ok": True, "accion": "creado" if creado else "actualizado", "motivo": None}
-    except ValueError as exc:
+    except (ValueError, HTTPException) as exc:
         db.rollback()
-        return {"ok": False, "accion": None, "motivo": str(exc)}
+        detail = exc.detail if isinstance(exc, HTTPException) else exc
+        return {"ok": False, "accion": None, "motivo": str(detail)}
 
 
 def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> None:
@@ -474,7 +498,7 @@ def procesar_archivo_importacion(db: Session, job, filas: list[list[Any]]) -> No
                 "motivo": f"el código '{code}' aparece más de una vez en este archivo",
             }
         else:
-            resultado = validar_y_aplicar_fila(db, fila)
+            resultado = validar_y_aplicar_fila(db, fila, job)
 
         if resultado["ok"]:
             if resultado["accion"] == "creado":

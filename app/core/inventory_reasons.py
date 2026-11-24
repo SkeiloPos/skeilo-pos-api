@@ -39,9 +39,13 @@ VENCIMIENTO = "vencimiento"
 #: Salida por consumo del propio negocio (staff, degustación, cortesía).
 CONSUMO_INTERNO = "consumo_interno"
 
+#: Entrada o ajuste originado por la importación masiva de Excel de inventario
+#: (spec 165, decisión A-165).
+IMPORTACION_MASIVA = "importacion_masiva"
+
 #: Motivos válidos como entrada / como salida. No se aplican como constraint de
 #: BD; sirven para validar en la capa de API cuando el motivo lo elige el usuario.
-ENTRADA_REASONS = (COMPRA, AJUSTE)
+ENTRADA_REASONS = (COMPRA, AJUSTE, IMPORTACION_MASIVA)
 SALIDA_REASONS = (VENTA, DANO, VENCIMIENTO, CONSUMO_INTERNO, AJUSTE)
 
 # ----------------------------------------------------------------- Referencias
@@ -51,3 +55,6 @@ REF_ORDER = "order"
 REF_ORDER_VOID = "order_void"
 REF_PURCHASE = "purchase"
 REF_PURCHASE_VOID = "purchase_void"
+
+#: Job de importación masiva de Excel de inventario (spec 165).
+REF_IMPORT_JOB = "import_job"
