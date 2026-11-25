@@ -135,6 +135,7 @@ def list_sales(
     date_from: date | None = Query(None, description="Fecha inicial (inclusive) sobre sold_at."),
     date_to: date | None = Query(None, description="Fecha final (inclusive) sobre sold_at."),
     invoice_reference: str | None = Query(None, description="Búsqueda por referencia de factura (prefijo+número)."),
+    customer_order_id: UUID | None = Query(None, description="Venta de un pedido puntual."),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
     tenant: Tenant = Depends(get_tenant),
@@ -145,6 +146,7 @@ def list_sales(
         date_from=date_from,
         date_to=date_to,
         invoice_reference=invoice_reference,
+        customer_order_id=customer_order_id,
     )
     return paginate(db, stmt, page, size)
 
