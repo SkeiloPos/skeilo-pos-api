@@ -163,7 +163,7 @@ def test_pago_mixto_neta_el_cambio_solo_en_la_fila_cash() -> None:
     `transfer` de `sales_by_method` debe mostrar $6.000 (bruto = neto, no
     hay cambio ahí) y la fila `cash` debe mostrar $8.000 (neto), no $10.000."""
     db = _session()
-    shift = make_cash_shift(db, opening_amount=Decimal("0"))
+    shift = make_cash_shift(db, opening_amount=Decimal("100000"))
     efectivo = make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
     transferencia = make_payment_method(db, name="Transferencia", type="transfer", is_cash=False)
 
@@ -191,7 +191,7 @@ def test_varias_ventas_con_pago_mixto_suman_correctamente_por_metodo() -> None:
     con 2 líneas de pago -- `sales_by_method` acumula el total de cada
     método a través de TODAS las ventas del turno, no solo de la última."""
     db = _session()
-    shift = make_cash_shift(db, opening_amount=Decimal("0"))
+    shift = make_cash_shift(db, opening_amount=Decimal("100000"))
     efectivo = make_payment_method(db, name="Efectivo", type="cash", is_cash=True)
     transferencia = make_payment_method(db, name="Transferencia", type="transfer", is_cash=False)
 
