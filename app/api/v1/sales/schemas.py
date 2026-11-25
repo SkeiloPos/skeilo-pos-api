@@ -162,6 +162,8 @@ class SaleItemResponse(BaseModel):
 class PaymentResponse(BaseModel):
     id: UUID
     payment_method_id: UUID
+    payment_method_name: str
+    is_cash: bool
     amount: Decimal
     reference: str | None = None
     paid_at: UtcDatetime

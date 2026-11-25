@@ -22,6 +22,7 @@ from app.core.plan_limits import enforce_plan_limit
 from app.core.pagination import Page, paginate
 from app.core.qr_token import mint_qr_token
 from app.models.dining_table import DiningTable
+from app.models.table_session import TableSession
 from app.models.customer_order import CustomerOrder
 from app.models.order_item import OrderItem
 from app.models.order_payment_attempt import OrderPaymentAttempt
@@ -34,6 +35,7 @@ from app.api.v1.orders import checkout
 from app.api.v1.orders import tables_advanced
 from app.api.v1.plan import service as plan_service
 from app.api.v1.table_sessions.service import notify_sessions_closed
+from app.api.v1.table_sessions.schemas import TableSessionResponse
 from app.api.v1.catalog.schemas import (
     OptionSelectionIn, UpdateAdditionQuantityIn, ToppingSelectionIn, UpdateToppingQuantityIn,
 )
@@ -50,14 +52,17 @@ from app.api.v1.orders.schemas import (
     PaymentAttemptConfirmCashIn, PaymentAttemptAdjustSplitIn, PaymentEventOut,
     KitchenBoardResponse, KitchenCardOut, ChangeKitchenStatusIn,
     ItemMoveIn, SplitToNewIn, SplitOrderResponse, MoveItemResponse, SplitToNewResponse,
+    TableDetailResponse, OrderSummaryResponse,
 )
 from app.api.v1.orders import item_transfer
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 # A nivel de módulo a propósito: `TypeAdapter` compila el esquema, y construirlo
-# por request tiraría por tierra el ahorro que persigue el ETag.
-_ORDERS_ADAPTER = TypeAdapter(list[OrderResponse])
+# por request tiraría por tierra el ahorro que persigue el ETag. `OrderSummaryResponse`
+# (no `OrderResponse`): esta es la rama que sondea la grilla de la Terminal
+# (`active_sessions_only`), recortada a lo que esa pantalla pinta.
+_ORDERS_ADAPTER = TypeAdapter(list[OrderSummaryResponse])
 
 
 def _load_order(db: Session, order_id: UUID, tenant: Tenant | None = None) -> CustomerOrder:
@@ -116,6 +121,7 @@ def _load_order(db: Session, order_id: UUID, tenant: Tenant | None = None) -> Cu
 def list_tables(
     page: int | None = Query(None, ge=1),
     size: int | None = Query(None, ge=1, le=100),
+    dining_table_id: UUID | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -123,13 +129,63 @@ def list_tables(
     FR-025 — Terminal, Dashboard, detalle de orden y hoja de QR lo consumen
     completo). Con `page` y/o `size`: `Page[TableResponse]` con el mismo orden
     (`number` es `UNIQUE`, sin desempate) y el clamp de página fuera de rango
-    de spec 079 (contracts/tables-list-api.md)."""
+    de spec 079 (contracts/tables-list-api.md).
+
+    `dining_table_id`: filtro aditivo para quien solo necesita una mesa (la
+    Terminal, al entrar directo al detalle de un pedido por URL) -- sigue
+    devolviendo una lista (0 o 1 fila), no un objeto, para no cambiar la forma
+    de respuesta que ya consumen los otros callers. Se ignora junto con
+    `page`/`size` si se combinan (no hay un caso de uso real para eso hoy)."""
+    if dining_table_id is not None:
+        return db.execute(
+            select(DiningTable).where(DiningTable.id == dining_table_id)
+        ).scalars().all()
     if page is None and size is None:
         return db.execute(select(DiningTable).order_by(DiningTable.number)).scalars().all()
     stmt = select(DiningTable).order_by(DiningTable.number.asc())
     effective_size = size or 20
     effective_page = service.clamp_page(db, stmt, page or 1, effective_size)
     return paginate(db, stmt, effective_page, effective_size)
+
+
+@router.get(
+    "/tables/{dining_table_id}/detail",
+    response_model=TableDetailResponse,
+    summary="Detalle agregado de una mesa para la Terminal (mesa + sesión activa + pedidos)",
+)
+def table_detail(
+    dining_table_id: UUID,
+    db: Session = Depends(get_db),
+    tenant: Tenant = Depends(get_tenant),
+    _: User = Depends(get_current_user),
+):
+    """Reemplaza 3 peticiones sueltas que la Terminal siempre pedía juntas al
+    abrir el detalle de un pedido (`/orders/tables?dining_table_id=`,
+    `/table-sessions` sin filtro + buscar la propia, `/orders?dining_table_id=`) --
+    `bill`/`checkout-preview` quedan fuera a propósito (ciclo de invalidación
+    propio: cambian con la selección del cajero, no con el estado de la mesa).
+
+    `session` viene `null` si la mesa está libre (sin sesión activa) -- no es
+    un error, una mesa libre nunca tuvo ni va a tener sesión hasta que alguien
+    la ocupe de nuevo."""
+    table = db.execute(
+        select(DiningTable).where(DiningTable.id == dining_table_id)
+    ).scalar_one_or_none()
+    if table is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Mesa no encontrada")
+    session = db.execute(
+        select(TableSession).where(
+            TableSession.dining_table_id == dining_table_id,
+            TableSession.status == "active",
+        )
+    ).scalar_one_or_none()
+    orders = service.list_orders(db, None, True, dining_table_id)
+    _decorate_orders(db, orders, tenant=tenant)
+    return TableDetailResponse(
+        table=TableResponse.model_validate(table),
+        session=TableSessionResponse.model_validate(session) if session else None,
+        orders=[OrderResponse.model_validate(o) for o in orders],
+    )
 
 
 @router.post("/tables", response_model=TableResponse, status_code=status.HTTP_201_CREATED, summary="Crear mesa (genera qr_token)")
@@ -1003,7 +1059,7 @@ def _decorate_orders(
 
 @router.get(
     "",
-    response_model=list[OrderResponse] | Page[OrderResponse],
+    response_model=list[OrderSummaryResponse] | Page[OrderResponse],
     summary="Listar comandas (staff)",
 )
 def list_orders(
@@ -1011,6 +1067,7 @@ def list_orders(
     status_filter: str | None = Query(None, alias="status"),
     order_type: OrderType | None = Query(None),
     active_sessions_only: bool = Query(False),
+    dining_table_id: UUID | None = Query(None),
     page: int | None = Query(None, ge=1),
     size: int | None = Query(None, ge=1, le=100),
     date_from: date | None = Query(None, description="Fecha inicial (inclusive) sobre created_at."),
@@ -1025,22 +1082,36 @@ def list_orders(
 ):
     """Dos ramas (spec 079, contracts/orders-list-api.md):
 
-    **Sin `page` ni `size`** — camino de hoy, byte a byte: `service.list_orders`
-    con `ORDER BY created_at DESC`, `status` **crudo**, `paid`/`staff_user_name`
+    **Sin `page` ni `size`** — camino de hoy, byte a byte en lo que la grilla
+    de la Terminal (`mesas-sesiones`) lee: `service.list_orders` con
+    `ORDER BY created_at DESC`, `status` **crudo**, `paid`/`staff_user_name`
     en bloque, respuesta vía `json_or_304` (`ETag` + `304`). La terminal sondea
     esto, así que el `ETag` le ahorra el re-render; `active_sessions_only` (spec
-    029) mantiene su semántica.
+    029) mantiene su semántica. Serializada con `OrderSummaryResponse` (no
+    `OrderResponse`): sin `options`/`toppings`/`notes` por ítem ni
+    `billing`/`applied_promotions`/`current_payment_attempt` por orden -- la
+    grilla nunca los pinta (confirmado recorriendo `tablesView()`/
+    `ordersByType()` en el frontend), y ya viajaban `null`/vacíos en esta rama
+    de todos modos. `service.list_orders` corre además con
+    `include_item_details=False`, así que ni siquiera se consultan las tablas
+    de `options`/`toppings` por ítem. El detalle de una mesa puntual
+    (`GET /orders/tables/{id}/detail`) sigue devolviendo `OrderResponse`
+    completo -- son dos contratos separados a propósito, no comparten schema.
 
     **Con `page` y/o `size`** — pantalla "Órdenes": `service.list_orders_query`
     (orden `created_at DESC, id DESC`, `status` como "estado que ve la persona",
     `order_type` opcional, `date_from`/`date_to`/`q` opcionales — spec 120,
     research.md §1-§2) paginado con `paginate` + `clamp_page`; `paid` y
     `staff_user_name` solo sobre los `items` de la página; **sin `ETag`** (la
-    pantalla se recarga a mano); `active_sessions_only` se ignora (ningún
-    consumidor legítimo lo combina con paginación). `date_from`/`date_to`/`q`
-    solo aplican a esta rama — la rama sin paginar no los recibe."""
+    pantalla se recarga a mano); `active_sessions_only`/`dining_table_id` se
+    ignoran (ningún consumidor legítimo los combina con paginación).
+    `date_from`/`date_to`/`q` solo aplican a esta rama — la rama sin paginar
+    no los recibe."""
     if page is None and size is None:
-        orders = service.list_orders(db, status_filter, active_sessions_only)
+        orders = service.list_orders(
+            db, status_filter, active_sessions_only, dining_table_id,
+            include_item_details=False,
+        )
         _decorate_orders(db, orders, tenant=tenant)
         # `dump_json` sobre los ORM crudos no valida -- `applied_promotions`
         # trae JSONB con formas viejas (solo `name`) o con `rule_id` interno
@@ -1049,7 +1120,7 @@ def list_orders(
         # `rule_id` al cliente. Validar primero (igual que ya hace
         # `response_model` en el resto de rutas de esta misma lista) corrige
         # los tipos y descarta lo no declarado, sin cambiar el contrato.
-        validated = [OrderResponse.model_validate(o) for o in orders]
+        validated = [OrderSummaryResponse.model_validate(o) for o in orders]
         return json_or_304(request, _ORDERS_ADAPTER, validated)
 
     # Rama paginada: `status` se valida contra el enum cerrado de 6 valores

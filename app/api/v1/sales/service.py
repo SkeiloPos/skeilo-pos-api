@@ -427,17 +427,24 @@ def list_sales_query(
     date_from: date | None = None,
     date_to: date | None = None,
     invoice_reference: str | None = None,
+    customer_order_id: UUID | None = None,
 ) -> Select:
     """Construye el `Select` de ventas para el listado paginado (GET /sales).
 
     `date_from`/`date_to` se interpretan como día calendario en la zona
     horaria del tenant, no medianoche UTC (spec 030, FR-004,
-    contracts/date-range-filters.md)."""
+    contracts/date-range-filters.md).
+
+    `customer_order_id`: resuelve "la venta de este pedido" en una sola
+    consulta -- antes el frontend rodeaba por `GET /invoices?order_id=` (solo
+    para leer `sale_id`) y recién ahí pedía `GET /sales/{id}`. Sin filtro de
+    `status`: `Invoice` tampoco lo filtraba, así que una venta `void` sigue
+    resolviendo igual que antes (mismo comportamiento, una sola consulta)."""
     stmt = (
         select(Sale)
         .options(
             selectinload(Sale.items),
-            selectinload(Sale.payments),
+            selectinload(Sale.payments).selectinload(Payment.payment_method),
             selectinload(Sale.invoice),
             selectinload(Sale.dining_table),
         )
@@ -445,6 +452,8 @@ def list_sales_query(
     )
     if status:
         stmt = stmt.where(Sale.status == status)
+    if customer_order_id:
+        stmt = stmt.where(Sale.customer_order_id == customer_order_id)
     if date_from or date_to:
         tz = resolve_timezone(tenant)
         if date_from:

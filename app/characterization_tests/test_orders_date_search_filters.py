@@ -50,6 +50,7 @@ def _ids(db, *, date_from=None, date_to=None, q=None, status=None, order_type=No
             status_filter=status,
             order_type=order_type,
             active_sessions_only=False,
+            dining_table_id=None,
             page=1,
             size=50,
             date_from=date_from,

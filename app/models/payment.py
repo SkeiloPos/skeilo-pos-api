@@ -88,6 +88,7 @@ class Payment(UUIDPrimaryKeyMixin, Base):
     payment_method_id: Mapped[UUID] = mapped_column(
         ForeignKey("payment_methods.id"), nullable=False, index=True
     )
+    payment_method: Mapped["PaymentMethod"] = relationship()
 
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
 
@@ -101,3 +102,20 @@ class Payment(UUIDPrimaryKeyMixin, Base):
         CheckConstraint("amount > 0", name="ck_payment_amount_positive"),
         {"schema": "tenant"},
     )
+
+    @property
+    def payment_method_name(self) -> str:
+        """Atajo de lectura para serializar sin duplicar el nombre en esta
+        fila (`PaymentResponse`, `app/api/v1/sales/schemas.py`) — mismo
+        patrón que `OrderPaymentAttempt.payment_method_name`. Editar el
+        método de pago no cambia este valor retroactivamente: siempre lee el
+        nombre *actual* del `PaymentMethod` referenciado, no una copia
+        congelada."""
+        return self.payment_method.name
+
+    @property
+    def is_cash(self) -> bool:
+        """Atajo de lectura, mismo motivo que `payment_method_name` — le
+        permite al cliente (staff UI) distinguir efectivo de transferencia
+        sin una segunda llamada a `payment_methods`."""
+        return self.payment_method.is_cash

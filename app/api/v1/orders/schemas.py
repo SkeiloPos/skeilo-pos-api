@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.catalog.schemas import OptionSelectionIn, ToppingSelectionIn
 from app.api.v1.sales.schemas import PaymentIn
+from app.api.v1.table_sessions.schemas import TableSessionResponse
 from app.core.schema_types import AssetRefIn, AssetUrl
 from app.core.timezone import TenantLocalDatetime, UtcDatetime
 from app.models.order_payment_attempt import RejectionReason
@@ -439,6 +440,70 @@ class OrderResponse(BaseModel):
     # de preparación de cocina.
     kitchen_status: str | None = None
     sent_to_kitchen_at: UtcDatetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrderItemSummaryResponse(BaseModel):
+    """Ítem recortado para la grilla de la Terminal de Mesas (`GET /orders`
+    sin `page`/`size`, independiente de `GET /orders/tables/{id}/detail`, que
+    sigue usando `OrderItemResponse` completo para su propia pantalla de
+    detalle). Sin `options`/`toppings`/`notes`/`void_de`/`participant_id`/
+    `rt_v`/`product_variant_id`: la grilla solo agrega cantidades y totales
+    por mesa/pedido (`tablesView()`/`ordersByType()` en el frontend), nunca
+    pinta el detalle de una línea -- confirmado recorriendo cada signal que
+    lee `orders()` en esa instancia del store antes de recortar este schema."""
+    id: UUID
+    quantity: int
+    unit_price: Decimal
+    addons_total: Decimal = Decimal("0")
+    discounted_unit_price: Decimal | None = None
+    discounted_line_total: Decimal | None = None
+    estado_cocina: str
+    combo_id: UUID | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrderSummaryResponse(BaseModel):
+    """Orden recortada para la misma grilla que `OrderItemSummaryResponse`
+    (ver su docstring) — mismo criterio: solo lo que `tablesView()`/
+    `ordersByType()`/`deriveTableStatus()` leen hoy. Todo lo que no entra acá
+    (`billing`, `invoice_reference`, `applied_promotions`, `current_payment_attempt`,
+    `qr_payment_instruction_mode`, etc.) ya viajaba `null`/vacío en esta rama
+    sin paginar (spec 094/120/121/154: solo los rellena el detalle individual),
+    así que quitarlos del contrato de este endpoint no cambia ningún valor
+    que el frontend estuviera leyendo. Los campos de `DiningOrder` (TS) que
+    este schema no cubre ya son opcionales ahí -- ausentes, no rompen tipos."""
+    id: UUID
+    channel: str
+    order_type: str | None = None
+    status: str
+    payment_status: str
+    dining_table_id: UUID | None = None
+    customer_name: str | None = None
+    delivery_fee: Decimal | None = None
+    table_order_number: int | None = None
+    created_at: UtcDatetime
+    items: list[OrderItemSummaryResponse] = Field(default_factory=list)
+    paid: bool = False
+    staff_user_name: str | None = None
+    kitchen_status: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TableDetailResponse(BaseModel):
+    """Detalle agregado de una mesa para la Terminal (mesa + sesión activa +
+    pedidos, spec: separación de rutas de la Terminal). Reemplaza 3 peticiones
+    sueltas (`/orders/tables?dining_table_id=`, `/table-sessions` sin filtro +
+    buscar la propia, `/orders?dining_table_id=`) que siempre se necesitan
+    juntas al abrir el detalle de un pedido. `bill`/`checkout-preview` quedan
+    fuera a propósito: tienen un ciclo de invalidación propio (cambian con la
+    selección de qué cobrar / qué pedido editar, no con el estado de la mesa)."""
+    table: TableResponse | None = None
+    session: TableSessionResponse | None = None
+    orders: list[OrderResponse] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
