@@ -470,11 +470,14 @@ class OrderSummaryResponse(BaseModel):
     (ver su docstring) — mismo criterio: solo lo que `tablesView()`/
     `ordersByType()`/`deriveTableStatus()` leen hoy. Todo lo que no entra acá
     (`billing`, `invoice_reference`, `applied_promotions`, `current_payment_attempt`,
-    `qr_payment_instruction_mode`, etc.) ya viajaba `null`/vacío en esta rama
-    sin paginar (spec 094/120/121/154: solo los rellena el detalle individual),
-    así que quitarlos del contrato de este endpoint no cambia ningún valor
-    que el frontend estuviera leyendo. Los campos de `DiningOrder` (TS) que
-    este schema no cubre ya son opcionales ahí -- ausentes, no rompen tipos."""
+    etc.) ya viajaba `null`/vacío en esta rama sin paginar (spec 094/120/121:
+    solo los rellena el detalle individual), así que quitarlos del contrato
+    de este endpoint no cambia ningún valor que el frontend estuviera leyendo.
+    `qr_payment_instruction_mode` sí viaja con su valor real (spec 157):
+    `deriveTableStatus`/`tablesView()` lo usan para decidir si un pedido QR
+    sin `dining_table_id` ya está "pagado" (`PAY_BEFORE_RECEIVING`). Los
+    campos de `DiningOrder` (TS) que este schema no cubre ya son opcionales
+    ahí -- ausentes, no rompen tipos."""
     id: UUID
     channel: str
     order_type: str | None = None
@@ -489,6 +492,7 @@ class OrderSummaryResponse(BaseModel):
     paid: bool = False
     staff_user_name: str | None = None
     kitchen_status: str | None = None
+    qr_payment_instruction_mode: Literal["PAY_AFTER_RECEIVING", "PAY_BEFORE_RECEIVING"] | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
