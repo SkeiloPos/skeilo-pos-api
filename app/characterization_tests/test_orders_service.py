@@ -21,6 +21,7 @@ Ejecutar solo este módulo:
 
     python -m unittest app.characterization_tests.test_orders_service -v
 """
+from datetime import timedelta
 from decimal import Decimal
 import unittest
 from uuid import uuid4
@@ -1008,6 +1009,95 @@ class TestListOrdersActiveSessionsOnly(unittest.TestCase):
         ids = [o.id for o in resultado]
         self.assertNotIn(pedido_1.id, ids)
         self.assertNotIn(pedido_2.id, ids)
+
+    def test_excluye_pedido_cancelado_sin_pagar_de_sesion_ya_cerrada(self):
+        """Un `cancelada` nunca se va a cobrar -- no es el huérfano que
+        `billOrphan` necesita señalar, así que se descarta igual que un
+        pagado en cuanto su sesión cierra (antes de este fix se conservaba
+        para siempre, igual que un huérfano real sin pagar)."""
+        db, _, order = self._seed(session_status="closed", order_status="cancelada", con_sale=False)
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        self.assertNotIn(order.id, [o.id for o in resultado])
+
+    def test_conserva_pedido_cancelado_de_sesion_activa(self):
+        db, _, order = self._seed(session_status="active", order_status="cancelada", con_sale=False)
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        self.assertIn(order.id, [o.id for o in resultado])
+
+    def _inicio_hoy(self):
+        from app.core.timezone import business_today, local_day_bounds_utc, resolve_timezone
+        inicio, _ = local_day_bounds_utc(business_today(None), resolve_timezone(None))
+        return inicio
+
+    def test_excluye_pedido_mostrador_entregado_y_cobrado_de_dia_anterior(self):
+        """Mostrador puro (sin mesa/sesión): si ya terminó Y es de un día de
+        negocio anterior al de hoy, se descarta -- sin esta cota la Terminal
+        se traía el historial completo de mostrador/domicilio en cada
+        sondeo (hoy sigue disponible desde la pantalla "Órdenes")."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            status="entregada", payment_status="PAID",
+            created_at=self._inicio_hoy() - timedelta(hours=1),
+            channel="POS",
+        )
+        db.commit()
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        self.assertNotIn(order.id, [o.id for o in resultado])
+
+    def test_conserva_pedido_mostrador_entregado_y_cobrado_de_hoy(self):
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            status="entregada", payment_status="PAID",
+            created_at=self._inicio_hoy() + timedelta(hours=1),
+            channel="POS",
+        )
+        db.commit()
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        self.assertIn(order.id, [o.id for o in resultado])
+
+    def test_conserva_pedido_mostrador_entregado_sin_cobrar_de_dia_anterior(self):
+        """Entregado pero SIN cobrar sigue siendo un huérfano real por
+        cobrar, sin importar su antigüedad -- distinto de "ya terminó"."""
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            status="entregada", payment_status="UNPAID",
+            created_at=self._inicio_hoy() - timedelta(hours=1),
+            channel="POS",
+        )
+        db.commit()
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        self.assertIn(order.id, [o.id for o in resultado])
+
+    def test_excluye_pedido_mostrador_cancelado_de_dia_anterior(self):
+        db = fx.new_session()
+        ts = fx.make_table_session(db)
+        order = fx.make_customer_order(
+            db, ts, table_session_id=None, dining_table_id=None,
+            status="cancelada",
+            created_at=self._inicio_hoy() - timedelta(hours=1),
+            channel="POS",
+        )
+        db.commit()
+
+        resultado = service.list_orders(db, active_sessions_only=True)
+
+        self.assertNotIn(order.id, [o.id for o in resultado])
 
 
 class TestOrderLinesWithAddonsPerLine(unittest.TestCase):

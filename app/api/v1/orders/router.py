@@ -179,7 +179,7 @@ def table_detail(
             TableSession.status == "active",
         )
     ).scalar_one_or_none()
-    orders = service.list_orders(db, None, True, dining_table_id)
+    orders = service.list_orders(db, None, True, dining_table_id, tenant=tenant)
     _decorate_orders(db, orders, tenant=tenant)
     return TableDetailResponse(
         table=TableResponse.model_validate(table),
@@ -1110,7 +1110,7 @@ def list_orders(
     if page is None and size is None:
         orders = service.list_orders(
             db, status_filter, active_sessions_only, dining_table_id,
-            include_item_details=False,
+            include_item_details=False, tenant=tenant,
         )
         _decorate_orders(db, orders, tenant=tenant)
         # `dump_json` sobre los ORM crudos no valida -- `applied_promotions`

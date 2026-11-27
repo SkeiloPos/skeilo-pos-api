@@ -21,13 +21,13 @@ from math import ceil
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import cast, func, or_, select
+from sqlalchemy import and_, cast, func, not_, or_, select
 from sqlalchemy.types import String
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
 from app.core.crud import get_or_404
-from app.core.timezone import local_day_bounds_utc, resolve_timezone
+from app.core.timezone import business_today, local_day_bounds_utc, resolve_timezone
 from app.core.order_audit import (
     ActorType,
     OrderAuditActor,
@@ -493,6 +493,7 @@ def staff_user_names(db: Session, user_ids: list[UUID]) -> dict[UUID, str]:
 def list_orders(
     db: Session, status_filter: str | None = None, active_sessions_only: bool = False,
     dining_table_id: UUID | None = None, include_item_details: bool = True,
+    tenant: Tenant | None = None,
 ) -> list[CustomerOrder]:
     """Listado de comandas para la Terminal de Mesas (`GET /orders`).
 
@@ -500,19 +501,34 @@ def list_orders(
     UNA mesa (el detalle de la Terminal, en su propia ruta) -- mismo patrón
     que el de `list_tables` en este mismo módulo.
 
-    `active_sessions_only=True` (spec 029, hotfix): descarta pedidos ya
-    pagados cuya `TableSession` ya cerró — sin esto, un pedido de una visita
-    ya cobrada y liberada quedaba visible para siempre (ligado a la misma
-    `dining_table_id` física) y reaparecía mezclado con la sesión nueva en
-    cuanto la mesa se ocupaba de nuevo, porque `status` nunca llega a
-    `"pagada"` en los caminos QR/mostrador vigentes (D2 de research.md).
-    Mismo patrón de subconsulta que `has_billable_orders`/`_billable_orders`
-    (`table_sessions/service.py`), expuesto aquí para el listado general.
+    `active_sessions_only=True` (spec 029, hotfix; ampliado después -- ver
+    abajo): descarta pedidos ya pagados cuya `TableSession` ya cerró — sin
+    esto, un pedido de una visita ya cobrada y liberada quedaba visible para
+    siempre (ligado a la misma `dining_table_id` física) y reaparecía
+    mezclado con la sesión nueva en cuanto la mesa se ocupaba de nuevo,
+    porque `status` nunca llega a `"pagada"` en los caminos QR/mostrador
+    vigentes (D2 de research.md). Mismo patrón de subconsulta que
+    `has_billable_orders`/`_billable_orders` (`table_sessions/service.py`),
+    expuesto aquí para el listado general.
 
     Un pedido **sin pagar** se conserva aunque su sesión ya haya cerrado — es
     el caso huérfano real que `billOrphan` (frontend) existe para señalar,
-    no algo que ocultar. Uno sin `table_session_id` (mostrador puro, sin
-    mesa) tampoco se toca.
+    no algo que ocultar. La única excepción es `status == 'cancelada'`: un
+    pedido cancelado nunca se va a cobrar, así que no es un huérfano
+    pendiente de nada -- se descarta igual que uno pagado en cuanto su
+    sesión cierra.
+
+    Un pedido **sin `table_session_id`** (mostrador puro: TAKEAWAY/DELIVERY,
+    sin mesa) se conserva mientras siga vivo (`pendiente`/`confirmado`, o
+    `entregada` sin cobrar). Si ya terminó (`entregada` **y** cobrado, o
+    `cancelada`) y además es de un día de negocio anterior al de hoy (zona
+    horaria del tenant, `business_today`/`local_day_bounds_utc`), se
+    descarta: sin esta cota, la Terminal (que sondea este listado cada
+    pocos segundos) se traía el historial completo de mostrador/domicilio
+    del tenant entero en cada vuelta, sin límite alguno. El mismo pedido
+    sigue disponible para siempre desde la pantalla "Órdenes"
+    (`list_orders_query`, con paginación y `date_from`/`date_to`), que es la
+    vista pensada para historial.
 
     `include_item_details=False`: la grilla de la Terminal (`GET /orders` sin
     `page`/`size`, serializada con `OrderSummaryResponse`) no pinta
@@ -556,13 +572,29 @@ def list_orders(
                 ),
             )
         )
-        q = q.where(
+        # Sesión de mesa cerrada para siempre: pagado (ya cubierto arriba) O
+        # cancelado -- un cancelado nunca se va a cobrar, no es huérfano.
+        mesa_cerrada_para_siempre = and_(
+            CustomerOrder.table_session_id.isnot(None),
+            CustomerOrder.table_session_id.in_(inactive_sessions),
             or_(
-                CustomerOrder.table_session_id.is_(None),
-                CustomerOrder.table_session_id.notin_(inactive_sessions),
-                CustomerOrder.id.notin_(pedidos_pagados),
-            )
+                CustomerOrder.id.in_(pedidos_pagados),
+                CustomerOrder.status == "cancelada",
+            ),
         )
+        # Mostrador/domicilio ya terminado (entregada+cobrado, o cancelada) de
+        # un día de negocio anterior al de hoy: la pantalla "Órdenes" sigue
+        # teniendo el historial completo, esta es solo la vista en vivo.
+        inicio_hoy, _ = local_day_bounds_utc(business_today(tenant), resolve_timezone(tenant))
+        mostrador_viejo_terminado = and_(
+            CustomerOrder.table_session_id.is_(None),
+            or_(
+                CustomerOrder.status == "cancelada",
+                and_(CustomerOrder.status == "entregada", CustomerOrder.id.in_(pedidos_pagados)),
+            ),
+            CustomerOrder.created_at < inicio_hoy,
+        )
+        q = q.where(not_(or_(mesa_cerrada_para_siempre, mostrador_viejo_terminado)))
     return db.execute(q).scalars().all()
 
 
